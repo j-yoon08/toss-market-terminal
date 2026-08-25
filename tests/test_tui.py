@@ -12,7 +12,7 @@ from textual.widgets import DataTable, Static
 
 from tests.helpers import sample_snapshot
 from toss_market_terminal.models import MarketSnapshot, Price, Trade
-from toss_market_terminal.render import CHART_MODE_LABELS
+from toss_market_terminal.render import CHART_MODE_LABELS, TIMEFRAME_LABELS_KO
 from toss_market_terminal.settings import AlertRule, Settings
 from toss_market_terminal.stream import StreamStatus, TradeEvent
 from toss_market_terminal.tui import CHART_TITLE_LABELS, TossMarketApp
@@ -587,6 +587,79 @@ async def test_focused_wide_resize_to_compact_exits_focus_cleanly(tmp_path: Path
         assert not app.chart_focus
         assert app.query_one("#chart-panel").styles.display == "none"
         assert app.query_one("#watchlist-panel").styles.display == "none"
+
+
+_NO_ADVICE_WORDS = ("매수 추천", "매도 추천", "BUY", "SELL")
+
+
+async def test_market_stats_indicator_section_updates_per_timeframe(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        for key, mode in (("5", "5m"), ("i", "15m"), ("h", "1h"), ("d", "1d"), ("1", "1m")):
+            await pilot.press(key)
+            await pilot.pause()
+            stats = app.query_one("#market-stats", Static).render().plain
+            assert f"{TIMEFRAME_LABELS_KO[mode]} 지표" in stats
+            assert "EMA9/21" in stats
+            assert "RSI" in stats
+            assert "거래량" in stats
+            assert "VWAP" in stats
+            assert "지지" in stats
+            assert "저항" in stats
+            for word in _NO_ADVICE_WORDS:
+                assert word not in stats
+        # Daily mode never fabricates a session VWAP.
+        await pilot.press("d")
+        await pilot.pause()
+        assert "VWAP 데이터 부족" in app.query_one("#market-stats", Static).render().plain
+
+
+async def test_market_stats_fits_wide_and_focused_layouts_without_wrap(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        widget = app.query_one("#market-stats", Static)
+        width, height = widget.content_size
+        lines = widget.render().plain.splitlines()
+        assert len(lines) <= height
+        for line in lines:
+            assert cell_len(line) <= width
+
+        await pilot.press("c")
+        await pilot.pause()
+        focused_width, focused_height = widget.content_size
+        assert focused_width > width
+        focused_lines = widget.render().plain.splitlines()
+        assert len(focused_lines) <= focused_height
+        for line in focused_lines:
+            assert cell_len(line) <= focused_width
+
+
+async def test_market_stats_stays_safe_when_compact_and_hidden(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        assert app.screen.has_class("compact")
+        assert app.query_one("#chart-panel").styles.display == "none"
+        content = app.query_one("#market-stats", Static).render().plain
+        for line in content.splitlines():
+            assert cell_len(line) >= 0
 
 
 async def test_chart_content_lines_fit_measured_width_wide_and_focused(tmp_path: Path) -> None:

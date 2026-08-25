@@ -8,24 +8,40 @@ from rich.cells import cell_len
 from rich.text import Text
 
 from tests.helpers import sample_snapshot
+from toss_market_terminal.indicators import (
+    SupportResistance,
+    aggregate_candles,
+    ema_series,
+    relative_volume,
+    rsi_series,
+    session_vwap_series,
+)
 from toss_market_terminal.models import Candle, Orderbook, OrderbookEntry, Trade
 from toss_market_terminal.render import (
     CHART_MODE_LABELS,
     DOWN_COLOR,
     UP_COLOR,
+    NearestLevel,
     _candlestick_grid,
+    chart_indicators,
     chart_renderable,
     downsample_candles,
+    ema_relation_label_ko,
     format_multiple,
     format_trade_time,
+    level_display_ko,
     market_metrics,
     market_signals,
+    nearest_support_resistance,
     orderbook_signal_label,
     orderbook_signal_label_ko,
+    rsi_zone_label_ko,
+    select_chart_candles,
     sparkline,
     trade_pressure_label,
     trade_pressure_label_ko,
     volume_bar,
+    vwap_distance_percent,
 )
 
 
@@ -351,3 +367,143 @@ def test_chart_renderable_handles_empty_flat_and_zero_volume_without_crashing() 
     chart = chart_renderable(one_candle, "1m", width=20, height=12)
     for line in chart.plain.splitlines():
         assert cell_len(line) <= 20
+
+
+# --- select_chart_candles / chart_indicators -----------------------------
+
+
+def test_select_chart_candles_matches_mode_source() -> None:
+    snapshot = sample_snapshot()
+    assert select_chart_candles(snapshot, "1m") == snapshot.candles
+    assert select_chart_candles(snapshot, "1d") == snapshot.daily_candles
+    assert select_chart_candles(snapshot, "5m") == aggregate_candles(snapshot.candles, "5m")
+
+
+def test_select_chart_candles_rejects_unknown_mode_with_bounded_message() -> None:
+    with pytest.raises(ValueError) as caught:
+        select_chart_candles(sample_snapshot(), "3m")
+    assert "3m" in str(caught.value)
+
+
+def _rising_candles(count: int, start_minute: int = 0) -> tuple[Candle, ...]:
+    """Chronologically rising synthetic 1m candles, returned newest-first."""
+    chronological = [
+        _candle(
+            f"2026-01-05T09:{start_minute + i:02d}:00Z",
+            str(100 + i),
+            str(101 + i),
+            str(99 + i),
+            str(100 + i),
+            "10",
+        )
+        for i in range(count)
+    ]
+    return tuple(reversed(chronological))
+
+
+def test_chart_indicators_matches_direct_pure_helper_calls_on_selected_candles() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(25))
+    result = chart_indicators(snapshot, "1m", Decimal("124"))
+    candles = select_chart_candles(snapshot, "1m")
+    assert result.ema_short == ema_series(candles, 9)[0]
+    assert result.ema_long == ema_series(candles, 21)[0]
+    assert result.rsi == rsi_series(candles, 14)[0]
+    assert result.relative_volume == relative_volume(candles)
+    assert result.vwap == session_vwap_series(candles)[0]
+    assert result.ema_short is not None
+    assert result.ema_long is not None
+    assert result.rsi is not None
+    assert result.vwap is not None
+
+
+def test_chart_indicators_never_fabricates_daily_vwap() -> None:
+    snapshot = replace(sample_snapshot(), daily_candles=_rising_candles(25))
+    result = chart_indicators(snapshot, "1d", Decimal("124"))
+    assert result.vwap is None
+    # EMA/RSI still compute from the daily series itself; only VWAP is unavailable.
+    assert result.ema_short is not None
+    assert result.rsi is not None
+
+
+def test_chart_indicators_insufficient_history_stays_none_not_zero() -> None:
+    # sample_snapshot ships only two 1m candles: nowhere near EMA9/EMA21/RSI14 warmup,
+    # and too few prior candles for a relative-volume baseline.
+    snapshot = sample_snapshot()
+    result = chart_indicators(snapshot, "1m", Decimal("110"))
+    assert result.ema_short is None
+    assert result.ema_long is None
+    assert result.rsi is None
+    assert result.relative_volume is None
+    # Session VWAP only needs positive cumulative volume, which two candles supply.
+    assert result.vwap is not None
+
+
+# --- Korean indicator/level presentation helpers --------------------------
+
+
+def test_ema_relation_label_ko_boundaries() -> None:
+    assert ema_relation_label_ko(None, Decimal("1")) == "데이터 부족"
+    assert ema_relation_label_ko(Decimal("1"), None) == "데이터 부족"
+    assert ema_relation_label_ko(Decimal("2"), Decimal("1")) == "단기선 위"
+    assert ema_relation_label_ko(Decimal("1"), Decimal("2")) == "단기선 아래"
+    assert ema_relation_label_ko(Decimal("1"), Decimal("1")) == "단기선 겹침"
+
+
+def test_rsi_zone_label_ko_boundaries() -> None:
+    assert rsi_zone_label_ko(None) == "데이터 부족"
+    assert rsi_zone_label_ko(Decimal("29.99")) == "낮은 구간"
+    assert rsi_zone_label_ko(Decimal("30")) == "중립 구간"
+    assert rsi_zone_label_ko(Decimal("70")) == "중립 구간"
+    assert rsi_zone_label_ko(Decimal("70.01")) == "높은 구간"
+
+
+def test_vwap_distance_percent_handles_missing_and_zero_vwap() -> None:
+    assert vwap_distance_percent(None, Decimal("100")) is None
+    assert vwap_distance_percent(Decimal("0"), Decimal("100")) is None
+    assert vwap_distance_percent(Decimal("100"), Decimal("110")) == Decimal("10")
+
+
+def test_nearest_support_resistance_picks_highest_support_lowest_resistance() -> None:
+    levels = SupportResistance(
+        previous_close=Decimal("100"),
+        session_high=Decimal("105"),
+        session_low=Decimal("95"),
+        recent_high=Decimal("110"),
+        recent_low=Decimal("90"),
+        swing_high=Decimal("120"),
+        swing_low=Decimal("80"),
+    )
+    result = nearest_support_resistance(levels, Decimal("102"))
+    assert result.support == NearestLevel("전일 종가", Decimal("100"))
+    assert result.resistance == NearestLevel("세션 고가", Decimal("105"))
+
+
+def test_nearest_support_resistance_ties_prefer_earlier_field_order() -> None:
+    levels = SupportResistance(previous_close=Decimal("100"), session_low=Decimal("100"))
+    result = nearest_support_resistance(levels, Decimal("100"))
+    assert result.support == NearestLevel("전일 종가", Decimal("100"))
+    assert result.resistance == NearestLevel("전일 종가", Decimal("100"))
+
+
+def test_nearest_support_resistance_missing_side_is_none() -> None:
+    only_above = SupportResistance(session_high=Decimal("110"), swing_high=Decimal("120"))
+    result = nearest_support_resistance(only_above, Decimal("100"))
+    assert result.support is None
+    assert result.resistance == NearestLevel("세션 고가", Decimal("110"))
+
+    only_below = SupportResistance(session_low=Decimal("90"), swing_low=Decimal("80"))
+    result = nearest_support_resistance(only_below, Decimal("100"))
+    assert result.support == NearestLevel("세션 저가", Decimal("90"))
+    assert result.resistance is None
+
+    empty = nearest_support_resistance(SupportResistance(), Decimal("100"))
+    assert empty.support is None
+    assert empty.resistance is None
+
+
+def test_level_display_ko_formats_label_and_price_or_dash() -> None:
+    assert level_display_ko(None, "USD") == "—"
+    close_level = NearestLevel("전일 종가", Decimal("42500"))
+    assert level_display_ko(close_level, "KRW") == "전일 종가 42,500"
+    swing_level = NearestLevel("스윙 저점", Decimal("110.50"))
+    assert level_display_ko(swing_level, "USD") == "스윙 저점 110.5"

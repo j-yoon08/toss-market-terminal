@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "toss-market-terminal"
-version = "0.3.0"
+version = "0.4.0"
 description = "Read-only real-time stock terminal for the official Toss Securities Open API"
 readme = "README.md"
 requires-python = ">=3.12"

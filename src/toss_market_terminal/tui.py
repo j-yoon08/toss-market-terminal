@@ -23,19 +23,25 @@ from .models import DataShapeError, MarketSnapshot, Orderbook, Trade
 from .render import (
     DOWN_COLOR,
     MUTED_COLOR,
+    TIMEFRAME_LABELS_KO,
     UP_COLOR,
+    chart_indicators,
     chart_renderable,
     direction_style,
+    ema_relation_label_ko,
     format_decimal,
     format_multiple,
     format_percent,
     format_signed,
     format_trade_time,
+    level_display_ko,
     market_metrics,
     market_signals,
     orderbook_signal_label_ko,
+    rsi_zone_label_ko,
     trade_pressure_label_ko,
     volume_bar,
+    vwap_distance_percent,
 )
 from .settings import Settings, SettingsStore
 from .stream import (
@@ -154,7 +160,7 @@ class TossMarketApp(App[int]):
         padding: 1 2;
     }
     #market-stats {
-        height: 9;
+        height: 12;
         padding: 0 2;
         border-top: solid #2a3440;
         color: #9aa7b4;
@@ -298,6 +304,7 @@ class TossMarketApp(App[int]):
     def _set_chart_mode(self, mode: str) -> None:
         self.chart_mode = mode
         self._render_chart()
+        self._render_stats()
 
     def action_intraday(self) -> None:
         self._set_chart_mode("1m")
@@ -841,6 +848,37 @@ class TossMarketApp(App[int]):
         text.append(
             f"체결 {trade_pressure_label_ko(signals.trade_pressure_percent)} {pressure} · "
             f"1분 거래량 {volume_ratio}\n",
+            style=MUTED_COLOR,
+        )
+
+        indicators = chart_indicators(self.snapshot, self.chart_mode, self.current_price)
+        timeframe_label = TIMEFRAME_LABELS_KO[self.chart_mode]
+        text.append(
+            f"{timeframe_label} 지표 · EMA9/21 "
+            f"{ema_relation_label_ko(indicators.ema_short, indicators.ema_long)}\n",
+            style=MUTED_COLOR,
+        )
+        rsi_text = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "—"
+        text.append(
+            f"RSI {rsi_text} {rsi_zone_label_ko(indicators.rsi)} · "
+            f"거래량 {format_multiple(indicators.relative_volume)}\n",
+            style=MUTED_COLOR,
+        )
+        vwap_percent = vwap_distance_percent(indicators.vwap, self.current_price)
+        if indicators.vwap is not None and vwap_percent is not None:
+            text.append(
+                f"VWAP {format_decimal(indicators.vwap, self.current_currency)} · "
+                f"현재가 {format_percent(vwap_percent)}\n",
+                style=MUTED_COLOR,
+            )
+        else:
+            text.append("VWAP 데이터 부족\n", style=MUTED_COLOR)
+        text.append(
+            f"지지 {level_display_ko(indicators.levels.support, self.current_currency)}\n",
+            style=MUTED_COLOR,
+        )
+        text.append(
+            f"저항 {level_display_ko(indicators.levels.resistance, self.current_currency)}\n",
             style=MUTED_COLOR,
         )
         text.append(f"{self.market.upper()} 공개 시세 · 조회 전용", style="#526273")

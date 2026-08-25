@@ -12,7 +12,15 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .indicators import aggregate_candles
+from .indicators import (
+    SupportResistance,
+    aggregate_candles,
+    ema_series,
+    relative_volume,
+    rsi_series,
+    session_vwap_series,
+    support_resistance,
+)
 from .models import Candle, MarketSnapshot, Orderbook, Trade
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
@@ -26,6 +34,13 @@ CHART_MODE_LABELS = {
     "15m": "15 MINUTE",
     "1h": "1 HOUR",
     "1d": "DAILY",
+}
+TIMEFRAME_LABELS_KO = {
+    "1m": "1분봉",
+    "5m": "5분봉",
+    "15m": "15분봉",
+    "1h": "1시간봉",
+    "1d": "일봉",
 }
 _CHART_MAX_ECHO = 32
 _MIN_CHART_DIMENSION = 1
@@ -359,6 +374,152 @@ def _chart_echo(value: object) -> str:
     return text
 
 
+def select_chart_candles(snapshot: MarketSnapshot, mode: str) -> tuple[Candle, ...]:
+    """Newest-first source candles for chart ``mode``.
+
+    ``1m`` and ``1d`` use ``snapshot.candles`` / ``snapshot.daily_candles``
+    as-is; ``5m``, ``15m``, and ``1h`` aggregate ``snapshot.candles`` via
+    :func:`toss_market_terminal.indicators.aggregate_candles`. Raises
+    ``ValueError`` for an unsupported ``mode``.
+    """
+    if mode not in CHART_MODE_LABELS:
+        raise ValueError(
+            f"지원하지 않는 차트 모드입니다: {_chart_echo(mode)} "
+            f"(지원: {', '.join(CHART_MODE_LABELS)})"
+        )
+    if mode == "1d":
+        return tuple(snapshot.daily_candles)
+    if mode == "1m":
+        return tuple(snapshot.candles)
+    return aggregate_candles(snapshot.candles, mode)
+
+
+_LEVEL_LABELS_KO: tuple[tuple[str, str], ...] = (
+    ("previous_close", "전일 종가"),
+    ("session_high", "세션 고가"),
+    ("session_low", "세션 저가"),
+    ("recent_high", "최근 고가"),
+    ("recent_low", "최근 저가"),
+    ("swing_high", "스윙 고점"),
+    ("swing_low", "스윙 저점"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class NearestLevel:
+    label: str
+    price: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class NearestLevels:
+    """Nearest support/resistance; either side is ``None`` when no candidate qualifies."""
+
+    support: NearestLevel | None
+    resistance: NearestLevel | None
+
+
+def nearest_support_resistance(levels: SupportResistance, current_price: Decimal) -> NearestLevels:
+    """Nearest support (highest candidate <= price) and resistance (lowest candidate >= price).
+
+    Considers every named field of ``levels``, skipping ``None`` ones. When
+    several qualifying candidates tie on price, the one listed first in
+    :data:`_LEVEL_LABELS_KO` (dataclass field order) wins.
+    """
+    candidates = [
+        (label, price)
+        for field, label in _LEVEL_LABELS_KO
+        if (price := getattr(levels, field)) is not None
+    ]
+    below = [item for item in candidates if item[1] <= current_price]
+    above = [item for item in candidates if item[1] >= current_price]
+    support = max(below, key=lambda item: item[1]) if below else None
+    resistance = min(above, key=lambda item: item[1]) if above else None
+    return NearestLevels(
+        support=NearestLevel(*support) if support is not None else None,
+        resistance=NearestLevel(*resistance) if resistance is not None else None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ChartIndicators:
+    """Latest-candle EMA/RSI/volume/VWAP snapshot plus nearest levels for a chart mode."""
+
+    mode: str
+    ema_short: Decimal | None
+    ema_long: Decimal | None
+    rsi: Decimal | None
+    relative_volume: Decimal | None
+    vwap: Decimal | None
+    levels: NearestLevels
+
+
+def chart_indicators(
+    snapshot: MarketSnapshot, mode: str, current_price: Decimal
+) -> ChartIndicators:
+    """Compute EMA9/EMA21, RSI14, relative volume, session VWAP, and nearest levels for ``mode``.
+
+    Candles come from :func:`select_chart_candles`, so every field reflects
+    the same source the chart itself renders. Session VWAP is only computed
+    for intraday modes; ``1d`` always reports ``vwap=None`` rather than
+    fabricate a session that does not exist. Every field stays ``None`` when
+    its underlying pure helper (in :mod:`toss_market_terminal.indicators`)
+    lacks enough data.
+    """
+    candles = select_chart_candles(snapshot, mode)
+    ema_short_series = ema_series(candles, 9)
+    ema_long_series = ema_series(candles, 21)
+    rsi_values = rsi_series(candles, 14)
+    vwap = session_vwap_series(candles)[0] if mode != "1d" and candles else None
+    daily_candles = candles if mode == "1d" else snapshot.daily_candles
+    levels = support_resistance(candles, daily_candles=daily_candles)
+    return ChartIndicators(
+        mode=mode,
+        ema_short=ema_short_series[0] if ema_short_series else None,
+        ema_long=ema_long_series[0] if ema_long_series else None,
+        rsi=rsi_values[0] if rsi_values else None,
+        relative_volume=relative_volume(candles),
+        vwap=vwap,
+        levels=nearest_support_resistance(levels, current_price),
+    )
+
+
+def ema_relation_label_ko(ema_short: Decimal | None, ema_long: Decimal | None) -> str:
+    """Plain Korean description of EMA9 vs EMA21 position; not advice."""
+    if ema_short is None or ema_long is None:
+        return "데이터 부족"
+    if ema_short > ema_long:
+        return "단기선 위"
+    if ema_short < ema_long:
+        return "단기선 아래"
+    return "단기선 겹침"
+
+
+def rsi_zone_label_ko(rsi: Decimal | None) -> str:
+    """Plain Korean RSI zone description; not advice."""
+    if rsi is None:
+        return "데이터 부족"
+    if rsi < Decimal("30"):
+        return "낮은 구간"
+    if rsi > Decimal("70"):
+        return "높은 구간"
+    return "중립 구간"
+
+
+def vwap_distance_percent(vwap: Decimal | None, current_price: Decimal) -> Decimal | None:
+    """Current price's percent distance from session ``vwap``; ``None`` when unavailable."""
+    if vwap is None or vwap == 0:
+        return None
+    return (current_price - vwap) / vwap * Decimal("100")
+
+
+def level_display_ko(level: NearestLevel | None, currency: str | None) -> str:
+    """Format a nearest support/resistance level as ``"라벨 가격"``, or ``"—"`` when absent."""
+    if level is None:
+        return "—"
+    return f"{level.label} {format_decimal(level.price, currency)}"
+
+
 def downsample_candles(candles: Sequence[Candle], target_columns: int) -> tuple[Candle, ...]:
     """Aggregate chronological (oldest-first) ``candles`` into ``target_columns`` buckets.
 
@@ -479,22 +640,11 @@ def chart_renderable(
     count stays within ``height``; ``width``/``height`` below 1 are clamped
     up to 1. Raises ``ValueError`` for an unsupported ``mode``.
     """
-    if mode not in CHART_MODE_LABELS:
-        raise ValueError(
-            f"지원하지 않는 차트 모드입니다: {_chart_echo(mode)} "
-            f"(지원: {', '.join(CHART_MODE_LABELS)})"
-        )
+    source = select_chart_candles(snapshot, mode)
     chart_width = max(_MIN_CHART_DIMENSION, int(width))
     chart_height = max(_MIN_CHART_DIMENSION, int(height))
     currency = snapshot.price.currency
     label = CHART_MODE_LABELS[mode]
-
-    if mode == "1d":
-        source: Sequence[Candle] = snapshot.daily_candles
-    elif mode == "1m":
-        source = snapshot.candles
-    else:
-        source = aggregate_candles(snapshot.candles, mode)
     chronological = tuple(reversed(source))
 
     lines: list[Text] = [Text(set_cell_size(f"PRICE · {label}", chart_width), style="bold #c9d1d9")]
