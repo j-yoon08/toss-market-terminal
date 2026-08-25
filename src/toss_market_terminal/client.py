@@ -8,7 +8,16 @@ from typing import Any
 import httpx
 
 from .config import Credentials
-from .models import Candle, MarketSnapshot, Orderbook, Price, StockInfo, Trade
+from .models import (
+    MAX_BATCH_SYMBOLS,
+    Candle,
+    MarketSnapshot,
+    Orderbook,
+    Price,
+    StockInfo,
+    Trade,
+    normalize_symbol,
+)
 
 API_BASE_URL = "https://openapi.tossinvest.com"
 READ_ONLY_PATHS = frozenset(
@@ -143,6 +152,31 @@ class TossMarketClient:
         if not isinstance(result, list) or not result:
             raise TossApiError(404, "price-not-found")
         return Price.from_api(result[0])
+
+    async def prices(self, symbols: list[str] | tuple[str, ...]) -> dict[str, Price]:
+        """Batch current prices for 1-200 normalized unique symbols.
+
+        Uses the official ``stocks``-style comma-separated batching on the
+        read-only ``/api/v1/prices`` endpoint and maps results by their own
+        symbol so provider response order is irrelevant.
+        """
+        normalized: list[str] = []
+        for raw in symbols:
+            symbol = normalize_symbol(raw)
+            if symbol in normalized:
+                raise ValueError(f"중복 심볼은 배치 조회할 수 없습니다: {symbol}")
+            normalized.append(symbol)
+        if not 1 <= len(normalized) <= MAX_BATCH_SYMBOLS:
+            raise ValueError("배치 현재가 조회는 1~200개 심볼이어야 합니다.")
+        result = await self._get("/api/v1/prices", {"symbols": ",".join(normalized)})
+        if not isinstance(result, list):
+            raise TossApiError(200, "invalid-prices-response")
+        by_symbol = {price.symbol: price for price in (Price.from_api(item) for item in result)}
+        missing = [symbol for symbol in normalized if symbol not in by_symbol]
+        if missing:
+            safe = "".join(ch for ch in ",".join(missing) if ch.isalnum() or ch in "-_")[:80]
+            raise TossApiError(404, f"price-not-found:{safe}")
+        return {symbol: by_symbol[symbol] for symbol in normalized}
 
     async def orderbook(self, symbol: str) -> Orderbook:
         result = await self._get("/api/v1/orderbook", {"symbol": symbol})

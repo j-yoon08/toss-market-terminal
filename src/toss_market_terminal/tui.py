@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -30,15 +31,32 @@ from .render import (
     market_metrics,
     volume_bar,
 )
-from .stream import OrderbookEvent, StreamStatus, TossMarketStream, TradeEvent, infer_market
+from .settings import Settings, SettingsStore
+from .stream import (
+    OrderbookEvent,
+    StreamStatus,
+    TossMarketStream,
+    TradeEvent,
+    infer_market,
+    normalize_symbol,
+)
 
 KST = ZoneInfo("Asia/Seoul")
+WATCHLIST_REFRESH_SECONDS = 15.0
 
 
 def safe_status_error(exc: Exception) -> str:
     if isinstance(exc, (TossApiError, DataShapeError)):
         return str(exc)[:120]
     return f"{type(exc).__name__}: REST snapshot failed"
+
+
+@dataclass(frozen=True, slots=True)
+class WatchlistRow:
+    symbol: str
+    price: str
+    currency: str
+    active_alerts: int
 
 
 class TossMarketApp(App[int]):
@@ -49,6 +67,11 @@ class TossMarketApp(App[int]):
         ("r", "refresh", "재동기화"),
         ("1", "intraday", "1분봉"),
         ("d", "daily", "일봉"),
+        ("up", "watch_up", "위 항목"),
+        ("down", "watch_down", "아래 항목"),
+        ("j", "watch_down", "아래 항목(j)"),
+        ("k", "watch_up", "위 항목(k)"),
+        ("enter", "watch_select", "심볼 전환"),
     ]
     CSS = """
     Screen {
@@ -78,9 +101,10 @@ class TossMarketApp(App[int]):
         border: solid #2a3440;
         background: #0b1118;
     }
-    #orderbook-panel { width: 34%; }
-    #chart-panel { width: 40%; }
-    #trades-panel { width: 26%; }
+    #watchlist-panel { width: 18%; }
+    #orderbook-panel { width: 28%; }
+    #chart-panel { width: 33%; }
+    #trades-panel { width: 21%; }
     .panel-title {
         height: 2;
         padding: 0 1;
@@ -127,6 +151,7 @@ class TossMarketApp(App[int]):
         background: #111923;
     }
     Screen.compact #chart-panel { display: none; }
+    Screen.compact #watchlist-panel { display: none; }
     Screen.compact #orderbook-panel { width: 52%; }
     Screen.compact #trades-panel { width: 48%; }
     Screen.compact #summary { height: 7; }
@@ -139,16 +164,34 @@ class TossMarketApp(App[int]):
         *,
         initial_snapshot: MarketSnapshot | None = None,
         connect_live: bool = True,
+        settings_path: Path | None = None,
+        settings: Settings | None = None,
+        watchlist_refresh_seconds: float = WATCHLIST_REFRESH_SECONDS,
     ) -> None:
         super().__init__()
-        self.symbol = symbol
-        self.market = infer_market(symbol)
+        self.symbol = normalize_symbol(symbol)
+        self.market = infer_market(self.symbol)
         self.credentials_path = credentials_path
         self.initial_snapshot = initial_snapshot
         self.connect_live = connect_live
+        self.settings_path = settings_path
+        self.settings = settings if settings is not None else Settings()
+        self.watchlist_refresh_seconds = watchlist_refresh_seconds
         self.refresh_lock = asyncio.Lock()
+        self.switch_lock = asyncio.Lock()
+        self.watchlist_refresh_lock = asyncio.Lock()
         self.client: TossMarketClient | None = None
         self.feed_task: asyncio.Task[None] | None = None
+        self.watchlist_task: asyncio.Task[None] | None = None
+        # In-memory only: `watch SYMBOL` never persists the launch symbol.
+        configured = list(dict.fromkeys(self.settings.watchlist))
+        if self.symbol not in configured:
+            if len(configured) >= 12:
+                configured = configured[:11]
+            configured.append(self.symbol)
+        self.watchlist_symbols = tuple(configured)
+        self.watchlist_rows: dict[str, WatchlistRow] = {}
+        self.watchlist_stale = False
         self.trades: deque[Trade] = deque(maxlen=50)
         self.orderbook: Orderbook | None = None
         self.snapshot: MarketSnapshot | None = None
@@ -167,6 +210,9 @@ class TossMarketApp(App[int]):
         yield Static(id="topbar", markup=False)
         yield Static("초기 데이터 조회 중…", id="summary", markup=False)
         with Horizontal(id="main"):
+            with Vertical(id="watchlist-panel", classes="market-panel"):
+                yield Static("WATCHLIST", classes="panel-title")
+                yield DataTable(id="watchlist", cursor_type="row", cell_padding=1)
             with Vertical(id="orderbook-panel", classes="market-panel"):
                 yield Static("ORDER BOOK", classes="panel-title")
                 yield DataTable(
@@ -187,6 +233,7 @@ class TossMarketApp(App[int]):
         self.set_interval(1.0, self._render_chrome)
         if self.initial_snapshot is not None:
             self._apply_snapshot(self.initial_snapshot)
+            self._refresh_watchlist_rows_from_snapshot()
             self.connection_state = "PREVIEW" if not self.connect_live else "SNAPSHOT"
             self._render_all()
             if not self.connect_live:
@@ -198,13 +245,16 @@ class TossMarketApp(App[int]):
             self.exit(2, message=f"오류: {exc}")
             return
         self.client = TossMarketClient(credentials)
+        await self._load_persisted_watchlist()
         await self._refresh_snapshot()
         self.feed_task = asyncio.create_task(self._run_feed())
+        self.watchlist_task = asyncio.create_task(self._run_watchlist_polling())
 
     async def on_unmount(self) -> None:
-        if self.feed_task:
-            self.feed_task.cancel()
-            await asyncio.gather(self.feed_task, return_exceptions=True)
+        for task in (self.watchlist_task, self.feed_task):
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         if self.client:
             await self.client.close()
 
@@ -223,10 +273,170 @@ class TossMarketApp(App[int]):
         self._render_chart()
 
     def _prepare_tables(self) -> None:
+        watchlist = self.query_one("#watchlist", DataTable)
+        watchlist.add_columns("SYMBOL", "PRICE", "ALERTS")
         orderbook = self.query_one("#orderbook", DataTable)
         orderbook.add_columns("SIDE", "PRICE", "SIZE", "DEPTH")
         trades = self.query_one("#trades", DataTable)
         trades.add_columns("TIME", "PRICE", "SIZE", "")
+
+    async def _load_persisted_watchlist(self) -> None:
+        """Merge the persisted watchlist into memory without persisting anything."""
+        if self.settings_path is None:
+            return
+        try:
+            persisted = SettingsStore(self.settings_path).load()
+            merged = list(persisted.watchlist)
+            if self.symbol not in merged:
+                if len(merged) >= 12:
+                    merged = merged[:11]
+                merged.append(self.symbol)
+            self.watchlist_symbols = tuple(merged)
+            self.settings = persisted
+        except Exception:
+            self.watchlist_stale = True
+
+    async def _run_watchlist_polling(self) -> None:
+        while True:
+            await asyncio.sleep(self.watchlist_refresh_seconds)
+            try:
+                await self._refresh_watchlist_prices()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.watchlist_stale = True
+                self._render_watchlist()
+
+    async def _refresh_watchlist_prices(self) -> bool:
+        if self.client is None or not self.watchlist_symbols:
+            return False
+        if self.watchlist_refresh_lock.locked():
+            return False
+        async with self.watchlist_refresh_lock:
+            try:
+                prices = await self.client.prices(list(self.watchlist_symbols))
+            except Exception:
+                self.watchlist_stale = True
+                self._render_watchlist()
+                return False
+            for symbol, price in prices.items():
+                active_alerts = sum(
+                    1
+                    for rule in self.settings.alerts
+                    if rule.symbol == symbol and rule.enabled
+                )
+                self.watchlist_rows[symbol] = WatchlistRow(
+                    symbol=symbol,
+                    price=format_decimal(price.last_price),
+                    currency=price.currency,
+                    active_alerts=active_alerts,
+                )
+            self.watchlist_stale = False
+            self._render_watchlist()
+            return True
+
+    def _refresh_watchlist_rows_from_snapshot(self) -> None:
+        if self.snapshot is None or self.current_price is None:
+            return
+        active_alerts = sum(
+            1 for rule in self.settings.alerts if rule.symbol == self.symbol and rule.enabled
+        )
+        self.watchlist_rows[self.symbol] = WatchlistRow(
+            symbol=self.symbol,
+            price=format_decimal(self.current_price),
+            currency=self.current_currency or self.snapshot.price.currency,
+            active_alerts=active_alerts,
+        )
+
+    def _render_watchlist(self) -> None:
+        table = self.query_one("#watchlist", DataTable)
+        table.clear()
+        for symbol in self.watchlist_symbols:
+            row = self.watchlist_rows.get(symbol)
+            marker = "•" if row is not None and row.active_alerts else " "
+            count = str(row.active_alerts) if row is not None else "0"
+            price_text = f"{row.price} {row.currency}" if row is not None else "—"
+            if row is None or self.watchlist_stale:
+                price_text = f"{price_text}*" if self.watchlist_stale else price_text
+            table.add_row(symbol, Text(price_text, style=MUTED_COLOR), f"{marker}{count}")
+
+    # --- navigation / switching -------------------------------------------------
+    @property
+    def _highlighted_index(self) -> int:
+        try:
+            return self.watchlist_symbols.index(self.symbol)
+        except ValueError:
+            return 0
+
+    def action_watch_up(self) -> None:
+        if not self.watchlist_symbols:
+            return
+        table = self.query_one("#watchlist", DataTable)
+        self._move_cursor(max(0, table.cursor_row - 1))
+
+    def action_watch_down(self) -> None:
+        if not self.watchlist_symbols:
+            return
+        table = self.query_one("#watchlist", DataTable)
+        self._move_cursor(min(len(self.watchlist_symbols) - 1, table.cursor_row + 1))
+
+    def _move_cursor(self, index: int) -> None:
+        table = self.query_one("#watchlist", DataTable)
+        if table.row_count:
+            table.move_cursor(
+                row=min(index, table.row_count - 1),
+                column=0,
+            )
+
+    async def action_watch_select(self) -> None:
+        table = self.query_one("#watchlist", DataTable)
+        row_key = table.cursor_row
+        if not self.watchlist_symbols or row_key >= len(self.watchlist_symbols):
+            return
+        target = self.watchlist_symbols[row_key]
+        if target != self.symbol:
+            await self.switch_symbol(target)
+
+    async def switch_symbol(self, target: str) -> None:
+        """Switch active symbol after fully stopping the previous stream."""
+        normalized = normalize_symbol(target)
+        async with self.switch_lock:
+            if normalized == self.symbol:
+                return
+            old_feed = self.feed_task
+            self.feed_task = None
+            if old_feed is not None:
+                old_feed.cancel()
+                await asyncio.gather(old_feed, return_exceptions=True)
+
+            self.symbol = normalized
+            self.market = infer_market(normalized)
+            self.stream_live = False
+            self.subscription_detail = ""
+            self.protocol_degraded = False
+            self.orderbook = None
+            self.trades.clear()
+            self.current_price = None
+            self.current_currency = ""
+            self.current_timestamp = None
+            self.snapshot = None
+            self.last_tick_monotonic = None
+            if normalized not in self.watchlist_symbols:
+                symbols = list(self.watchlist_symbols)
+                if len(symbols) >= 12:
+                    symbols = symbols[:11]
+                symbols.append(normalized)
+                self.watchlist_symbols = tuple(symbols)
+            self.connection_state = "SWITCHING"
+            self.connection_detail = ""
+            self._render_chrome()
+
+            if self.client is None:
+                return
+            await self._refresh_snapshot()
+            self.feed_task = asyncio.create_task(
+                self._run_feed(symbol=normalized, market=self.market)
+            )
 
     async def _refresh_snapshot(self) -> bool:
         async with self.refresh_lock:
@@ -235,13 +445,14 @@ class TossMarketApp(App[int]):
     async def _refresh_snapshot_locked(self) -> bool:
         if self.client is None:
             return False
+        requested_symbol = self.symbol
         was_live = self.stream_live
         previous_detail = self.connection_detail
         self.connection_state = "SYNCING"
         self.connection_detail = "REST snapshot"
         self._render_chrome()
         try:
-            snapshot = await self.client.snapshot(self.symbol)
+            snapshot = await self.client.snapshot(requested_symbol)
         except Exception as exc:
             if was_live:
                 self.protocol_degraded = False
@@ -251,6 +462,8 @@ class TossMarketApp(App[int]):
                 self.connection_state = "ERROR"
                 self.connection_detail = safe_status_error(exc)
             self._render_chrome()
+            return False
+        if self.symbol != requested_symbol or snapshot.stock.symbol != requested_symbol:
             return False
         self._apply_snapshot(snapshot)
         if was_live:
@@ -267,15 +480,24 @@ class TossMarketApp(App[int]):
         self.current_price = snapshot.price.last_price
         self.current_currency = snapshot.price.currency
         self.current_timestamp = snapshot.price.timestamp
+        self._refresh_watchlist_rows_from_snapshot()
+        if self.is_mounted:
+            self._render_watchlist()
 
-    async def _run_feed(self) -> None:
+    async def _run_feed(self, *, symbol: str | None = None, market: str | None = None) -> None:
         if self.client is None:
             return
+        feed_symbol = symbol or self.symbol
+        feed_market = market or infer_market(feed_symbol)
         stream = TossMarketStream(self.client)
-        async for event in stream.events(self.symbol, self.market):
+        async for event in stream.events(feed_symbol, feed_market):
+            if self.symbol != feed_symbol:
+                return
             if isinstance(event, StreamStatus):
                 await self._handle_stream_status(event)
             elif isinstance(event, TradeEvent):
+                if event.symbol != feed_symbol:
+                    continue
                 self._recover_protocol_status()
                 self.trades.appendleft(event.trade)
                 self.current_price = event.trade.price
@@ -287,6 +509,8 @@ class TossMarketApp(App[int]):
                 self._render_stats()
                 self._render_chrome()
             elif isinstance(event, OrderbookEvent):
+                if event.symbol != feed_symbol:
+                    continue
                 self._recover_protocol_status()
                 self.orderbook = event.orderbook
                 self.last_tick_monotonic = time.monotonic()

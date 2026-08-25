@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -13,10 +12,9 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
 from .client import TossApiError, TossMarketClient
-from .models import Orderbook, Trade
+from .models import Orderbook, Trade, infer_market, normalize_symbol
 
 WS_URL = "wss://openapi-ws.tossinvest.com/ws/v1"
-SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,19}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,17 +36,6 @@ class OrderbookEvent:
 
 
 StreamEvent = StreamStatus | TradeEvent | OrderbookEvent
-
-
-def normalize_symbol(symbol: str) -> str:
-    normalized = symbol.strip().upper()
-    if not SYMBOL_PATTERN.fullmatch(normalized):
-        raise ValueError("종목 심볼 형식이 올바르지 않습니다.")
-    return normalized
-
-
-def infer_market(symbol: str) -> str:
-    return "kr" if len(symbol) == 6 and symbol.isdigit() else "us"
 
 
 def subscription_declaration(symbol: str, market: str, request_id: str) -> list[dict[str, Any]]:

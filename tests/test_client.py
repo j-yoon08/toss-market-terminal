@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -117,3 +118,58 @@ async def test_error_does_not_include_raw_response_or_secret() -> None:
             await client.access_token()
     assert "invalid_client" in str(caught.value)
     assert secret not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_batch_prices_maps_results_independent_of_provider_order() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(
+                200,
+                json={"access_token": "test-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        assert request.url.path == "/api/v1/prices"
+        symbols = request.url.params["symbols"]
+        requested.append(symbols)
+        assert "," in symbols
+        # Deliberately shuffled response order.
+        payload = {
+            "005930": {
+                "symbol": "005930",
+                "lastPrice": "71000",
+                "currency": "KRW",
+                "timestamp": None,
+            },
+            "AAPL": {"symbol": "AAPL", "lastPrice": "185.70", "currency": "USD", "timestamp": None},
+            "NVDA": {"symbol": "NVDA", "lastPrice": "130.10", "currency": "USD", "timestamp": None},
+        }
+        ordered = ["NVDA", "AAPL", "005930"]
+        body = [payload[symbol] for symbol in ordered]
+        return httpx.Response(200, json={"result": body})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        prices = await client.prices(["aapl", "NVDA", "005930"])
+
+    assert requested == ["AAPL,NVDA,005930"]
+    assert list(prices) == ["AAPL", "NVDA", "005930"]
+    assert prices["NVDA"].last_price == Decimal("130.10")
+    assert prices["005930"].currency == "KRW"
+
+
+@pytest.mark.asyncio
+async def test_batch_prices_rejects_out_of_bounds_and_duplicates() -> None:
+    client = TossMarketClient.__new__(TossMarketClient)
+    with pytest.raises(ValueError):
+        await client.prices([])
+    with pytest.raises(ValueError):
+        await client.prices([f"S{i}" for i in range(201)])
+    with pytest.raises(ValueError):
+        await client.prices(["AAPL", "aapl"])
