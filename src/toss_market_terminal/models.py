@@ -134,3 +134,4 @@ class MarketSnapshot:
     orderbook: Orderbook
     trades: tuple[Trade, ...]
     candles: tuple[Candle, ...]
+    daily_candles: tuple[Candle, ...] = ()

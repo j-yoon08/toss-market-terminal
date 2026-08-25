@@ -1,6 +1,6 @@
 # Toss Market Terminal
 
-토스증권 **공식 Open API**로 현재가·호가·체결·1분봉을 보여주는 조회 전용 터미널 프로그램입니다.
+토스증권 **공식 Open API**로 현재가·호가·체결·1분봉/일봉을 보여주는 조회 전용 실시간 터미널입니다. 넓은 터미널에서는 호가·차트·체결 3패널 관제 화면을, 좁은 SSH 터미널에서는 호가·체결 중심의 compact 화면을 제공합니다.
 
 ## 안전 경계
 
@@ -49,13 +49,24 @@ uv run toss-market probe AAPL --seconds 8
 
 TUI 키:
 
+- `1`: 1분봉 차트
+- `d`: 일봉 차트
 - `r`: REST 스냅샷 재동기화
 - `q`: 종료
+
+화면에는 전일 종가 대비 변화, 당일 고가·저가·거래량, 최우선 호가 스프레드, 최근 체결 VWAP, 호가 잔량 막대, 실시간 체결 방향 및 마지막 tick 경과 시간이 표시됩니다.
+
+실제 시세 기반 SVG 미리보기 생성:
+
+```bash
+uv run python scripts/capture_preview.py AAPL \
+  --output-dir /home/ubuntu/Documents/outputs/toss-market-terminal
+```
 
 ## 데이터 동작
 
 1. OAuth2 Client Credentials로 메모리 내 액세스 토큰을 발급합니다.
-2. REST로 종목·현재가·호가·최근 체결·1분봉 초기 상태를 조회합니다.
+2. REST로 종목·현재가·호가·최근 체결·1분봉·최근 40개 일봉 초기 상태를 조회합니다.
 3. WebSocket에서 `trade:{kr|us}` 및 `orderbook:{kr|us}`를 구독합니다.
 4. 구독 ack를 확인한 뒤 실시간 변경을 화면에 반영합니다.
 5. 연결이 끊기면 제한된 지수 백오프로 재연결하고, TUI는 REST 상태를 다시 동기화합니다.

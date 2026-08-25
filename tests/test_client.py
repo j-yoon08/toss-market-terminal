@@ -12,9 +12,12 @@ from toss_market_terminal.config import Credentials
 @pytest.mark.asyncio
 async def test_snapshot_calls_only_allowlisted_market_data() -> None:
     seen: list[str] = []
+    candle_queries: list[dict[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.url.path)
+        if request.url.path == "/api/v1/candles":
+            candle_queries.append(dict(request.url.params))
         if request.url.path == "/oauth2/token":
             return httpx.Response(
                 200,
@@ -85,7 +88,11 @@ async def test_snapshot_calls_only_allowlisted_market_data() -> None:
         snapshot = await client.snapshot("AAPL")
 
     assert snapshot.stock.symbol == "AAPL"
+    assert len(snapshot.daily_candles) == 1
     assert seen.count("/oauth2/token") == 1
+    assert seen.count("/api/v1/candles") == 2
+    assert {query["interval"] for query in candle_queries} == {"1m", "1d"}
+    assert any(query["interval"] == "1d" and query["count"] == "40" for query in candle_queries)
     assert set(seen[1:]) == READ_ONLY_PATHS
     assert not any(
         "account" in path or "order" in path for path in seen if path != "/api/v1/orderbook"

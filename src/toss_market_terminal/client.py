@@ -174,12 +174,15 @@ class TossMarketClient:
         return tuple(Candle.from_api(item) for item in result["candles"])
 
     async def snapshot(self, symbol: str) -> MarketSnapshot:
-        stock, price, orderbook, trades, candles = await asyncio.gather(
+        stock, price, orderbook, trades = await asyncio.gather(
             self.stock(symbol),
             self.price(symbol),
             self.orderbook(symbol),
             self.trades(symbol),
+        )
+        candles, daily_candles = await asyncio.gather(
             self.candles(symbol),
+            self.candles(symbol, interval="1d", count=40),
         )
         return MarketSnapshot(
             stock=stock,
@@ -187,4 +190,5 @@ class TossMarketClient:
             orderbook=orderbook,
             trades=trades,
             candles=candles,
+            daily_candles=daily_candles,
         )
