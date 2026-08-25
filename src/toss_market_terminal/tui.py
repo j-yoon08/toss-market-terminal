@@ -49,6 +49,15 @@ from .stream import (
 
 KST = ZoneInfo("Asia/Seoul")
 WATCHLIST_REFRESH_SECONDS = 15.0
+COMPACT_WIDTH_THRESHOLD = 117
+
+CHART_TITLE_LABELS = {
+    "1m": "1 MINUTE",
+    "5m": "5 MINUTES",
+    "15m": "15 MINUTES",
+    "1h": "1 HOUR",
+    "1d": "DAILY",
+}
 
 
 def safe_status_error(exc: Exception) -> str:
@@ -72,7 +81,11 @@ class TossMarketApp(App[int]):
         ("q", "quit", "종료"),
         ("r", "refresh", "재동기화"),
         ("1", "intraday", "1분봉"),
+        ("5", "chart_5m", "5분봉"),
+        ("i", "chart_15m", "15분봉"),
+        ("h", "chart_1h", "1시간봉"),
         ("d", "daily", "일봉"),
+        ("c", "toggle_focus", "차트 포커스"),
         ("up", "watch_up", "위 항목"),
         ("down", "watch_down", "아래 항목"),
         ("j", "watch_down", "아래 항목(j)"),
@@ -161,6 +174,10 @@ class TossMarketApp(App[int]):
     Screen.compact #orderbook-panel { width: 52%; }
     Screen.compact #trades-panel { width: 48%; }
     Screen.compact #summary { height: 7; }
+    Screen.chart-focus #watchlist-panel { display: none; }
+    Screen.chart-focus #chart-panel { width: 65%; }
+    Screen.chart-focus #orderbook-panel { width: 18%; }
+    Screen.chart-focus #trades-panel { width: 17%; }
     """
 
     def __init__(
@@ -207,6 +224,7 @@ class TossMarketApp(App[int]):
         self.current_currency = ""
         self.current_timestamp: str | None = None
         self.chart_mode = "1m"
+        self.chart_focus = False
         self.connection_state = "STARTING"
         self.connection_detail = ""
         self.stream_live = False
@@ -267,18 +285,41 @@ class TossMarketApp(App[int]):
             await self.client.close()
 
     def on_resize(self, event: events.Resize) -> None:
-        self.screen.set_class(event.size.width < 117, "compact")
+        compact = event.size.width < COMPACT_WIDTH_THRESHOLD
+        self.screen.set_class(compact, "compact")
+        if compact:
+            self.chart_focus = False
+        self.screen.set_class(self.chart_focus, "chart-focus")
+        self.call_after_refresh(self._render_chart)
 
     async def action_refresh(self) -> None:
         await self._refresh_snapshot()
 
-    def action_intraday(self) -> None:
-        self.chart_mode = "1m"
+    def _set_chart_mode(self, mode: str) -> None:
+        self.chart_mode = mode
         self._render_chart()
 
+    def action_intraday(self) -> None:
+        self._set_chart_mode("1m")
+
+    def action_chart_5m(self) -> None:
+        self._set_chart_mode("5m")
+
+    def action_chart_15m(self) -> None:
+        self._set_chart_mode("15m")
+
+    def action_chart_1h(self) -> None:
+        self._set_chart_mode("1h")
+
     def action_daily(self) -> None:
-        self.chart_mode = "1d"
-        self._render_chart()
+        self._set_chart_mode("1d")
+
+    def action_toggle_focus(self) -> None:
+        if self.screen.has_class("compact"):
+            return
+        self.chart_focus = not self.chart_focus
+        self.screen.set_class(self.chart_focus, "chart-focus")
+        self.call_after_refresh(self._render_chart)
 
     def _prepare_tables(self) -> None:
         watchlist = self.query_one("#watchlist", DataTable)
@@ -738,10 +779,12 @@ class TossMarketApp(App[int]):
     def _render_chart(self) -> None:
         if self.snapshot is None:
             return
-        self.query_one("#chart-content", Static).update(
-            chart_renderable(self.snapshot, self.chart_mode)
-        )
-        title = "MARKET CHART · 1 MINUTE" if self.chart_mode == "1m" else "MARKET CHART · DAILY"
+        chart_content = self.query_one("#chart-content", Static)
+        if not chart_content.is_mounted:
+            return
+        width, height = chart_content.content_size
+        chart_content.update(chart_renderable(self.snapshot, self.chart_mode, width, height))
+        title = f"MARKET CHART · {CHART_TITLE_LABELS[self.chart_mode]}"
         self.query_one("#chart-panel .panel-title", Static).update(title)
 
     def _render_stats(self) -> None:

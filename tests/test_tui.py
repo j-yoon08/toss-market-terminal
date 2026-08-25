@@ -6,14 +6,16 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Static
 
 from tests.helpers import sample_snapshot
 from toss_market_terminal.models import MarketSnapshot, Price, Trade
+from toss_market_terminal.render import CHART_MODE_LABELS
 from toss_market_terminal.settings import AlertRule, Settings
 from toss_market_terminal.stream import StreamStatus, TradeEvent
-from toss_market_terminal.tui import TossMarketApp
+from toss_market_terminal.tui import CHART_TITLE_LABELS, TossMarketApp
 
 
 async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> None:
@@ -481,3 +483,135 @@ async def test_tui_emits_one_edge_alert_and_renders_market_signals(
         app.current_price = Decimal("113")
         assert app._evaluate_active_alerts() == ()
         assert bells == 1
+
+
+async def test_chart_mode_bindings_switch_title_and_content_without_fetching(
+    tmp_path: Path,
+) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        assert app.client is None
+        assert app.chart_mode == "1m"
+        for key, mode in (("5", "5m"), ("i", "15m"), ("h", "1h"), ("d", "1d"), ("1", "1m")):
+            await pilot.press(key)
+            await pilot.pause()
+            assert app.chart_mode == mode
+            # Switching modes must stay local: no client/REST call is ever created.
+            assert app.client is None
+            title = app.query_one("#chart-panel .panel-title", Static).render().plain
+            assert title == f"MARKET CHART · {CHART_TITLE_LABELS[mode]}"
+            content = app.query_one("#chart-content", Static).render().plain
+            assert f"PRICE · {CHART_MODE_LABELS[mode]}" in content
+
+
+async def test_chart_focus_toggle_hides_watchlist_and_widens_chart(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        assert not app.screen.has_class("chart-focus")
+        assert app.query_one("#watchlist-panel").styles.display != "none"
+
+        await pilot.press("c")
+        await pilot.pause()
+        assert app.screen.has_class("chart-focus")
+        assert app.chart_focus
+        assert app.query_one("#watchlist-panel").styles.display == "none"
+
+        chart_width = app.query_one("#chart-panel").size.width
+        orderbook_width = app.query_one("#orderbook-panel").size.width
+        trades_width = app.query_one("#trades-panel").size.width
+        total = chart_width + orderbook_width + trades_width
+        assert total > 0
+        assert chart_width > orderbook_width > 0
+        assert chart_width > trades_width > 0
+        ratio = chart_width / total
+        assert 0.60 <= ratio <= 0.70
+
+        await pilot.press("c")
+        await pilot.pause()
+        assert not app.screen.has_class("chart-focus")
+        assert not app.chart_focus
+        assert app.query_one("#watchlist-panel").styles.display != "none"
+
+
+async def test_chart_focus_toggle_is_a_no_op_when_compact(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        assert app.screen.has_class("compact")
+
+        await pilot.press("c")
+        await pilot.pause()
+        assert not app.screen.has_class("chart-focus")
+        assert not app.chart_focus
+        assert app.query_one("#chart-panel").styles.display == "none"
+        assert app.query_one("#watchlist-panel").styles.display == "none"
+        # Chart content must remain safe to render even while fully hidden.
+        content = app.query_one("#chart-content", Static).render().plain
+        for line in content.splitlines():
+            assert cell_len(line) >= 0
+
+
+async def test_focused_wide_resize_to_compact_exits_focus_cleanly(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+        assert app.screen.has_class("chart-focus")
+
+        await pilot.resize_terminal(90, 30)
+        assert app.screen.has_class("compact")
+        assert not app.screen.has_class("chart-focus")
+        assert not app.chart_focus
+        assert app.query_one("#chart-panel").styles.display == "none"
+        assert app.query_one("#watchlist-panel").styles.display == "none"
+
+
+async def test_chart_content_lines_fit_measured_width_wide_and_focused(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        widget = app.query_one("#chart-content", Static)
+        width, height = widget.content_size
+        assert width > 0
+        assert height > 0
+        lines = widget.render().plain.splitlines()
+        assert len(lines) <= height
+        for line in lines:
+            assert cell_len(line) <= width
+
+        await pilot.press("c")
+        await pilot.pause()
+        focused_width, focused_height = widget.content_size
+        assert focused_width > width
+        focused_lines = widget.render().plain.splitlines()
+        assert len(focused_lines) <= focused_height
+        for line in focused_lines:
+            assert cell_len(line) <= focused_width
