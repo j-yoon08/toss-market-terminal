@@ -30,8 +30,8 @@ MUTED_COLOR = "#7d8998"
 
 CHART_MODE_LABELS = {
     "1m": "1 MINUTE",
-    "5m": "5 MINUTE",
-    "15m": "15 MINUTE",
+    "5m": "5 MINUTES",
+    "15m": "15 MINUTES",
     "1h": "1 HOUR",
     "1d": "DAILY",
 }
@@ -454,17 +454,37 @@ class ChartIndicators:
     levels: NearestLevels
 
 
-def chart_indicators(
-    snapshot: MarketSnapshot, mode: str, current_price: Decimal
-) -> ChartIndicators:
-    """Compute EMA9/EMA21, RSI14, relative volume, session VWAP, and nearest levels for ``mode``.
+@dataclass(frozen=True, slots=True)
+class ChartIndicatorBase:
+    """The snapshot+mode half of :class:`ChartIndicators`: everything but nearest levels.
+
+    Depends only on ``(snapshot, mode)``, never on a live current price, so
+    callers that re-render on every trade/orderbook tick (see
+    :class:`toss_market_terminal.tui.TossMarketApp`) can cache one instance
+    per ``(snapshot identity, mode)`` pair and cheaply re-derive
+    :class:`ChartIndicators` per tick via :func:`chart_indicators_from_base`
+    instead of repeating the full EMA/RSI/VWAP/pivot computation each time.
+    """
+
+    mode: str
+    ema_short: Decimal | None
+    ema_long: Decimal | None
+    rsi: Decimal | None
+    relative_volume: Decimal | None
+    vwap: Decimal | None
+    levels: SupportResistance
+
+
+def chart_indicator_base(snapshot: MarketSnapshot, mode: str) -> ChartIndicatorBase:
+    """Compute the cacheable, current-price-independent half of :func:`chart_indicators`.
 
     Candles come from :func:`select_chart_candles`, so every field reflects
     the same source the chart itself renders. Session VWAP is only computed
     for intraday modes; ``1d`` always reports ``vwap=None`` rather than
     fabricate a session that does not exist. Every field stays ``None`` when
     its underlying pure helper (in :mod:`toss_market_terminal.indicators`)
-    lacks enough data.
+    lacks enough data. Raises ``ValueError`` for malformed/naive candle
+    timestamps or a currency mismatch (see :mod:`toss_market_terminal.indicators`).
     """
     candles = select_chart_candles(snapshot, mode)
     ema_short_series = ema_series(candles, 9)
@@ -473,15 +493,46 @@ def chart_indicators(
     vwap = session_vwap_series(candles)[0] if mode != "1d" and candles else None
     daily_candles = candles if mode == "1d" else snapshot.daily_candles
     levels = support_resistance(candles, daily_candles=daily_candles)
-    return ChartIndicators(
+    return ChartIndicatorBase(
         mode=mode,
         ema_short=ema_short_series[0] if ema_short_series else None,
         ema_long=ema_long_series[0] if ema_long_series else None,
         rsi=rsi_values[0] if rsi_values else None,
         relative_volume=relative_volume(candles),
         vwap=vwap,
-        levels=nearest_support_resistance(levels, current_price),
+        levels=levels,
     )
+
+
+def chart_indicators_from_base(base: ChartIndicatorBase, current_price: Decimal) -> ChartIndicators:
+    """Cheaply project a cached :class:`ChartIndicatorBase` onto a live ``current_price``.
+
+    Only the nearest-support/resistance projection runs here; a current-price
+    crossing a cached level therefore still updates ``levels`` correctly
+    without recomputing EMA/RSI/VWAP/pivots.
+    """
+    return ChartIndicators(
+        mode=base.mode,
+        ema_short=base.ema_short,
+        ema_long=base.ema_long,
+        rsi=base.rsi,
+        relative_volume=base.relative_volume,
+        vwap=base.vwap,
+        levels=nearest_support_resistance(base.levels, current_price),
+    )
+
+
+def chart_indicators(
+    snapshot: MarketSnapshot, mode: str, current_price: Decimal
+) -> ChartIndicators:
+    """Compute EMA9/EMA21, RSI14, relative volume, session VWAP, and nearest levels for ``mode``.
+
+    Convenience wrapper around :func:`chart_indicator_base` and
+    :func:`chart_indicators_from_base` for one-shot callers; callers that
+    re-render per tick (e.g. on every trade/orderbook event) should cache the
+    base and call :func:`chart_indicators_from_base` directly instead.
+    """
+    return chart_indicators_from_base(chart_indicator_base(snapshot, mode), current_price)
 
 
 def ema_relation_label_ko(ema_short: Decimal | None, ema_long: Decimal | None) -> str:

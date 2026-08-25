@@ -21,11 +21,15 @@ from .client import TossApiError, TossMarketClient
 from .config import CredentialError, Credentials
 from .models import DataShapeError, MarketSnapshot, Orderbook, Trade
 from .render import (
+    CHART_MODE_LABELS,
     DOWN_COLOR,
     MUTED_COLOR,
     TIMEFRAME_LABELS_KO,
     UP_COLOR,
-    chart_indicators,
+    ChartIndicatorBase,
+    ChartIndicators,
+    chart_indicator_base,
+    chart_indicators_from_base,
     chart_renderable,
     direction_style,
     ema_relation_label_ko,
@@ -57,19 +61,20 @@ KST = ZoneInfo("Asia/Seoul")
 WATCHLIST_REFRESH_SECONDS = 15.0
 COMPACT_WIDTH_THRESHOLD = 117
 
-CHART_TITLE_LABELS = {
-    "1m": "1 MINUTE",
-    "5m": "5 MINUTES",
-    "15m": "15 MINUTES",
-    "1h": "1 HOUR",
-    "1d": "DAILY",
-}
-
 
 def safe_status_error(exc: Exception) -> str:
     if isinstance(exc, (TossApiError, DataShapeError)):
         return str(exc)[:120]
     return f"{type(exc).__name__}: REST snapshot failed"
+
+
+def safe_indicator_error(exc: Exception) -> str:
+    """Bounded, non-secret description of a chart-indicator failure.
+
+    Never echoes the raw exception text (which may embed candle timestamps
+    or currency codes) back to the UI; only the exception type name is shown.
+    """
+    return f"{type(exc).__name__}: 지표 계산 실패"
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,7 +241,11 @@ class TossMarketApp(App[int]):
         self.stream_live = False
         self.subscription_detail = ""
         self.protocol_degraded = False
+        self.indicator_degraded = False
         self.last_tick_monotonic: float | None = None
+        self._indicator_base: ChartIndicatorBase | None = None
+        self._indicator_base_snapshot: MarketSnapshot | None = None
+        self._indicator_base_mode: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="topbar", markup=False)
@@ -546,6 +555,10 @@ class TossMarketApp(App[int]):
             self.current_timestamp = None
             self.snapshot = None
             self.last_tick_monotonic = None
+            self.indicator_degraded = False
+            self._indicator_base = None
+            self._indicator_base_snapshot = None
+            self._indicator_base_mode = None
             if normalized not in self.watchlist_symbols:
                 symbols = list(self.watchlist_symbols)
                 if len(symbols) >= 12:
@@ -591,6 +604,7 @@ class TossMarketApp(App[int]):
         if self.symbol != requested_symbol or snapshot.stock.symbol != requested_symbol:
             return False
         self._apply_snapshot(snapshot)
+        self.indicator_degraded = False
         if was_live:
             self.connection_state = "LIVE"
             self.connection_detail = self.subscription_detail or previous_detail
@@ -605,6 +619,9 @@ class TossMarketApp(App[int]):
         self.current_price = snapshot.price.last_price
         self.current_currency = snapshot.price.currency
         self.current_timestamp = snapshot.price.timestamp
+        self._indicator_base = None
+        self._indicator_base_snapshot = None
+        self._indicator_base_mode = None
         self._refresh_watchlist_rows_from_snapshot()
         self._evaluate_active_alerts()
         if self.is_mounted:
@@ -682,7 +699,7 @@ class TossMarketApp(App[int]):
         self._render_chrome()
 
     def _recover_protocol_status(self) -> None:
-        if not self.protocol_degraded or not self.stream_live:
+        if not self.protocol_degraded or not self.stream_live or self.indicator_degraded:
             return
         self.protocol_degraded = False
         self.connection_state = "LIVE"
@@ -791,8 +808,29 @@ class TossMarketApp(App[int]):
             return
         width, height = chart_content.content_size
         chart_content.update(chart_renderable(self.snapshot, self.chart_mode, width, height))
-        title = f"MARKET CHART · {CHART_TITLE_LABELS[self.chart_mode]}"
+        title = f"MARKET CHART · {CHART_MODE_LABELS[self.chart_mode]}"
         self.query_one("#chart-panel .panel-title", Static).update(title)
+
+    def _chart_indicators(self) -> ChartIndicators:
+        """Cached snapshot+mode indicator base, cheaply re-projected onto the live price.
+
+        Avoids repeating the full EMA9/EMA21/RSI14/VWAP/pivot computation on
+        every trade/orderbook tick: the expensive half is cached per
+        ``(snapshot identity, chart_mode)`` and only the nearest-level
+        projection reruns each call. May raise ``ValueError`` for malformed/
+        naive candle timestamps or a currency mismatch; callers must handle
+        that to keep rendering resilient to bad data.
+        """
+        if (
+            self._indicator_base is None
+            or self._indicator_base_snapshot is not self.snapshot
+            or self._indicator_base_mode != self.chart_mode
+        ):
+            base = chart_indicator_base(self.snapshot, self.chart_mode)
+            self._indicator_base = base
+            self._indicator_base_snapshot = self.snapshot
+            self._indicator_base_mode = self.chart_mode
+        return chart_indicators_from_base(self._indicator_base, self.current_price)
 
     def _render_stats(self) -> None:
         if self.snapshot is None or self.current_price is None:
@@ -851,36 +889,51 @@ class TossMarketApp(App[int]):
             style=MUTED_COLOR,
         )
 
-        indicators = chart_indicators(self.snapshot, self.chart_mode, self.current_price)
         timeframe_label = TIMEFRAME_LABELS_KO[self.chart_mode]
-        text.append(
-            f"{timeframe_label} 지표 · EMA9/21 "
-            f"{ema_relation_label_ko(indicators.ema_short, indicators.ema_long)}\n",
-            style=MUTED_COLOR,
-        )
-        rsi_text = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "—"
-        text.append(
-            f"RSI {rsi_text} {rsi_zone_label_ko(indicators.rsi)} · "
-            f"거래량 {format_multiple(indicators.relative_volume)}\n",
-            style=MUTED_COLOR,
-        )
-        vwap_percent = vwap_distance_percent(indicators.vwap, self.current_price)
-        if indicators.vwap is not None and vwap_percent is not None:
+        try:
+            indicators = self._chart_indicators()
+        except ValueError as exc:
+            # Fail-safe boundary: a bad candle (malformed/naive timestamp, currency
+            # mismatch) must never kill the live feed task. Render the base stats
+            # above, mark the connection truthfully DEGRADED with a sanitized
+            # detail, and recover only after a subsequent successful REST snapshot
+            # (see `_refresh_snapshot_locked`), not on the next tick.
+            self.indicator_degraded = True
+            self.connection_state = "DEGRADED"
+            self.connection_detail = safe_indicator_error(exc)
             text.append(
-                f"VWAP {format_decimal(indicators.vwap, self.current_currency)} · "
-                f"현재가 {format_percent(vwap_percent)}\n",
-                style=MUTED_COLOR,
+                f"{timeframe_label} 지표 계산 불가 · {self.connection_detail}\n",
+                style="#f0ad4e",
             )
         else:
-            text.append("VWAP 데이터 부족\n", style=MUTED_COLOR)
-        text.append(
-            f"지지 {level_display_ko(indicators.levels.support, self.current_currency)}\n",
-            style=MUTED_COLOR,
-        )
-        text.append(
-            f"저항 {level_display_ko(indicators.levels.resistance, self.current_currency)}\n",
-            style=MUTED_COLOR,
-        )
+            text.append(
+                f"{timeframe_label} 지표 · EMA9/21 "
+                f"{ema_relation_label_ko(indicators.ema_short, indicators.ema_long)}\n",
+                style=MUTED_COLOR,
+            )
+            rsi_text = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "—"
+            text.append(
+                f"RSI {rsi_text} {rsi_zone_label_ko(indicators.rsi)} · "
+                f"거래량 {format_multiple(indicators.relative_volume)}\n",
+                style=MUTED_COLOR,
+            )
+            vwap_percent = vwap_distance_percent(indicators.vwap, self.current_price)
+            if indicators.vwap is not None and vwap_percent is not None:
+                text.append(
+                    f"VWAP {format_decimal(indicators.vwap, self.current_currency)} · "
+                    f"현재가 {format_percent(vwap_percent)}\n",
+                    style=MUTED_COLOR,
+                )
+            else:
+                text.append("VWAP 데이터 부족\n", style=MUTED_COLOR)
+            text.append(
+                f"지지 {level_display_ko(indicators.levels.support, self.current_currency)}\n",
+                style=MUTED_COLOR,
+            )
+            text.append(
+                f"저항 {level_display_ko(indicators.levels.resistance, self.current_currency)}\n",
+                style=MUTED_COLOR,
+            )
         text.append(f"{self.market.upper()} 공개 시세 · 조회 전용", style="#526273")
         self.query_one("#market-stats", Static).update(text)
 

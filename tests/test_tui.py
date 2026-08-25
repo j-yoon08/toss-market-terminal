@@ -11,11 +11,17 @@ from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Static
 
 from tests.helpers import sample_snapshot
+from toss_market_terminal import tui as tui_module
 from toss_market_terminal.models import MarketSnapshot, Price, Trade
-from toss_market_terminal.render import CHART_MODE_LABELS, TIMEFRAME_LABELS_KO
+from toss_market_terminal.render import (
+    CHART_MODE_LABELS,
+    TIMEFRAME_LABELS_KO,
+    nearest_support_resistance,
+)
+from toss_market_terminal.render import chart_indicator_base as real_chart_indicator_base
 from toss_market_terminal.settings import AlertRule, Settings
-from toss_market_terminal.stream import StreamStatus, TradeEvent
-from toss_market_terminal.tui import CHART_TITLE_LABELS, TossMarketApp
+from toss_market_terminal.stream import OrderbookEvent, StreamStatus, TradeEvent
+from toss_market_terminal.tui import TossMarketApp
 
 
 async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> None:
@@ -505,7 +511,7 @@ async def test_chart_mode_bindings_switch_title_and_content_without_fetching(
             # Switching modes must stay local: no client/REST call is ever created.
             assert app.client is None
             title = app.query_one("#chart-panel .panel-title", Static).render().plain
-            assert title == f"MARKET CHART · {CHART_TITLE_LABELS[mode]}"
+            assert title == f"MARKET CHART · {CHART_MODE_LABELS[mode]}"
             content = app.query_one("#chart-content", Static).render().plain
             assert f"PRICE · {CHART_MODE_LABELS[mode]}" in content
 
@@ -688,3 +694,238 @@ async def test_chart_content_lines_fit_measured_width_wide_and_focused(tmp_path:
         assert len(focused_lines) <= focused_height
         for line in focused_lines:
             assert cell_len(line) <= focused_width
+
+
+# --- indicator error boundary (finding 1) ----------------------------------
+
+
+def _naive_timestamp_snapshot() -> MarketSnapshot:
+    """A snapshot whose newest 1m candle has a naive (offset-less) timestamp.
+
+    ``toss_market_terminal.indicators`` requires timezone-aware candle
+    timestamps and raises ``ValueError`` otherwise; this is exactly the
+    "malformed/naive candle timestamp" case the review flagged as capable of
+    killing the live feed task from inside `_render_stats`.
+    """
+    base = sample_snapshot()
+    bad_candle = replace(base.candles[0], timestamp="2026-08-25T10:00:00")
+    return replace(base, candles=(bad_candle, base.candles[1]))
+
+
+def _currency_mismatch_snapshot() -> MarketSnapshot:
+    """A snapshot whose intraday candles and daily candles disagree on currency."""
+    base = sample_snapshot()
+    mismatched_daily = tuple(replace(candle, currency="KRW") for candle in base.daily_candles)
+    return replace(base, daily_candles=mismatched_daily)
+
+
+async def test_render_stats_survives_malformed_candle_timestamp_at_mount(
+    tmp_path: Path,
+) -> None:
+    broken = _naive_timestamp_snapshot()
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=broken,
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        # `_render_stats` must not propagate the ValueError raised deep inside
+        # chart-indicator computation; the app must still be alive and mounted.
+        assert app.is_mounted
+        assert app.indicator_degraded
+        assert app.connection_state == "DEGRADED"
+        # Sanitized, bounded detail only -- never the raw offending value.
+        assert app.connection_detail == "ValueError: 지표 계산 실패"
+        assert "2026-08-25T10:00:00" not in app.connection_detail
+        stats = app.query_one("#market-stats", Static).render().plain
+        # Base stats (computed from metrics/signals, not chart indicators) still render.
+        assert "시장 신호 요약" in stats
+        assert "매수·매도 호가 차이" in stats
+        assert "지표 계산 불가" in stats
+        assert "2026-08-25T10:00:00" not in stats
+
+
+async def test_indicator_error_in_live_tick_keeps_feed_running_and_recovers_on_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = _naive_timestamp_snapshot()
+    good = sample_snapshot()
+    second_trade_processed = asyncio.Event()
+
+    class RecoveringClient:
+        async def snapshot(self, symbol: str) -> MarketSnapshot:
+            assert symbol == "AAPL"
+            return good
+
+        async def close(self) -> None:
+            return None
+
+    class FakeStream:
+        def __init__(self, _client: object) -> None:
+            pass
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol, Trade(Decimal("111"), Decimal("1"), "2026-08-25T10:00:01Z", "USD")
+            )
+            yield OrderbookEvent(symbol, good.orderbook)
+            yield TradeEvent(
+                symbol, Trade(Decimal("112"), Decimal("1"), "2026-08-25T10:00:02Z", "USD")
+            )
+            second_trade_processed.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr("toss_market_terminal.tui.TossMarketStream", FakeStream)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=broken,
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        assert app.connection_state == "DEGRADED"
+
+        app.client = RecoveringClient()  # type: ignore[assignment]
+        app.stream_live = True
+        app.subscription_detail = "topics=2"
+        app.feed_task = asyncio.create_task(app._run_feed())
+        await asyncio.wait_for(second_trade_processed.wait(), timeout=2)
+        await pilot.pause()
+
+        # The feed task kept processing ticks through the indicator failure instead of dying.
+        assert app.feed_task is not None and not app.feed_task.done()
+        assert app.current_price == Decimal("112")
+        # No REST snapshot has landed yet: still truthfully degraded, not silently "LIVE".
+        assert app.connection_state == "DEGRADED"
+
+        # A subsequent successful REST snapshot (with well-formed candles) restores LIVE.
+        assert await app._refresh_snapshot()
+        assert app.connection_state == "LIVE"
+        assert not app.indicator_degraded
+        stats = app.query_one("#market-stats", Static).render().plain
+        assert "지표 계산 불가" not in stats
+
+
+async def test_render_stats_survives_candle_currency_mismatch(tmp_path: Path) -> None:
+    broken = _currency_mismatch_snapshot()
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=broken,
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        assert app.is_mounted
+        assert app.indicator_degraded
+        assert app.connection_state == "DEGRADED"
+        assert app.connection_detail == "ValueError: 지표 계산 실패"
+        assert "KRW" not in app.connection_detail
+        stats = app.query_one("#market-stats", Static).render().plain
+        assert "시장 신호 요약" in stats
+        assert "지표 계산 불가" in stats
+
+
+# --- chart indicator caching (finding 2) ------------------------------------
+
+
+async def test_chart_indicator_base_is_cached_per_snapshot_and_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def counting_base(snapshot: MarketSnapshot, mode: str) -> object:
+        nonlocal calls
+        calls += 1
+        return real_chart_indicator_base(snapshot, mode)
+
+    monkeypatch.setattr("toss_market_terminal.tui.chart_indicator_base", counting_base)
+
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        assert calls == 1  # on_mount's initial render
+
+        base = real_chart_indicator_base(sample_snapshot(), "1m")
+        expected_low = nearest_support_resistance(base.levels, Decimal("109"))
+        expected_high = nearest_support_resistance(base.levels, Decimal("111"))
+        assert expected_low != expected_high  # sanity: crossing does change the nearest levels
+
+        # Repeated ticks with only the current price moving must hit the cache and still
+        # report the correct nearest support/resistance for each price.
+        app.current_price = Decimal("109")
+        app._render_stats()
+        assert app._chart_indicators().levels == expected_low
+        assert calls == 1
+
+        app.current_price = Decimal("111")
+        app._render_stats()
+        assert app._chart_indicators().levels == expected_high
+        assert calls == 1
+
+        app._render_stats()
+        app._render_stats()
+        assert calls == 1  # further repeated renders stay cached
+
+        app._set_chart_mode("5m")
+        assert calls == 2  # a mode change invalidates the cache
+
+        app._set_chart_mode("1m")
+        assert calls == 3  # switching back is a fresh (snapshot, mode) cache entry
+
+        app._apply_snapshot(sample_snapshot())
+        app._render_stats()
+        assert calls == 4  # a new snapshot instance invalidates the cache, even with equal content
+
+        app._render_stats()
+        app._render_stats()
+        assert calls == 4
+
+
+async def test_switch_symbol_resets_indicator_cache_and_degraded_flag(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings=Settings(watchlist=("AAPL", "005930")),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app._indicator_base = real_chart_indicator_base(app.snapshot, app.chart_mode)
+        app._indicator_base_snapshot = app.snapshot
+        app._indicator_base_mode = app.chart_mode
+        app.indicator_degraded = True
+
+        await app.switch_symbol("005930")
+
+        assert app._indicator_base is None
+        assert app._indicator_base_snapshot is None
+        assert app._indicator_base_mode is None
+        assert not app.indicator_degraded
+
+
+# --- unified chart mode labels (finding 3) ----------------------------------
+
+
+def test_chart_title_labels_duplicate_removed_from_tui_module() -> None:
+    assert not hasattr(tui_module, "CHART_TITLE_LABELS")
+
+
+def test_chart_mode_labels_are_grammatically_consistent() -> None:
+    assert CHART_MODE_LABELS == {
+        "1m": "1 MINUTE",
+        "5m": "5 MINUTES",
+        "15m": "15 MINUTES",
+        "1h": "1 HOUR",
+        "1d": "DAILY",
+    }
