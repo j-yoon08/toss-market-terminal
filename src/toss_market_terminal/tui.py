@@ -31,8 +31,8 @@ from .render import (
     format_signed,
     market_metrics,
     market_signals,
-    orderbook_signal_label,
-    trade_pressure_label,
+    orderbook_signal_label_ko,
+    trade_pressure_label_ko,
     volume_bar,
 )
 from .settings import Settings, SettingsStore
@@ -759,21 +759,21 @@ class TossMarketApp(App[int]):
             trades=tuple(self.trades),
         )
         text = Text()
-        text.append("MARKET STATS\n", style="bold #c9d1d9")
+        text.append("시장 신호 요약\n", style="bold #c9d1d9")
         if metrics.spread is not None:
             text.append(
-                f"SPREAD {format_decimal(metrics.spread, self.current_currency)}",
+                f"매수·매도 호가 차이 {format_decimal(metrics.spread, self.current_currency)}",
                 style=MUTED_COLOR,
             )
             if metrics.spread_percent is not None:
                 text.append(f" · {metrics.spread_percent:.3f}%\n", style=MUTED_COLOR)
         if metrics.recent_vwap is not None:
             text.append(
-                f"RECENT VWAP {format_decimal(metrics.recent_vwap, self.current_currency)}",
+                f"체결 평균 {format_decimal(metrics.recent_vwap, self.current_currency)}",
                 style=MUTED_COLOR,
             )
             if signals.vwap_distance_percent is not None:
-                text.append(f" · {format_percent(signals.vwap_distance_percent)}\n")
+                text.append(f" · 현재가 {format_percent(signals.vwap_distance_percent)}\n")
             else:
                 text.append("\n")
         imbalance = (
@@ -781,26 +781,26 @@ class TossMarketApp(App[int]):
             if signals.orderbook_imbalance_percent is not None
             else "—"
         )
-        ratio = f"{signals.bid_ask_ratio:.2f}x" if signals.bid_ask_ratio is not None else "—"
+        ratio = f"{signals.bid_ask_ratio:.2f}배" if signals.bid_ask_ratio is not None else "—"
         pressure = (
             f"{signals.trade_pressure_percent:.1f}%"
             if signals.trade_pressure_percent is not None
             else "—"
         )
         volume_ratio = (
-            f"{signals.volume_spike_ratio:.2f}x" if signals.volume_spike_ratio is not None else "—"
+            f"{signals.volume_spike_ratio:.2f}배" if signals.volume_spike_ratio is not None else "—"
         )
         text.append(
-            f"BOOK {orderbook_signal_label(signals.orderbook_imbalance_percent)} "
-            f"{imbalance} · B/A {ratio}\n",
+            f"호가 {orderbook_signal_label_ko(signals.orderbook_imbalance_percent)} "
+            f"{imbalance} · 잔량비 {ratio}\n",
             style=MUTED_COLOR,
         )
         text.append(
-            f"TICKS {trade_pressure_label(signals.trade_pressure_percent)} {pressure} · "
-            f"VOL {volume_ratio}\n",
+            f"체결 {trade_pressure_label_ko(signals.trade_pressure_percent)} {pressure} · "
+            f"1분 거래량 {volume_ratio}\n",
             style=MUTED_COLOR,
         )
-        text.append(f"FEED {self.market.upper()} · READ ONLY", style="#526273")
+        text.append(f"{self.market.upper()} 공개 시세 · 조회 전용", style="#526273")
         self.query_one("#market-stats", Static).update(text)
 
     def _render_chrome(self) -> None:

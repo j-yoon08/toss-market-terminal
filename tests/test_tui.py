@@ -33,7 +33,7 @@ async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> No
         assert "MARKET CHART" in app.query_one("#chart-panel .panel-title", Static).render().plain
         assert app.query_one("#trades-panel .panel-title", Static).render().plain == "LIVE TRADES"
         assert app.query_one("#trades", DataTable).max_scroll_x == 0
-        assert "RECENT VWAP" in app.query_one("#market-stats", Static).render().plain
+        assert "체결 평균" in app.query_one("#market-stats", Static).render().plain
         assert not app.screen.has_class("compact")
         await pilot.press("d")
         await pilot.pause()
@@ -436,8 +436,16 @@ async def test_tui_emits_one_edge_alert_and_renders_market_signals(
         monkeypatch.setattr(app, "notify", capture_notification)
         monkeypatch.setattr(app, "bell", capture_bell)
         stats = app.query_one("#market-stats", Static).render().plain
-        assert "BOOK " in stats
-        assert "TICKS " in stats
+        assert "시장 신호 요약" in stats
+        assert "매수·매도 호가 차이" in stats
+        assert "체결 평균" in stats
+        assert "호가 매도 우세" in stats
+        assert "잔량비" in stats
+        assert "체결 상승 우세" in stats
+        assert "1분 거래량" in stats
+        assert "공개 시세 · 조회 전용" in stats
+        assert "BOOK " not in stats
+        assert "TICKS " not in stats
 
         app.current_price = Decimal("112")
         app.current_timestamp = "2026-08-25T10:00:00Z"

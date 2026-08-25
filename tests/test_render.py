@@ -10,8 +10,10 @@ from toss_market_terminal.render import (
     market_metrics,
     market_signals,
     orderbook_signal_label,
+    orderbook_signal_label_ko,
     sparkline,
     trade_pressure_label,
+    trade_pressure_label_ko,
     volume_bar,
 )
 
@@ -116,6 +118,17 @@ def test_market_signal_labels_have_strict_neutral_boundaries() -> None:
     assert trade_pressure_label(Decimal("39.99")) == "DOWNTICK HEAVY"
     assert orderbook_signal_label(None) == "INSUFFICIENT"
     assert trade_pressure_label(None) == "INSUFFICIENT"
+
+
+def test_market_signal_korean_labels_preserve_canonical_boundaries() -> None:
+    assert orderbook_signal_label_ko(Decimal("60.01")) == "매수 우세"
+    assert orderbook_signal_label_ko(Decimal("60")) == "수급 균형"
+    assert orderbook_signal_label_ko(Decimal("39.99")) == "매도 우세"
+    assert orderbook_signal_label_ko(None) == "데이터 부족"
+    assert trade_pressure_label_ko(Decimal("60.01")) == "상승 우세"
+    assert trade_pressure_label_ko(Decimal("60")) == "방향 혼조"
+    assert trade_pressure_label_ko(Decimal("39.99")) == "하락 우세"
+    assert trade_pressure_label_ko(None) == "데이터 부족"
 
 
 def test_market_signals_return_none_for_zero_or_insufficient_denominators() -> None:

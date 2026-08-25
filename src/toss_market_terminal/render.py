@@ -61,6 +61,26 @@ def trade_pressure_label(value: Decimal | None) -> str:
     return "MIXED"
 
 
+def orderbook_signal_label_ko(value: Decimal | None) -> str:
+    """Return a compact Korean display label without changing the signal contract."""
+    return {
+        "INSUFFICIENT": "데이터 부족",
+        "BID HEAVY": "매수 우세",
+        "ASK HEAVY": "매도 우세",
+        "BALANCED": "수급 균형",
+    }[orderbook_signal_label(value)]
+
+
+def trade_pressure_label_ko(value: Decimal | None) -> str:
+    """Return a compact Korean display label without changing the signal contract."""
+    return {
+        "INSUFFICIENT": "데이터 부족",
+        "UPTICK HEAVY": "상승 우세",
+        "DOWNTICK HEAVY": "하락 우세",
+        "MIXED": "방향 혼조",
+    }[trade_pressure_label(value)]
+
+
 def format_decimal(value: Decimal, currency: str | None = None) -> str:
     if currency == "KRW":
         return f"{value:,.0f}"
