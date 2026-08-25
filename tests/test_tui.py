@@ -219,6 +219,30 @@ async def test_protocol_error_recovers_on_next_valid_tick(tmp_path: Path) -> Non
         assert app.connection_detail == "topics=2"
 
 
+async def test_recover_protocol_status_stays_degraded_while_indicator_degraded(
+    tmp_path: Path,
+) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.stream_live = True
+        app.subscription_detail = "topics=2"
+        app.protocol_degraded = True
+        app.indicator_degraded = True
+        app.connection_state = "DEGRADED"
+        app.connection_detail = "ValueError: 지표 계산 실패"
+        app._recover_protocol_status()
+        assert app.connection_state == "DEGRADED"
+        assert app.connection_detail == "ValueError: 지표 계산 실패"
+        assert app.protocol_degraded
+        assert app.indicator_degraded
+
+
 async def test_watchlist_refresh_keeps_last_good_rows_and_primary_state(tmp_path: Path) -> None:
     class PriceClient:
         def __init__(self) -> None:
