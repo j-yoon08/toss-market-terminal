@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+from toss_market_terminal.client import READ_ONLY_PATHS, TossMarketClient
+from toss_market_terminal.config import Credentials
+
+
+@pytest.mark.asyncio
+async def test_snapshot_calls_only_allowlisted_market_data() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(
+                200,
+                json={"access_token": "test-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        assert request.headers["authorization"] == "Bearer test-token"
+        responses = {
+            "/api/v1/stocks": {
+                "result": [
+                    {
+                        "symbol": "AAPL",
+                        "name": "애플",
+                        "englishName": "APPLE INC",
+                        "market": "NASDAQ",
+                        "currency": "USD",
+                    }
+                ]
+            },
+            "/api/v1/prices": {
+                "result": [
+                    {
+                        "symbol": "AAPL",
+                        "lastPrice": "185.70",
+                        "currency": "USD",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            },
+            "/api/v1/orderbook": {
+                "result": {"currency": "USD", "timestamp": None, "asks": [], "bids": []}
+            },
+            "/api/v1/trades": {
+                "result": [
+                    {
+                        "price": "185.70",
+                        "volume": "2",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "currency": "USD",
+                    }
+                ]
+            },
+            "/api/v1/candles": {
+                "result": {
+                    "candles": [
+                        {
+                            "timestamp": "2026-01-01T00:00:00Z",
+                            "openPrice": "185",
+                            "highPrice": "186",
+                            "lowPrice": "184",
+                            "closePrice": "185.7",
+                            "volume": "100",
+                            "currency": "USD",
+                        }
+                    ],
+                    "nextBefore": None,
+                }
+            },
+        }
+        return httpx.Response(200, json=responses[request.url.path])
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        snapshot = await client.snapshot("AAPL")
+
+    assert snapshot.stock.symbol == "AAPL"
+    assert seen.count("/oauth2/token") == 1
+    assert set(seen[1:]) == READ_ONLY_PATHS
+    assert not any(
+        "account" in path or "order" in path for path in seen if path != "/api/v1/orderbook"
+    )
+
+
+@pytest.mark.asyncio
+async def test_error_does_not_include_raw_response_or_secret() -> None:
+    secret = "tssk_live_never_print_this"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            content=json.dumps({"error": "invalid_client", "debug": secret}).encode(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(Credentials("tsck_live_test", secret), http_client=http_client)
+        with pytest.raises(Exception) as caught:
+            await client.access_token()
+    assert "invalid_client" in str(caught.value)
+    assert secret not in str(caught.value)

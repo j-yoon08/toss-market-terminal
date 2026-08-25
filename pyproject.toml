@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "toss-market-terminal"
+version = "0.1.0"
+description = "Read-only real-time stock terminal for the official Toss Securities Open API"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Jongyun Kim" }]
+dependencies = [
+  "httpx>=0.27",
+  "rich>=13.8",
+  "textual>=0.80",
+  "websockets>=14",
+]
+
+[project.scripts]
+toss-market = "toss_market_terminal.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/toss_market_terminal"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
