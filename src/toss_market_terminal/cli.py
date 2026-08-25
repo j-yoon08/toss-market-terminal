@@ -115,8 +115,8 @@ def main() -> int:
                 raise ValueError("probe 시간은 1~60초여야 합니다.")
             return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
         if args.command == "watch":
-            TossMarketApp(symbol, args.credentials).run()
-            return 0
+            result = TossMarketApp(symbol, args.credentials).run()
+            return result or 0
     except (CredentialError, TossApiError, ValueError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 2

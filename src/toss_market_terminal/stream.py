@@ -10,8 +10,9 @@ from typing import Any
 from uuid import uuid4
 
 from websockets.asyncio.client import connect
+from websockets.exceptions import InvalidStatus
 
-from .client import TossMarketClient
+from .client import TossApiError, TossMarketClient
 from .models import Orderbook, Trade
 
 WS_URL = "wss://openapi-ws.tossinvest.com/ws/v1"
@@ -135,19 +136,43 @@ class TossMarketStream:
                             event = parse_stream_frame(raw, symbol)
                             if event is not None:
                                 yield event
-                            if isinstance(event, StreamStatus) and event.state == "error":
-                                raise ConnectionError("stream-error")
+                            if isinstance(event, StreamStatus):
+                                if event.state == "error":
+                                    raise ConnectionError("stream-error")
+                                if event.state == "rejected":
+                                    return
                     finally:
                         keepalive.cancel()
                         await asyncio.gather(keepalive, return_exceptions=True)
                 raise ConnectionError("stream-closed")
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except TossApiError as exc:
+                if exc.status_code in {401, 403}:
+                    yield StreamStatus("auth_error", f"http_{exc.status_code}:{exc.code}")
+                    return
                 attempt += 1
-                delay = min(30.0, 2 ** min(attempt - 1, 5)) + random.uniform(0, 0.5)
+                delay = self._retry_delay(attempt)
                 yield StreamStatus("reconnecting", f"retry_in={delay:.1f}s")
                 await asyncio.sleep(delay)
+            except InvalidStatus as exc:
+                status_code = getattr(exc.response, "status_code", 0)
+                if status_code in {401, 403}:
+                    yield StreamStatus("auth_error", f"websocket_http_{status_code}")
+                    return
+                attempt += 1
+                delay = self._retry_delay(attempt)
+                yield StreamStatus("reconnecting", f"retry_in={delay:.1f}s")
+                await asyncio.sleep(delay)
+            except Exception:
+                attempt += 1
+                delay = self._retry_delay(attempt)
+                yield StreamStatus("reconnecting", f"retry_in={delay:.1f}s")
+                await asyncio.sleep(delay)
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        return min(30.0, 2 ** min(attempt - 1, 5)) + random.uniform(0, 0.5)
 
     @staticmethod
     async def _keepalive(websocket: Any) -> None:

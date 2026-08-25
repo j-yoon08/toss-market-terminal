@@ -11,13 +11,13 @@ from textual.containers import Horizontal
 from textual.widgets import DataTable, Footer, Header, Static
 
 from .client import TossMarketClient
-from .config import Credentials
+from .config import CredentialError, Credentials
 from .models import MarketSnapshot, Orderbook, Trade
 from .render import format_decimal, sparkline
 from .stream import OrderbookEvent, StreamStatus, TossMarketStream, TradeEvent, infer_market
 
 
-class TossMarketApp(App[None]):
+class TossMarketApp(App[int]):
     TITLE = "Toss Market Terminal"
     SUB_TITLE = "READ ONLY"
     BINDINGS: ClassVar = [("q", "quit", "종료"), ("r", "refresh", "REST 재동기화")]
@@ -57,7 +57,11 @@ class TossMarketApp(App[None]):
         orderbook.add_columns("구분", "가격", "잔량")
         trades = self.query_one("#trades", DataTable)
         trades.add_columns("시각", "가격", "수량")
-        credentials = Credentials.load(self.credentials_path)
+        try:
+            credentials = Credentials.load(self.credentials_path)
+        except CredentialError as exc:
+            self.exit(2, message=f"오류: {exc}")
+            return
         self.client = TossMarketClient(credentials)
         await self._refresh_snapshot()
         self.feed_task = asyncio.create_task(self._run_feed())

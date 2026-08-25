@@ -49,6 +49,7 @@ class TossMarketClient:
         )
         self._access_token: str | None = None
         self._token_expires_at = 0.0
+        self._token_refresh_margin = 60.0
         self._token_lock = asyncio.Lock()
 
     async def __aenter__(self) -> TossMarketClient:
@@ -62,10 +63,16 @@ class TossMarketClient:
             await self._http.aclose()
 
     async def access_token(self) -> str:
-        if self._access_token and time.monotonic() < self._token_expires_at - 60:
+        if (
+            self._access_token
+            and time.monotonic() < self._token_expires_at - self._token_refresh_margin
+        ):
             return self._access_token
         async with self._token_lock:
-            if self._access_token and time.monotonic() < self._token_expires_at - 60:
+            if (
+                self._access_token
+                and time.monotonic() < self._token_expires_at - self._token_refresh_margin
+            ):
                 return self._access_token
             response = await self._http.post(
                 "/oauth2/token",
@@ -87,6 +94,7 @@ class TossMarketClient:
             if not isinstance(token, str) or not token:
                 raise TossApiError(response.status_code, "invalid-token-response")
             self._access_token = token
+            self._token_refresh_margin = min(60.0, max(1.0, expires_in * 0.1))
             self._token_expires_at = time.monotonic() + max(expires_in, 1)
             return token
 
