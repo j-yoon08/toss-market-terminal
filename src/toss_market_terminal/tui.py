@@ -280,11 +280,16 @@ class TossMarketApp(App[int]):
 
     def _prepare_tables(self) -> None:
         watchlist = self.query_one("#watchlist", DataTable)
-        watchlist.add_columns("SYMBOL", "PRICE", "ALRT")
+        watchlist.add_column("SYMBOL", width=7)
+        watchlist.add_column("PRICE", width=12)
+        watchlist.add_column("A", width=2)
         orderbook = self.query_one("#orderbook", DataTable)
         orderbook.add_columns("SIDE", "PRICE", "SIZE", "DEPTH")
         trades = self.query_one("#trades", DataTable)
-        trades.add_columns("TIME", "PRICE", "SIZE", "")
+        trades.add_column("TIME", width=13)
+        trades.add_column("PRICE", width=8)
+        trades.add_column("SIZE", width=5)
+        trades.add_column("", width=1)
 
     async def _load_persisted_watchlist(self) -> None:
         """Merge the persisted watchlist into memory without persisting anything."""
@@ -368,7 +373,11 @@ class TossMarketApp(App[int]):
             price_text = f"{row.price} {row.currency}" if row is not None else "—"
             if row is None or self.watchlist_stale:
                 price_text = f"{price_text}*" if self.watchlist_stale else price_text
-            table.add_row(symbol, Text(price_text, style=MUTED_COLOR), f"{marker}{count}")
+            table.add_row(
+                symbol,
+                Text(price_text, style=MUTED_COLOR),
+                f"{marker}{count}",
+            )
 
     def _evaluate_alerts(
         self,
