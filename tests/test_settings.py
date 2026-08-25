@@ -232,6 +232,18 @@ def test_atomic_save_sets_permissions_and_leaves_no_temp_files(tmp_path: Path) -
     assert store.load() == Settings()
 
 
+def test_save_does_not_chmod_an_existing_parent_directory(tmp_path: Path) -> None:
+    shared_parent = tmp_path / "shared"
+    shared_parent.mkdir(mode=0o755)
+    os.chmod(shared_parent, 0o755)
+    target = shared_parent / "settings.json"
+
+    SettingsStore(target).save(Settings(watchlist=("AAPL",)))
+
+    assert stat.S_IMODE(os.stat(shared_parent).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+
 def test_error_messages_do_not_echo_raw_file_content(tmp_path: Path) -> None:
     marker = "RAWCONTENT-SENTINEL-7351"
     path = tmp_path / "settings.json"

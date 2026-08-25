@@ -205,10 +205,14 @@ class SettingsStore:
             raise SettingsError(f"지원하지 않는 설정 버전: {settings.version}")
         path = self._resolve()
         parent = path.parent
+        parent_created = False
         try:
-            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            current_umask = os.umask(0o077)
-            os.umask(current_umask)
+            try:
+                parent.mkdir(mode=0o700, parents=True)
+                parent_created = True
+            except FileExistsError:
+                if not parent.is_dir():
+                    raise SettingsError("설정 경로의 상위 항목은 디렉터리여야 합니다.") from None
             fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=parent)
             try:
                 os.fchmod(fd, 0o600)
@@ -222,7 +226,8 @@ class SettingsStore:
                 except OSError:
                     pass
                 raise
-            os.chmod(parent, 0o700)
+            if parent_created:
+                os.chmod(parent, 0o700)
         except OSError as exc:
             raise SettingsError("설정 파일을 안전하게 저장하지 못했습니다.") from exc
 
