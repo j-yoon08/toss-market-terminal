@@ -215,8 +215,8 @@ class TossMarketClient:
             self.trades(symbol),
         )
         candles, daily_candles = await asyncio.gather(
-            self.candles(symbol),
-            self.candles(symbol, interval="1d", count=40),
+            self.candles(symbol, count=200),
+            self.candles(symbol, interval="1d", count=200),
         )
         return MarketSnapshot(
             stock=stock,

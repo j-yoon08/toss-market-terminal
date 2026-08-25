@@ -6,17 +6,31 @@ from datetime import datetime
 from decimal import Decimal
 from statistics import median
 
+from rich.cells import set_cell_size
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .models import MarketSnapshot, Orderbook, Trade
+from .indicators import aggregate_candles
+from .models import Candle, MarketSnapshot, Orderbook, Trade
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 UP_COLOR = "#2dd4bf"
 DOWN_COLOR = "#fb7185"
 MUTED_COLOR = "#7d8998"
+
+CHART_MODE_LABELS = {
+    "1m": "1 MINUTE",
+    "5m": "5 MINUTE",
+    "15m": "15 MINUTE",
+    "1h": "1 HOUR",
+    "1d": "DAILY",
+}
+_CHART_MAX_ECHO = 32
+_MIN_CHART_DIMENSION = 1
+_CHART_CHROME_LINES = 3  # summary line, blank separator, "VOLUME" header
+_PRICE_ROW_RATIO = 0.7
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,25 +351,186 @@ def trades_table(trades: tuple[Trade, ...] | list[Trade], limit: int = 15) -> Ta
     return table
 
 
-def chart_renderable(snapshot: MarketSnapshot, mode: str = "1m") -> Text:
-    candles = snapshot.daily_candles if mode == "1d" else snapshot.candles
-    ordered = list(reversed(candles))
-    closes = [candle.close_price for candle in ordered]
-    volumes = [candle.volume for candle in ordered]
-    currency = snapshot.price.currency
-    label = "DAILY" if mode == "1d" else "1 MINUTE"
-    text = Text()
-    text.append(f"PRICE · {label}\n", style="bold #c9d1d9")
-    text.append(f"{sparkline(closes)}\n", style=UP_COLOR)
-    if closes:
-        text.append(
-            f"LOW {format_decimal(min(closes), currency)}   "
-            f"HIGH {format_decimal(max(closes), currency)}\n\n",
-            style=MUTED_COLOR,
-        )
-    text.append("VOLUME\n", style="bold #c9d1d9")
-    text.append(sparkline(volumes), style="#8297b0")
+def _chart_echo(value: object) -> str:
+    """Bounded echo of an offending value for error messages."""
+    text = str(value)
+    if len(text) > _CHART_MAX_ECHO:
+        text = text[:_CHART_MAX_ECHO] + "…"
     return text
+
+
+def downsample_candles(candles: Sequence[Candle], target_columns: int) -> tuple[Candle, ...]:
+    """Aggregate chronological (oldest-first) ``candles`` into ``target_columns`` buckets.
+
+    Each bucket spans a contiguous, non-overlapping slice of ``candles`` (no
+    reordering) with proper OHLCV: open is its first member's open, close is
+    its last member's close, high/low are the bucket extremes, and volume is
+    the sum. Returns ``candles`` unchanged when it already fits within
+    ``target_columns``. Raises ``ValueError`` when ``target_columns`` is not
+    positive.
+    """
+    if target_columns <= 0:
+        raise ValueError(f"차트 컬럼 수는 양수여야 합니다: {_chart_echo(target_columns)}")
+    items = tuple(candles)
+    count = len(items)
+    if count <= target_columns:
+        return items
+    bucketed: list[Candle] = []
+    for index in range(target_columns):
+        start = index * count // target_columns
+        end = (index + 1) * count // target_columns
+        group = items[start:end]
+        if not group:
+            continue
+        bucketed.append(
+            Candle(
+                timestamp=group[0].timestamp,
+                open_price=group[0].open_price,
+                high_price=max(candle.high_price for candle in group),
+                low_price=min(candle.low_price for candle in group),
+                close_price=group[-1].close_price,
+                volume=sum((candle.volume for candle in group), Decimal("0")),
+                currency=group[-1].currency,
+            )
+        )
+    return tuple(bucketed)
+
+
+def _price_row(value: Decimal, low: Decimal, span: Decimal, rows: int) -> int:
+    """Row index (0 = top) that ``value`` maps to across ``rows`` price bands."""
+    if rows <= 1:
+        return 0
+    normalized = (value - low) / span
+    if normalized < 0:
+        normalized = Decimal("0")
+    elif normalized > 1:
+        normalized = Decimal("1")
+    row_from_top = round(float((Decimal("1") - normalized) * (rows - 1)))
+    return max(0, min(rows - 1, row_from_top))
+
+
+def _candlestick_grid(buckets: Sequence[Candle], rows: int) -> list[Text]:
+    lines = [Text() for _ in range(rows)]
+    if not buckets or rows <= 0:
+        return lines
+    low = min(candle.low_price for candle in buckets)
+    high = max(candle.high_price for candle in buckets)
+    span = high - low
+    if span <= 0:
+        span = Decimal("1")
+    for candle in buckets:
+        style = UP_COLOR if candle.close_price >= candle.open_price else DOWN_COLOR
+        top_row = _price_row(candle.high_price, low, span, rows)
+        bottom_row = _price_row(candle.low_price, low, span, rows)
+        body_top_row = _price_row(max(candle.open_price, candle.close_price), low, span, rows)
+        body_bottom_row = _price_row(min(candle.open_price, candle.close_price), low, span, rows)
+        for row in range(rows):
+            if body_top_row <= row <= body_bottom_row:
+                char = "█"
+            elif top_row <= row <= bottom_row:
+                char = "│"
+            else:
+                char = " "
+            lines[row].append(char, style=style if char != " " else None)
+    return lines
+
+
+def _volume_grid(buckets: Sequence[Candle], rows: int) -> list[Text]:
+    lines = [Text() for _ in range(rows)]
+    if not buckets or rows <= 0:
+        return lines
+    max_volume = max((candle.volume for candle in buckets), default=Decimal("0"))
+    for candle in buckets:
+        style = UP_COLOR if candle.close_price >= candle.open_price else DOWN_COLOR
+        filled = 0
+        if max_volume > 0 and candle.volume > 0:
+            filled = max(1, min(rows, round(float(candle.volume / max_volume) * rows)))
+        for row in range(rows):
+            filled_from_bottom = rows - row
+            char = "█" if filled_from_bottom <= filled else " "
+            lines[row].append(char, style=style if char != " " else None)
+    return lines
+
+
+def _join_lines(lines: Sequence[Text]) -> Text:
+    result = Text()
+    for index, line in enumerate(lines):
+        if index:
+            result.append("\n")
+        result.append(line)
+    return result
+
+
+def chart_renderable(
+    snapshot: MarketSnapshot,
+    mode: str = "1m",
+    width: int = 48,
+    height: int = 18,
+) -> Text:
+    """Render a candlestick + volume chart for ``mode`` as pure Rich ``Text``.
+
+    Supported ``mode`` values: ``1m`` and ``1d`` use ``snapshot.candles`` /
+    ``snapshot.daily_candles`` as-is; ``5m``, ``15m``, and ``1h`` aggregate
+    ``snapshot.candles`` via :func:`toss_market_terminal.indicators.aggregate_candles`.
+    Candles render chronologically, oldest on the left and newest on the
+    right; when more candles exist than fit in ``width`` columns they are
+    downsampled via :func:`downsample_candles` (not close-only sampling).
+    Every plain line stays within ``cell_len(line) <= width`` and the line
+    count stays within ``height``; ``width``/``height`` below 1 are clamped
+    up to 1. Raises ``ValueError`` for an unsupported ``mode``.
+    """
+    if mode not in CHART_MODE_LABELS:
+        raise ValueError(
+            f"지원하지 않는 차트 모드입니다: {_chart_echo(mode)} "
+            f"(지원: {', '.join(CHART_MODE_LABELS)})"
+        )
+    chart_width = max(_MIN_CHART_DIMENSION, int(width))
+    chart_height = max(_MIN_CHART_DIMENSION, int(height))
+    currency = snapshot.price.currency
+    label = CHART_MODE_LABELS[mode]
+
+    if mode == "1d":
+        source: Sequence[Candle] = snapshot.daily_candles
+    elif mode == "1m":
+        source = snapshot.candles
+    else:
+        source = aggregate_candles(snapshot.candles, mode)
+    chronological = tuple(reversed(source))
+
+    lines: list[Text] = [Text(set_cell_size(f"PRICE · {label}", chart_width), style="bold #c9d1d9")]
+
+    if not chronological:
+        lines.append(Text(set_cell_size("데이터 없음", chart_width), style=MUTED_COLOR))
+        return _join_lines(lines[:chart_height])
+
+    buckets = downsample_candles(chronological, chart_width)
+
+    remaining = max(0, chart_height - 1)
+    price_rows = 0
+    volume_rows = 0
+    include_chrome = False
+    if remaining > _CHART_CHROME_LINES + 1:
+        body = remaining - _CHART_CHROME_LINES
+        price_rows = max(1, min(body - 1, round(body * _PRICE_ROW_RATIO)))
+        volume_rows = body - price_rows
+        include_chrome = True
+    elif remaining > 0:
+        price_rows = remaining
+
+    lines.extend(_candlestick_grid(buckets, price_rows))
+    if include_chrome:
+        low_price = min(candle.low_price for candle in buckets)
+        high_price = max(candle.high_price for candle in buckets)
+        summary = set_cell_size(
+            f"LOW {format_decimal(low_price, currency)}   "
+            f"HIGH {format_decimal(high_price, currency)}",
+            chart_width,
+        )
+        lines.append(Text(summary, style=MUTED_COLOR))
+        lines.append(Text())
+        lines.append(Text(set_cell_size("VOLUME", chart_width), style="bold #c9d1d9"))
+        lines.extend(_volume_grid(buckets, volume_rows))
+    return _join_lines(lines)
 
 
 def snapshot_renderable(snapshot: MarketSnapshot) -> Group:

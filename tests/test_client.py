@@ -93,7 +93,7 @@ async def test_snapshot_calls_only_allowlisted_market_data() -> None:
     assert seen.count("/oauth2/token") == 1
     assert seen.count("/api/v1/candles") == 2
     assert {query["interval"] for query in candle_queries} == {"1m", "1d"}
-    assert any(query["interval"] == "1d" and query["count"] == "40" for query in candle_queries)
+    assert all(query["count"] == "200" for query in candle_queries)
     assert set(seen[1:]) == READ_ONLY_PATHS
     assert not any(
         "account" in path or "order" in path for path in seen if path != "/api/v1/orderbook"

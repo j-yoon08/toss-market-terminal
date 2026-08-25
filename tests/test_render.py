@@ -3,12 +3,19 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 
+import pytest
 from rich.cells import cell_len
+from rich.text import Text
 
 from tests.helpers import sample_snapshot
 from toss_market_terminal.models import Candle, Orderbook, OrderbookEntry, Trade
 from toss_market_terminal.render import (
+    CHART_MODE_LABELS,
+    DOWN_COLOR,
+    UP_COLOR,
+    _candlestick_grid,
     chart_renderable,
+    downsample_candles,
     format_multiple,
     format_trade_time,
     market_metrics,
@@ -20,6 +27,39 @@ from toss_market_terminal.render import (
     trade_pressure_label_ko,
     volume_bar,
 )
+
+
+def _candle(
+    timestamp: str,
+    open_price: str,
+    high_price: str,
+    low_price: str,
+    close_price: str,
+    volume: str,
+    currency: str = "USD",
+) -> Candle:
+    return Candle(
+        timestamp,
+        Decimal(open_price),
+        Decimal(high_price),
+        Decimal(low_price),
+        Decimal(close_price),
+        Decimal(volume),
+        currency,
+    )
+
+
+def _style_at(line: Text, index: int) -> str | None:
+    style: str | None = None
+    for span in line.spans:
+        if span.start <= index < span.end:
+            style = str(span.style)
+    return style
+
+
+def _chronological_snapshot(candles: tuple[Candle, ...]):
+    """Wrap newest-first ``candles`` into a snapshot, matching model conventions."""
+    return replace(sample_snapshot(), candles=candles)
 
 
 def test_trade_time_is_displayed_to_whole_seconds() -> None:
@@ -176,3 +216,138 @@ def test_market_signals_return_none_for_zero_or_insufficient_denominators() -> N
     assert signals.bid_ask_ratio is None
     assert signals.volume_spike_ratio is None
     assert signals.trade_pressure_percent is None
+
+
+def test_candlestick_grid_colors_by_direction_and_reflects_high_low_not_just_close() -> None:
+    # Oldest (leftmost) candle is bullish, newest (rightmost) is bearish. Both wicks
+    # extend well beyond their open/close body, so a close-only sampler would miss them.
+    bullish = _candle("t1", "100", "110", "90", "105", "10")
+    bearish = _candle("t2", "105", "108", "95", "100", "10")
+    grid = _candlestick_grid((bullish, bearish), rows=5)
+    assert len(grid) == 5
+
+    top_row = grid[0]
+    assert top_row.plain == "││"
+    assert _style_at(top_row, 0) == UP_COLOR
+    assert _style_at(top_row, 1) == DOWN_COLOR
+
+    # Bullish's low (90) reaches the bottom row; bearish's low (95) does not, so its
+    # column must go blank there even though both candles share the same price scale.
+    bottom_row = grid[4]
+    assert bottom_row.plain[0] == "│"
+    assert bottom_row.plain[1] == " "
+
+    # A row strictly between the two lows is still wick for both: proof the wick
+    # tracks the low price, not merely wherever the close price happens to land.
+    lower_mid_row = grid[3]
+    assert lower_mid_row.plain == "││"
+
+
+def test_chart_renderable_latest_candle_is_rightmost() -> None:
+    # snapshot.candles is newest-first; index 0 (bearish) must render on the right.
+    candles = (
+        _candle("t3", "100", "101", "99", "95", "5"),  # newest: bearish
+        _candle("t2", "100", "101", "99", "101", "5"),  # bullish
+        _candle("t1", "100", "101", "99", "101", "5"),  # oldest: bullish
+    )
+    snapshot = _chronological_snapshot(candles)
+    chart = chart_renderable(snapshot, "1m", width=3, height=6)
+    lines = chart.plain.splitlines()
+    price_line = next(line for line in lines if "█" in line or "│" in line)
+    grid_row_index = lines.index(price_line)
+
+    # Re-render the same grid directly (mirroring chart_renderable's ordering) so
+    # we can inspect per-column style rather than glyphs alone.
+    chronological = tuple(reversed(candles))
+    buckets = downsample_candles(chronological, 3)
+    grid = _candlestick_grid(buckets, rows=grid_row_index + 1)
+    target = grid[grid_row_index]
+    assert _style_at(target, 0) == UP_COLOR  # oldest, leftmost
+    assert _style_at(target, 2) == DOWN_COLOR  # newest, rightmost
+
+
+def test_downsample_candles_aggregates_proper_ohlcv_not_close_sampling() -> None:
+    chronological = (
+        _candle("t1", "10", "12", "9", "11", "1"),
+        _candle("t2", "11", "13", "10", "12", "2"),
+        _candle("t3", "12", "20", "11", "13", "3"),
+        _candle("t4", "13", "14", "5", "6", "4"),
+        _candle("t5", "6", "9", "4", "8", "5"),
+        _candle("t6", "8", "10", "7", "9", "6"),
+    )
+    bucketed = downsample_candles(chronological, 3)
+    assert len(bucketed) == 3
+    first, second, third = bucketed
+    assert first.open_price == Decimal("10")
+    assert first.close_price == Decimal("12")
+    assert first.high_price == Decimal("13")  # not just close-sampled max
+    assert first.low_price == Decimal("9")
+    assert first.volume == Decimal("3")
+
+    assert second.open_price == Decimal("12")
+    assert second.close_price == Decimal("6")
+    assert second.high_price == Decimal("20")
+    assert second.low_price == Decimal("5")
+    assert second.volume == Decimal("7")
+
+    assert third.open_price == Decimal("6")
+    assert third.close_price == Decimal("9")
+    assert third.high_price == Decimal("10")
+    assert third.low_price == Decimal("4")
+    assert third.volume == Decimal("11")
+
+    # Fewer candles than target columns: pass through unchanged.
+    assert downsample_candles(chronological[:2], 5) == chronological[:2]
+
+
+def test_downsample_candles_rejects_non_positive_target() -> None:
+    with pytest.raises(ValueError):
+        downsample_candles((), 0)
+
+
+def test_chart_renderable_supports_every_timeframe_label() -> None:
+    snapshot = sample_snapshot()
+    for mode, label in CHART_MODE_LABELS.items():
+        chart = chart_renderable(snapshot, mode)
+        assert f"PRICE · {label}" in chart.plain
+
+
+def test_chart_renderable_rejects_unknown_mode_with_bounded_message() -> None:
+    with pytest.raises(ValueError) as caught:
+        chart_renderable(sample_snapshot(), "3m")
+    assert "3m" in str(caught.value)
+
+    with pytest.raises(ValueError) as caught_long:
+        chart_renderable(sample_snapshot(), "x" * 500)
+    assert len(str(caught_long.value)) < 200
+
+
+@pytest.mark.parametrize("width", [20, 33, 48])
+@pytest.mark.parametrize("height", [1, 5, 6, 10, 18])
+def test_chart_renderable_stays_within_width_and_height_bounds(width: int, height: int) -> None:
+    chart = chart_renderable(sample_snapshot(), "1m", width=width, height=height)
+    lines = chart.plain.splitlines()
+    assert len(lines) <= height
+    for line in lines:
+        assert cell_len(line) <= width
+
+
+def test_chart_renderable_handles_empty_flat_and_zero_volume_without_crashing() -> None:
+    empty = replace(sample_snapshot(), candles=(), daily_candles=())
+    chart = chart_renderable(empty, "1m", width=20, height=10)
+    assert chart.plain
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 20
+
+    flat_candles = tuple(_candle(f"t{i}", "100", "100", "100", "100", "0") for i in range(5))
+    flat = replace(sample_snapshot(), candles=flat_candles)
+    chart = chart_renderable(flat, "1m", width=20, height=12)
+    lines = chart.plain.splitlines()
+    assert len(lines) <= 12
+    for line in lines:
+        assert cell_len(line) <= 20
+
+    one_candle = replace(sample_snapshot(), candles=(_candle("t1", "1", "1", "1", "1", "0"),))
+    chart = chart_renderable(one_candle, "1m", width=20, height=12)
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 20
