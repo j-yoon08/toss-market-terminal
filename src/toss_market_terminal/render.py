@@ -99,6 +99,11 @@ def format_percent(value: Decimal) -> str:
     return f"{prefix}{value:.2f}%"
 
 
+def format_trade_time(timestamp: str) -> str:
+    """Format an ISO-like trade timestamp to whole-second wall-clock time."""
+    return timestamp.rsplit("T", 1)[-1][:8]
+
+
 def sparkline(values: list[Decimal]) -> str:
     if not values:
         return "데이터 없음"
@@ -303,7 +308,7 @@ def orderbook_table(orderbook: Orderbook, current_price: Decimal, depth: int = 7
 def trades_table(trades: tuple[Trade, ...] | list[Trade], limit: int = 15) -> Table:
     items = list(trades)[:limit]
     table = Table(expand=True, box=None, pad_edge=False)
-    table.add_column("TIME", width=10)
+    table.add_column("TIME", width=9)
     table.add_column("PRICE", justify="right")
     table.add_column("SIZE", justify="right")
     table.add_column("", width=1)
@@ -316,7 +321,7 @@ def trades_table(trades: tuple[Trade, ...] | list[Trade], limit: int = 15) -> Ta
         else:
             marker, style = "·", MUTED_COLOR
         table.add_row(
-            trade.timestamp.split("T")[-1][:12],
+            format_trade_time(trade.timestamp),
             Text(format_decimal(trade.price, trade.currency), style=style),
             format_decimal(trade.volume),
             Text(marker, style=style),

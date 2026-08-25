@@ -7,6 +7,7 @@ from tests.helpers import sample_snapshot
 from toss_market_terminal.models import Candle, Orderbook, OrderbookEntry, Trade
 from toss_market_terminal.render import (
     chart_renderable,
+    format_trade_time,
     market_metrics,
     market_signals,
     orderbook_signal_label,
@@ -16,6 +17,12 @@ from toss_market_terminal.render import (
     trade_pressure_label_ko,
     volume_bar,
 )
+
+
+def test_trade_time_is_displayed_to_whole_seconds() -> None:
+    assert format_trade_time("2026-08-25T23:31:42.000Z") == "23:31:42"
+    assert format_trade_time("2026-08-25T23:31:42.987654+09:00") == "23:31:42"
+    assert format_trade_time("23:31:42.123") == "23:31:42"
 
 
 def test_market_metrics_normalize_quote_to_candle_timezone() -> None:

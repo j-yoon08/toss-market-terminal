@@ -29,6 +29,7 @@ from .render import (
     format_decimal,
     format_percent,
     format_signed,
+    format_trade_time,
     market_metrics,
     market_signals,
     orderbook_signal_label_ko,
@@ -286,9 +287,9 @@ class TossMarketApp(App[int]):
         orderbook = self.query_one("#orderbook", DataTable)
         orderbook.add_columns("SIDE", "PRICE", "SIZE", "DEPTH")
         trades = self.query_one("#trades", DataTable)
-        trades.add_column("TIME", width=13)
-        trades.add_column("PRICE", width=8)
-        trades.add_column("SIZE", width=5)
+        trades.add_column("TIME", width=9)
+        trades.add_column("PRICE", width=10)
+        trades.add_column("SIZE", width=7)
         trades.add_column("", width=1)
 
     async def _load_persisted_watchlist(self) -> None:
@@ -727,7 +728,7 @@ class TossMarketApp(App[int]):
             else:
                 marker, style = "·", MUTED_COLOR
             table.add_row(
-                trade.timestamp.split("T")[-1][:12],
+                format_trade_time(trade.timestamp),
                 Text(format_decimal(trade.price, trade.currency), style=style),
                 format_decimal(trade.volume),
                 Text(marker, style=style),

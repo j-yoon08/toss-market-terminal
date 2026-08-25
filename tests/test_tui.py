@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Static
 
 from tests.helpers import sample_snapshot
@@ -57,6 +58,23 @@ async def test_compact_tui_hides_chart_before_squeezing_tables(tmp_path: Path) -
         assert app.query_one("#trades-panel .panel-title", Static).render().plain == "LIVE TRADES"
         assert app.query_one("#chart-panel").styles.display == "none"
         assert app.query_one("#watchlist-panel").styles.display == "none"
+
+
+async def test_live_trade_time_hides_fractional_seconds(tmp_path: Path) -> None:
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(Trade(Decimal("110"), Decimal("2"), "2026-08-25T10:00:00.987Z", "USD"),),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        table = app.query_one("#trades", DataTable)
+        assert table.get_cell_at(Coordinate(0, 0)) == "10:00:00"
 
 
 async def test_snapshot_failure_is_sanitized_and_not_marked_live(tmp_path: Path) -> None:
