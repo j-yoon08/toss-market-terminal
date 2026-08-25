@@ -27,6 +27,7 @@ from .render import (
     chart_renderable,
     direction_style,
     format_decimal,
+    format_multiple,
     format_percent,
     format_signed,
     format_trade_time,
@@ -782,15 +783,13 @@ class TossMarketApp(App[int]):
             if signals.orderbook_imbalance_percent is not None
             else "—"
         )
-        ratio = f"{signals.bid_ask_ratio:.2f}배" if signals.bid_ask_ratio is not None else "—"
+        ratio = format_multiple(signals.bid_ask_ratio)
         pressure = (
             f"{signals.trade_pressure_percent:.1f}%"
             if signals.trade_pressure_percent is not None
             else "—"
         )
-        volume_ratio = (
-            f"{signals.volume_spike_ratio:.2f}배" if signals.volume_spike_ratio is not None else "—"
-        )
+        volume_ratio = format_multiple(signals.volume_spike_ratio)
         text.append(
             f"호가 {orderbook_signal_label_ko(signals.orderbook_imbalance_percent)} "
             f"{imbalance} · 잔량비 {ratio}\n",

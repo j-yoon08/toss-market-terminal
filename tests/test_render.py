@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 
+from rich.cells import cell_len
+
 from tests.helpers import sample_snapshot
 from toss_market_terminal.models import Candle, Orderbook, OrderbookEntry, Trade
 from toss_market_terminal.render import (
     chart_renderable,
+    format_multiple,
     format_trade_time,
     market_metrics,
     market_signals,
@@ -23,6 +26,15 @@ def test_trade_time_is_displayed_to_whole_seconds() -> None:
     assert format_trade_time("2026-08-25T23:31:42.000Z") == "23:31:42"
     assert format_trade_time("2026-08-25T23:31:42.987654+09:00") == "23:31:42"
     assert format_trade_time("23:31:42.123") == "23:31:42"
+
+
+def test_signal_multiple_format_stays_within_market_stats_width() -> None:
+    assert format_multiple(None) == "—"
+    assert format_multiple(Decimal("9.99")) == "9.99배"
+    assert format_multiple(Decimal("10")) == "10배"
+    assert format_multiple(Decimal("99.99")) == "100배"
+    line = f"체결 상승 우세 61.2% · 1분 거래량 {format_multiple(Decimal('99.99'))}"
+    assert cell_len(line) <= 40
 
 
 def test_market_metrics_normalize_quote_to_candle_timezone() -> None:

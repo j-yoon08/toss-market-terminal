@@ -99,6 +99,14 @@ def format_percent(value: Decimal) -> str:
     return f"{prefix}{value:.2f}%"
 
 
+def format_multiple(value: Decimal | None) -> str:
+    """Format a ratio compactly enough for the 40-cell market stats panel."""
+    if value is None:
+        return "—"
+    places = 0 if abs(value) >= Decimal("10") else 2
+    return f"{value:.{places}f}배"
+
+
 def format_trade_time(timestamp: str) -> str:
     """Format an ISO-like trade timestamp to whole-second wall-clock time."""
     return timestamp.rsplit("T", 1)[-1][:8]
