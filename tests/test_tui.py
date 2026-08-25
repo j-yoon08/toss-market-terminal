@@ -28,9 +28,11 @@ async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> No
         assert "TOSS MARKET" in app.query_one("#topbar", Static).render().plain
         assert app.query_one("#watchlist-panel .panel-title", Static).render().plain == "WATCHLIST"
         assert app.query_one("#watchlist", DataTable).row_count == 3
+        assert app.query_one("#watchlist", DataTable).max_scroll_x == 0
         assert app.query_one("#orderbook-panel .panel-title", Static).render().plain == "ORDER BOOK"
         assert "MARKET CHART" in app.query_one("#chart-panel .panel-title", Static).render().plain
         assert app.query_one("#trades-panel .panel-title", Static).render().plain == "LIVE TRADES"
+        assert app.query_one("#trades", DataTable).max_scroll_x == 0
         assert "RECENT VWAP" in app.query_one("#market-stats", Static).render().plain
         assert not app.screen.has_class("compact")
         await pilot.press("d")

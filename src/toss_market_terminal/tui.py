@@ -218,7 +218,7 @@ class TossMarketApp(App[int]):
         with Horizontal(id="main"):
             with Vertical(id="watchlist-panel", classes="market-panel"):
                 yield Static("WATCHLIST", classes="panel-title")
-                yield DataTable(id="watchlist", cursor_type="row", cell_padding=1)
+                yield DataTable(id="watchlist", cursor_type="row", cell_padding=0)
             with Vertical(id="orderbook-panel", classes="market-panel"):
                 yield Static("ORDER BOOK", classes="panel-title")
                 yield DataTable(
@@ -230,7 +230,7 @@ class TossMarketApp(App[int]):
                 yield Static(id="market-stats", markup=False)
             with Vertical(id="trades-panel", classes="market-panel"):
                 yield Static("LIVE TRADES", classes="panel-title")
-                yield DataTable(id="trades", zebra_stripes=False, show_cursor=False, cell_padding=1)
+                yield DataTable(id="trades", zebra_stripes=False, show_cursor=False, cell_padding=0)
         yield Static(id="statusbar", markup=False)
         yield Footer()
 
@@ -280,7 +280,7 @@ class TossMarketApp(App[int]):
 
     def _prepare_tables(self) -> None:
         watchlist = self.query_one("#watchlist", DataTable)
-        watchlist.add_columns("SYMBOL", "PRICE", "ALERTS")
+        watchlist.add_columns("SYMBOL", "PRICE", "ALRT")
         orderbook = self.query_one("#orderbook", DataTable)
         orderbook.add_columns("SIDE", "PRICE", "SIZE", "DEPTH")
         trades = self.query_one("#trades", DataTable)
