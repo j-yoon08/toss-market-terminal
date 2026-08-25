@@ -311,6 +311,10 @@ def _snapshot_for(symbol: str, price: str, *, market: str, currency: str) -> Mar
             last_price=Decimal(price),
             currency=currency,
         ),
+        orderbook=replace(source.orderbook, currency=currency),
+        trades=tuple(replace(trade, currency=currency) for trade in source.trades),
+        candles=tuple(replace(candle, currency=currency) for candle in source.candles),
+        daily_candles=tuple(replace(candle, currency=currency) for candle in source.daily_candles),
     )
 
 
@@ -953,3 +957,198 @@ def test_chart_mode_labels_are_grammatically_consistent() -> None:
         "1h": "1 HOUR",
         "1d": "DAILY",
     }
+
+
+# --- live candle tracking and REST correction -------------------------------
+
+
+async def test_trade_event_updates_latest_candle_and_rendered_chart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class OneTradeStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("150"), Decimal("7"), "2026-08-25T10:00:30+09:00", "USD"),
+            )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", OneTradeStream)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        chart_render_interval_seconds=0,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        before_chart = app.query_one("#chart-content", Static).render().plain
+        app.client = FakeClient()  # type: ignore[assignment]
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        newest = app.snapshot.candles[0]
+        assert app.current_price == Decimal("150")
+        assert newest.open_price == Decimal("109")
+        assert newest.high_price == newest.close_price == Decimal("150")
+        assert newest.low_price == Decimal("108")
+        assert newest.volume == Decimal("107")
+        assert app.query_one("#chart-content", Static).render().plain != before_chart
+
+
+async def test_high_frequency_trades_are_coalesced_with_a_trailing_render(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    published = 0
+
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class BurstStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            for second, price in enumerate(("120", "121", "122"), start=31):
+                yield TradeEvent(
+                    symbol,
+                    Trade(
+                        Decimal(price),
+                        Decimal("1"),
+                        f"2026-08-25T10:00:{second}+09:00",
+                        "USD",
+                    ),
+                )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", BurstStream)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        chart_render_interval_seconds=0.05,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        original_publish = app._publish_live_chart
+
+        def tracked_publish() -> None:
+            nonlocal published
+            published += 1
+            original_publish()
+
+        monkeypatch.setattr(app, "_publish_live_chart", tracked_publish)
+        app._last_chart_render_monotonic = tui_module.time.monotonic()
+        app.client = FakeClient()  # type: ignore[assignment]
+
+        await app._run_feed(symbol="AAPL", market="us")
+        assert app.snapshot.candles[0].close_price == Decimal("110")
+        await asyncio.sleep(0.08)
+        await pilot.pause()
+
+        assert published == 1
+        assert app.snapshot.candles[0].close_price == Decimal("122")
+        assert app.snapshot.candles[0].volume == Decimal("103")
+        assert app.chart_render_task is None
+
+
+async def test_candle_resync_replays_trades_received_during_rest_request(tmp_path: Path) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    base = sample_snapshot()
+
+    class RacingCandleClient:
+        async def candles(self, symbol: str, *, interval: str = "1m", count: int = 40):
+            nonlocal calls
+            assert symbol == "AAPL"
+            assert count == 200
+            calls += 1
+            if calls == 2:
+                started.set()
+            await release.wait()
+            return base.daily_candles if interval == "1d" else base.candles
+
+        async def close(self) -> None:
+            return None
+
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=base,
+        connect_live=False,
+        chart_render_interval_seconds=0,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.client = RacingCandleClient()  # type: ignore[assignment]
+        refreshing = asyncio.create_task(app._refresh_chart_candles())
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        live_trade = Trade(Decimal("130"), Decimal("4"), "2026-08-25T10:00:40+09:00", "USD")
+        app.current_price = live_trade.price
+        app.current_timestamp = live_trade.timestamp
+        app._record_live_trade(live_trade)
+        release.set()
+
+        assert await refreshing
+        await pilot.pause()
+        assert calls == 2
+        assert app.snapshot.candles[0].close_price == Decimal("130")
+        assert app.snapshot.candles[0].volume == Decimal("104")
+
+
+async def test_candle_resync_failure_is_degraded_and_success_recovers(tmp_path: Path) -> None:
+    base = sample_snapshot()
+
+    class FailingCandleClient:
+        async def candles(self, symbol: str, *, interval: str = "1m", count: int = 40):
+            raise RuntimeError(f"secret-candle-error-{symbol}-{interval}-{count}")
+
+        async def close(self) -> None:
+            return None
+
+    class SuccessfulCandleClient:
+        async def candles(self, symbol: str, *, interval: str = "1m", count: int = 40):
+            assert symbol == "AAPL"
+            assert count == 200
+            return base.daily_candles if interval == "1d" else base.candles
+
+        async def close(self) -> None:
+            return None
+
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=base,
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.stream_live = True
+        app.subscription_detail = "topics=2"
+        app.connection_state = "LIVE"
+        app.client = FailingCandleClient()  # type: ignore[assignment]
+
+        assert not await app._refresh_chart_candles()
+        assert app.candle_sync_degraded
+        assert app.connection_state == "DEGRADED"
+        assert app.connection_detail == "WS live · candle sync failed"
+        assert "secret" not in app.connection_detail
+
+        app.client = SuccessfulCandleClient()  # type: ignore[assignment]
+        assert await app._refresh_chart_candles()
+        assert not app.candle_sync_degraded
+        assert app.connection_state == "LIVE"
+        assert app.connection_detail == "topics=2"

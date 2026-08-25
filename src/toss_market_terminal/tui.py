@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -19,7 +19,8 @@ from textual.widgets import DataTable, Footer, Static
 from .alerts import AlertEvaluator, AlertEvent
 from .client import TossApiError, TossMarketClient
 from .config import CredentialError, Credentials
-from .models import DataShapeError, MarketSnapshot, Orderbook, Trade
+from .live_chart import apply_trade_to_candles
+from .models import Candle, DataShapeError, MarketSnapshot, Orderbook, Trade
 from .render import (
     CHART_MODE_LABELS,
     DOWN_COLOR,
@@ -59,6 +60,8 @@ from .stream import (
 
 KST = ZoneInfo("Asia/Seoul")
 WATCHLIST_REFRESH_SECONDS = 15.0
+CANDLE_RESYNC_SECONDS = 30.0
+CHART_RENDER_INTERVAL_SECONDS = 0.25
 COMPACT_WIDTH_THRESHOLD = 117
 
 
@@ -201,6 +204,8 @@ class TossMarketApp(App[int]):
         settings_path: Path | None = None,
         settings: Settings | None = None,
         watchlist_refresh_seconds: float = WATCHLIST_REFRESH_SECONDS,
+        candle_resync_seconds: float = CANDLE_RESYNC_SECONDS,
+        chart_render_interval_seconds: float = CHART_RENDER_INTERVAL_SECONDS,
     ) -> None:
         super().__init__()
         self.symbol = normalize_symbol(symbol)
@@ -211,12 +216,20 @@ class TossMarketApp(App[int]):
         self.settings_path = settings_path
         self.settings = settings if settings is not None else Settings()
         self.watchlist_refresh_seconds = watchlist_refresh_seconds
+        if candle_resync_seconds <= 0:
+            raise ValueError("캔들 재동기화 주기는 양수여야 합니다.")
+        if chart_render_interval_seconds < 0:
+            raise ValueError("차트 렌더 간격은 0 이상이어야 합니다.")
+        self.candle_resync_seconds = candle_resync_seconds
+        self.chart_render_interval_seconds = chart_render_interval_seconds
         self.refresh_lock = asyncio.Lock()
         self.switch_lock = asyncio.Lock()
         self.watchlist_refresh_lock = asyncio.Lock()
         self.client: TossMarketClient | None = None
         self.feed_task: asyncio.Task[None] | None = None
         self.watchlist_task: asyncio.Task[None] | None = None
+        self.candle_sync_task: asyncio.Task[None] | None = None
+        self.chart_render_task: asyncio.Task[None] | None = None
         # In-memory only: `watch SYMBOL` never persists the launch symbol.
         configured = list(dict.fromkeys(self.settings.watchlist))
         if self.symbol not in configured:
@@ -242,7 +255,13 @@ class TossMarketApp(App[int]):
         self.subscription_detail = ""
         self.protocol_degraded = False
         self.indicator_degraded = False
+        self.candle_sync_degraded = False
         self.last_tick_monotonic: float | None = None
+        self._live_candles: tuple[Candle, ...] = ()
+        self._live_daily_candles: tuple[Candle, ...] = ()
+        self._live_candle_revision = 0
+        self._live_trade_buffer: deque[tuple[int, Trade]] = deque(maxlen=2_000)
+        self._last_chart_render_monotonic: float | None = None
         self._indicator_base: ChartIndicatorBase | None = None
         self._indicator_base_snapshot: MarketSnapshot | None = None
         self._indicator_base_mode: str | None = None
@@ -290,9 +309,15 @@ class TossMarketApp(App[int]):
         await self._refresh_snapshot()
         self.feed_task = asyncio.create_task(self._run_feed())
         self.watchlist_task = asyncio.create_task(self._run_watchlist_polling())
+        self.candle_sync_task = asyncio.create_task(self._run_candle_resync())
 
     async def on_unmount(self) -> None:
-        for task in (self.watchlist_task, self.feed_task):
+        for task in (
+            self.chart_render_task,
+            self.candle_sync_task,
+            self.watchlist_task,
+            self.feed_task,
+        ):
             if task:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -542,6 +567,11 @@ class TossMarketApp(App[int]):
             if old_feed is not None:
                 old_feed.cancel()
                 await asyncio.gather(old_feed, return_exceptions=True)
+            old_chart_render = self.chart_render_task
+            self.chart_render_task = None
+            if old_chart_render is not None:
+                old_chart_render.cancel()
+                await asyncio.gather(old_chart_render, return_exceptions=True)
 
             self.symbol = normalized
             self.market = infer_market(normalized)
@@ -556,6 +586,12 @@ class TossMarketApp(App[int]):
             self.snapshot = None
             self.last_tick_monotonic = None
             self.indicator_degraded = False
+            self.candle_sync_degraded = False
+            self._live_candles = ()
+            self._live_daily_candles = ()
+            self._live_candle_revision = 0
+            self._live_trade_buffer.clear()
+            self._last_chart_render_monotonic = None
             self._indicator_base = None
             self._indicator_base_snapshot = None
             self._indicator_base_mode = None
@@ -584,6 +620,7 @@ class TossMarketApp(App[int]):
         if self.client is None:
             return False
         requested_symbol = self.symbol
+        start_revision = self._live_candle_revision
         was_live = self.stream_live
         previous_detail = self.connection_detail
         self.connection_state = "SYNCING"
@@ -603,8 +640,12 @@ class TossMarketApp(App[int]):
             return False
         if self.symbol != requested_symbol or snapshot.stock.symbol != requested_symbol:
             return False
-        self._apply_snapshot(snapshot)
+        replay_trades = tuple(
+            trade for revision, trade in self._live_trade_buffer if revision > start_revision
+        )
+        self._apply_snapshot(snapshot, replay_trades=replay_trades)
         self.indicator_degraded = False
+        self.candle_sync_degraded = False
         if was_live:
             self.connection_state = "LIVE"
             self.connection_detail = self.subscription_detail or previous_detail
@@ -612,13 +653,34 @@ class TossMarketApp(App[int]):
         self._render_all()
         return True
 
-    def _apply_snapshot(self, snapshot: MarketSnapshot) -> None:
-        self.snapshot = snapshot
+    def _apply_snapshot(
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        replay_trades: tuple[Trade, ...] = (),
+    ) -> None:
+        live_candles = snapshot.candles
+        live_daily_candles = snapshot.daily_candles
+        for trade in replay_trades:
+            live_candles = apply_trade_to_candles(live_candles, trade)
+            live_daily_candles = apply_trade_to_candles(live_daily_candles, trade, interval="1d")
+        self._live_candles = live_candles
+        self._live_daily_candles = live_daily_candles
+        self.snapshot = replace(
+            snapshot,
+            candles=live_candles,
+            daily_candles=live_daily_candles,
+        )
         self.orderbook = snapshot.orderbook
         self.trades = deque(snapshot.trades, maxlen=50)
-        self.current_price = snapshot.price.last_price
-        self.current_currency = snapshot.price.currency
-        self.current_timestamp = snapshot.price.timestamp
+        for trade in replay_trades:
+            self.trades.appendleft(trade)
+        latest_trade = replay_trades[-1] if replay_trades else None
+        self.current_price = latest_trade.price if latest_trade else snapshot.price.last_price
+        self.current_currency = latest_trade.currency if latest_trade else snapshot.price.currency
+        self.current_timestamp = (
+            latest_trade.timestamp if latest_trade else snapshot.price.timestamp
+        )
         self._indicator_base = None
         self._indicator_base_snapshot = None
         self._indicator_base_mode = None
@@ -626,6 +688,109 @@ class TossMarketApp(App[int]):
         self._evaluate_active_alerts()
         if self.is_mounted:
             self._render_watchlist()
+
+    def _record_live_trade(self, trade: Trade) -> bool:
+        if self.snapshot is None:
+            return False
+        base_candles = self._live_candles or self.snapshot.candles
+        base_daily = self._live_daily_candles or self.snapshot.daily_candles
+        updated_candles = apply_trade_to_candles(base_candles, trade)
+        if base_candles and updated_candles == base_candles:
+            return False
+        updated_daily = apply_trade_to_candles(base_daily, trade, interval="1d")
+        self._live_candles = updated_candles
+        self._live_daily_candles = updated_daily
+        self._live_candle_revision += 1
+        self._live_trade_buffer.append((self._live_candle_revision, trade))
+        return True
+
+    def _publish_live_chart(self) -> None:
+        if self.snapshot is None or not self._live_candles:
+            return
+        self.snapshot = replace(
+            self.snapshot,
+            candles=self._live_candles,
+            daily_candles=self._live_daily_candles,
+        )
+        self._indicator_base = None
+        self._indicator_base_snapshot = None
+        self._indicator_base_mode = None
+        self._last_chart_render_monotonic = time.monotonic()
+        self._render_chart()
+        self._render_stats()
+
+    def _schedule_live_chart_render(self) -> None:
+        if self.snapshot is None:
+            return
+        now = time.monotonic()
+        last = self._last_chart_render_monotonic
+        elapsed = self.chart_render_interval_seconds if last is None else now - last
+        delay = max(0.0, self.chart_render_interval_seconds - elapsed)
+        if delay == 0:
+            self._publish_live_chart()
+            return
+        if self.chart_render_task is None or self.chart_render_task.done():
+            self.chart_render_task = asyncio.create_task(
+                self._publish_live_chart_after(delay, self.symbol)
+            )
+
+    async def _publish_live_chart_after(self, delay: float, symbol: str) -> None:
+        try:
+            await asyncio.sleep(delay)
+            if self.symbol == symbol:
+                self._publish_live_chart()
+        finally:
+            if self.chart_render_task is asyncio.current_task():
+                self.chart_render_task = None
+
+    def _set_candle_sync_degraded(self, detail: str = "WS live · candle sync failed") -> None:
+        self.candle_sync_degraded = True
+        if self.stream_live:
+            self.connection_state = "DEGRADED"
+            self.connection_detail = detail
+        self._render_chrome()
+
+    async def _run_candle_resync(self) -> None:
+        while True:
+            await asyncio.sleep(self.candle_resync_seconds)
+            try:
+                await self._refresh_chart_candles()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._set_candle_sync_degraded()
+
+    async def _refresh_chart_candles(self) -> bool:
+        if self.client is None or self.snapshot is None:
+            return False
+        async with self.refresh_lock:
+            requested_symbol = self.symbol
+            start_revision = self._live_candle_revision
+            try:
+                candles, daily_candles = await asyncio.gather(
+                    self.client.candles(requested_symbol, count=200),
+                    self.client.candles(requested_symbol, interval="1d", count=200),
+                )
+            except Exception:
+                self._set_candle_sync_degraded()
+                return False
+            if self.symbol != requested_symbol or self.snapshot is None:
+                return False
+            replay_trades = tuple(
+                trade for revision, trade in self._live_trade_buffer if revision > start_revision
+            )
+            for trade in replay_trades:
+                candles = apply_trade_to_candles(candles, trade)
+                daily_candles = apply_trade_to_candles(daily_candles, trade, interval="1d")
+            self._live_candles = candles
+            self._live_daily_candles = daily_candles
+            self.candle_sync_degraded = False
+            self._publish_live_chart()
+            if self.stream_live and not self.protocol_degraded and not self.indicator_degraded:
+                self.connection_state = "LIVE"
+                self.connection_detail = self.subscription_detail
+            self._render_chrome()
+            return True
 
     async def _run_feed(self, *, symbol: str | None = None, market: str | None = None) -> None:
         if self.client is None:
@@ -642,6 +807,13 @@ class TossMarketApp(App[int]):
                 if event.symbol != feed_symbol:
                     continue
                 self._recover_protocol_status()
+                try:
+                    candle_updated: bool | None = self._record_live_trade(event.trade)
+                except ValueError:
+                    candle_updated = None
+                    self._set_candle_sync_degraded("WS live · candle update failed")
+                if candle_updated is False:
+                    continue
                 self.trades.appendleft(event.trade)
                 self.current_price = event.trade.price
                 self.current_currency = event.trade.currency
@@ -650,7 +822,10 @@ class TossMarketApp(App[int]):
                 self._evaluate_active_alerts()
                 self._render_trades()
                 self._render_summary()
-                self._render_stats()
+                if candle_updated:
+                    self._schedule_live_chart_render()
+                else:
+                    self._render_stats()
                 self._render_chrome()
             elif isinstance(event, OrderbookEvent):
                 if event.symbol != feed_symbol:
@@ -699,7 +874,12 @@ class TossMarketApp(App[int]):
         self._render_chrome()
 
     def _recover_protocol_status(self) -> None:
-        if not self.protocol_degraded or not self.stream_live or self.indicator_degraded:
+        if (
+            not self.protocol_degraded
+            or not self.stream_live
+            or self.indicator_degraded
+            or self.candle_sync_degraded
+        ):
             return
         self.protocol_degraded = False
         self.connection_state = "LIVE"
