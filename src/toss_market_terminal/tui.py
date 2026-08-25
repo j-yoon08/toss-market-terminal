@@ -16,6 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Static
 
+from .alerts import AlertEvaluator, AlertEvent
 from .client import TossApiError, TossMarketClient
 from .config import CredentialError, Credentials
 from .models import DataShapeError, MarketSnapshot, Orderbook, Trade
@@ -29,6 +30,9 @@ from .render import (
     format_percent,
     format_signed,
     market_metrics,
+    market_signals,
+    orderbook_signal_label,
+    trade_pressure_label,
     volume_bar,
 )
 from .settings import Settings, SettingsStore
@@ -135,13 +139,13 @@ class TossMarketApp(App[int]):
         padding: 1 2;
     }
     #market-stats {
-        height: 7;
+        height: 9;
         padding: 0 2;
         border-top: solid #2a3440;
         color: #9aa7b4;
     }
     #statusbar {
-        height: 3;
+        height: 4;
         padding: 1 2 0 2;
         background: #0d131a;
         color: #7d8998;
@@ -192,6 +196,8 @@ class TossMarketApp(App[int]):
         self.watchlist_symbols = tuple(configured)
         self.watchlist_rows: dict[str, WatchlistRow] = {}
         self.watchlist_stale = False
+        self.alert_evaluator = AlertEvaluator()
+        self.latest_alert: AlertEvent | None = None
         self.trades: deque[Trade] = deque(maxlen=50)
         self.orderbook: Orderbook | None = None
         self.snapshot: MarketSnapshot | None = None
@@ -321,9 +327,7 @@ class TossMarketApp(App[int]):
                 return False
             for symbol, price in prices.items():
                 active_alerts = sum(
-                    1
-                    for rule in self.settings.alerts
-                    if rule.symbol == symbol and rule.enabled
+                    1 for rule in self.settings.alerts if rule.symbol == symbol and rule.enabled
                 )
                 self.watchlist_rows[symbol] = WatchlistRow(
                     symbol=symbol,
@@ -331,6 +335,12 @@ class TossMarketApp(App[int]):
                     currency=price.currency,
                     active_alerts=active_alerts,
                 )
+                if symbol != self.symbol:
+                    self._evaluate_alerts(
+                        symbol=symbol,
+                        current_price=price.last_price,
+                        timestamp=price.timestamp,
+                    )
             self.watchlist_stale = False
             self._render_watchlist()
             return True
@@ -359,6 +369,62 @@ class TossMarketApp(App[int]):
             if row is None or self.watchlist_stale:
                 price_text = f"{price_text}*" if self.watchlist_stale else price_text
             table.add_row(symbol, Text(price_text, style=MUTED_COLOR), f"{marker}{count}")
+
+    def _evaluate_alerts(
+        self,
+        *,
+        symbol: str,
+        current_price: Decimal | None,
+        timestamp: str | None,
+        include_full_state: bool = False,
+    ) -> tuple[AlertEvent, ...]:
+        metrics = None
+        signals = None
+        if (
+            include_full_state
+            and symbol == self.symbol
+            and self.snapshot is not None
+            and current_price is not None
+        ):
+            metrics = market_metrics(
+                self.snapshot,
+                current_price,
+                orderbook=self.orderbook,
+                trades=tuple(self.trades),
+                current_timestamp=timestamp,
+            )
+            signals = market_signals(
+                self.snapshot,
+                current_price,
+                orderbook=self.orderbook,
+                trades=tuple(self.trades),
+            )
+        events = self.alert_evaluator.evaluate_all(
+            self.settings.alerts,
+            symbol=symbol,
+            current_price=current_price,
+            metrics=metrics,
+            signals=signals,
+            timestamp=timestamp,
+        )
+        for event in events:
+            self._emit_alert(event)
+        return events
+
+    def _evaluate_active_alerts(self) -> tuple[AlertEvent, ...]:
+        return self._evaluate_alerts(
+            symbol=self.symbol,
+            current_price=self.current_price,
+            timestamp=self.current_timestamp,
+            include_full_state=True,
+        )
+
+    def _emit_alert(self, event: AlertEvent) -> None:
+        self.latest_alert = event
+        if self.is_mounted:
+            self.notify(event.message, title="MARKET ALERT", severity="information", timeout=8)
+            self.bell()
+            self._render_chrome()
 
     # --- navigation / switching -------------------------------------------------
     @property
@@ -481,6 +547,7 @@ class TossMarketApp(App[int]):
         self.current_currency = snapshot.price.currency
         self.current_timestamp = snapshot.price.timestamp
         self._refresh_watchlist_rows_from_snapshot()
+        self._evaluate_active_alerts()
         if self.is_mounted:
             self._render_watchlist()
 
@@ -504,6 +571,7 @@ class TossMarketApp(App[int]):
                 self.current_currency = event.trade.currency
                 self.current_timestamp = event.trade.timestamp
                 self.last_tick_monotonic = time.monotonic()
+                self._evaluate_active_alerts()
                 self._render_trades()
                 self._render_summary()
                 self._render_stats()
@@ -675,6 +743,12 @@ class TossMarketApp(App[int]):
             trades=tuple(self.trades),
             current_timestamp=self.current_timestamp,
         )
+        signals = market_signals(
+            self.snapshot,
+            self.current_price,
+            orderbook=self.orderbook,
+            trades=tuple(self.trades),
+        )
         text = Text()
         text.append("MARKET STATS\n", style="bold #c9d1d9")
         if metrics.spread is not None:
@@ -686,9 +760,37 @@ class TossMarketApp(App[int]):
                 text.append(f" · {metrics.spread_percent:.3f}%\n", style=MUTED_COLOR)
         if metrics.recent_vwap is not None:
             text.append(
-                f"RECENT VWAP {format_decimal(metrics.recent_vwap, self.current_currency)}\n",
+                f"RECENT VWAP {format_decimal(metrics.recent_vwap, self.current_currency)}",
                 style=MUTED_COLOR,
             )
+            if signals.vwap_distance_percent is not None:
+                text.append(f" · {format_percent(signals.vwap_distance_percent)}\n")
+            else:
+                text.append("\n")
+        imbalance = (
+            f"{signals.orderbook_imbalance_percent:.1f}%"
+            if signals.orderbook_imbalance_percent is not None
+            else "—"
+        )
+        ratio = f"{signals.bid_ask_ratio:.2f}x" if signals.bid_ask_ratio is not None else "—"
+        pressure = (
+            f"{signals.trade_pressure_percent:.1f}%"
+            if signals.trade_pressure_percent is not None
+            else "—"
+        )
+        volume_ratio = (
+            f"{signals.volume_spike_ratio:.2f}x" if signals.volume_spike_ratio is not None else "—"
+        )
+        text.append(
+            f"BOOK {orderbook_signal_label(signals.orderbook_imbalance_percent)} "
+            f"{imbalance} · B/A {ratio}\n",
+            style=MUTED_COLOR,
+        )
+        text.append(
+            f"TICKS {trade_pressure_label(signals.trade_pressure_percent)} {pressure} · "
+            f"VOL {volume_ratio}\n",
+            style=MUTED_COLOR,
+        )
         text.append(f"FEED {self.market.upper()} · READ ONLY", style="#526273")
         self.query_one("#market-stats", Static).update(text)
 
@@ -717,4 +819,10 @@ class TossMarketApp(App[int]):
         status.append(f"   LAST TICK {tick_age}", style=MUTED_COLOR)
         if self.current_timestamp:
             status.append(f"   MARKET TIME {self.current_timestamp}", style="#526273")
+        if self.latest_alert is not None:
+            status.append(
+                f"\nALERT {self.latest_alert.rule.id} · {self.latest_alert.rule.symbol} · "
+                f"{self.latest_alert.condition} · {self.latest_alert.observed_value}",
+                style="#f0ad4e",
+            )
         self.query_one("#statusbar", Static).update(status)

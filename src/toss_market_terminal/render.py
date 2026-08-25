@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from statistics import median
 
 from rich.console import Group
 from rich.panel import Panel
@@ -29,6 +30,35 @@ class MarketMetrics:
     spread: Decimal | None
     spread_percent: Decimal | None
     recent_vwap: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class MarketSignals:
+    orderbook_imbalance_percent: Decimal | None
+    bid_ask_ratio: Decimal | None
+    vwap_distance_percent: Decimal | None
+    volume_spike_ratio: Decimal | None
+    trade_pressure_percent: Decimal | None
+
+
+def orderbook_signal_label(value: Decimal | None) -> str:
+    if value is None:
+        return "INSUFFICIENT"
+    if value > Decimal("60"):
+        return "BID HEAVY"
+    if value < Decimal("40"):
+        return "ASK HEAVY"
+    return "BALANCED"
+
+
+def trade_pressure_label(value: Decimal | None) -> str:
+    if value is None:
+        return "INSUFFICIENT"
+    if value > Decimal("60"):
+        return "UPTICK HEAVY"
+    if value < Decimal("40"):
+        return "DOWNTICK HEAVY"
+    return "MIXED"
 
 
 def format_decimal(value: Decimal, currency: str | None = None) -> str:
@@ -147,6 +177,69 @@ def market_metrics(
         spread=spread,
         spread_percent=spread_percent,
         recent_vwap=recent_vwap,
+    )
+
+
+def market_signals(
+    snapshot: MarketSnapshot,
+    current_price: Decimal | None = None,
+    *,
+    orderbook: Orderbook | None = None,
+    trades: Sequence[Trade] | None = None,
+    depth: int = 7,
+) -> MarketSignals:
+    price = current_price if current_price is not None else snapshot.price.last_price
+    active_orderbook = orderbook if orderbook is not None else snapshot.orderbook
+    asks = active_orderbook.asks[:depth]
+    bids = active_orderbook.bids[:depth]
+    ask_volume = sum((entry.volume for entry in asks), Decimal("0"))
+    bid_volume = sum((entry.volume for entry in bids), Decimal("0"))
+    total_book_volume = ask_volume + bid_volume
+    imbalance = bid_volume / total_book_volume * Decimal("100") if total_book_volume > 0 else None
+    bid_ask_ratio = bid_volume / ask_volume if ask_volume > 0 else None
+
+    active_trades = tuple(trades) if trades is not None else snapshot.trades
+    trade_volume = sum((trade.volume for trade in active_trades), Decimal("0"))
+    recent_vwap = (
+        sum((trade.price * trade.volume for trade in active_trades), Decimal("0")) / trade_volume
+        if trade_volume > 0
+        else None
+    )
+    vwap_distance = (
+        (price - recent_vwap) / recent_vwap * Decimal("100")
+        if recent_vwap is not None and recent_vwap != 0
+        else None
+    )
+
+    positive_previous_volumes = [
+        candle.volume for candle in snapshot.candles[1:] if candle.volume > 0
+    ]
+    volume_spike = None
+    if snapshot.candles and len(positive_previous_volumes) >= 3:
+        baseline = median(positive_previous_volumes)
+        if baseline > 0:
+            volume_spike = snapshot.candles[0].volume / baseline
+
+    uptick_volume = Decimal("0")
+    downtick_volume = Decimal("0")
+    items = list(active_trades)
+    for index, trade in enumerate(items[:-1]):
+        older = items[index + 1]
+        if trade.price > older.price:
+            uptick_volume += trade.volume
+        elif trade.price < older.price:
+            downtick_volume += trade.volume
+    directional_volume = uptick_volume + downtick_volume
+    trade_pressure = (
+        uptick_volume / directional_volume * Decimal("100") if directional_volume > 0 else None
+    )
+
+    return MarketSignals(
+        orderbook_imbalance_percent=imbalance,
+        bid_ask_ratio=bid_ask_ratio,
+        vwap_distance_percent=vwap_distance,
+        volume_spike_ratio=volume_spike,
+        trade_pressure_percent=trade_pressure,
     )
 
 

@@ -10,7 +10,7 @@ from textual.widgets import DataTable, Static
 
 from tests.helpers import sample_snapshot
 from toss_market_terminal.models import MarketSnapshot, Price, Trade
-from toss_market_terminal.settings import Settings
+from toss_market_terminal.settings import AlertRule, Settings
 from toss_market_terminal.stream import StreamStatus, TradeEvent
 from toss_market_terminal.tui import TossMarketApp
 
@@ -404,3 +404,52 @@ async def test_watchlist_refresh_lock_prevents_overlapping_calls(tmp_path: Path)
         release.set()
         assert await first
         assert maximum == 1
+
+
+async def test_tui_emits_one_edge_alert_and_renders_market_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notifications: list[str] = []
+    bells = 0
+
+    def capture_notification(message: str, **_kwargs: object) -> None:
+        notifications.append(message)
+
+    def capture_bell() -> None:
+        nonlocal bells
+        bells += 1
+
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings=Settings(
+            watchlist=("AAPL",),
+            alerts=(AlertRule("A1", "AAPL", "above", Decimal("111")),),
+        ),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(app, "notify", capture_notification)
+        monkeypatch.setattr(app, "bell", capture_bell)
+        stats = app.query_one("#market-stats", Static).render().plain
+        assert "BOOK " in stats
+        assert "TICKS " in stats
+
+        app.current_price = Decimal("112")
+        app.current_timestamp = "2026-08-25T10:00:00Z"
+        events = app._evaluate_active_alerts()
+        assert len(events) == 1
+        assert app.latest_alert is not None
+        assert app.latest_alert.rule.id == "A1"
+        assert notifications and "observed=112" in notifications[0]
+        assert bells == 1
+        assert (
+            "ALERT A1 · AAPL · price > 111 · 112"
+            in app.query_one("#statusbar", Static).render().plain
+        )
+
+        app.current_price = Decimal("113")
+        assert app._evaluate_active_alerts() == ()
+        assert bells == 1

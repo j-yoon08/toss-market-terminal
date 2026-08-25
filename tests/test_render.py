@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 from tests.helpers import sample_snapshot
-from toss_market_terminal.models import Orderbook, OrderbookEntry, Trade
+from toss_market_terminal.models import Candle, Orderbook, OrderbookEntry, Trade
 from toss_market_terminal.render import (
     chart_renderable,
     market_metrics,
+    market_signals,
+    orderbook_signal_label,
     sparkline,
+    trade_pressure_label,
     volume_bar,
 )
 
@@ -65,3 +69,78 @@ def test_next_market_date_uses_latest_candle_as_previous_close() -> None:
     assert metrics.change == Decimal("5")
     assert metrics.day_high is None
     assert metrics.day_low is None
+
+
+def test_market_signals_use_displayed_book_recent_ticks_and_candle_median() -> None:
+    snapshot = sample_snapshot()
+    book = Orderbook(
+        "USD",
+        asks=(OrderbookEntry(Decimal("112.1"), Decimal("20")),),
+        bids=(OrderbookEntry(Decimal("111.9"), Decimal("80")),),
+        timestamp=None,
+    )
+    trades = (
+        Trade(Decimal("110"), Decimal("3"), "2026-08-25T10:00:02Z", "USD"),
+        Trade(Decimal("109"), Decimal("1"), "2026-08-25T10:00:01Z", "USD"),
+        Trade(Decimal("111"), Decimal("2"), "2026-08-25T10:00:00Z", "USD"),
+    )
+    candle = snapshot.candles[0]
+    candles = (
+        replace(candle, volume=Decimal("400")),
+        replace(candle, volume=Decimal("100")),
+        replace(candle, volume=Decimal("100")),
+        replace(candle, volume=Decimal("200")),
+    )
+    signals = market_signals(
+        replace(snapshot, candles=candles),
+        Decimal("112"),
+        orderbook=book,
+        trades=trades,
+    )
+    assert signals.orderbook_imbalance_percent == Decimal("80")
+    assert signals.bid_ask_ratio == Decimal("4")
+    expected_vwap = Decimal("661") / Decimal("6")
+    assert signals.vwap_distance_percent == (Decimal("112") - expected_vwap) / expected_vwap * 100
+    assert signals.volume_spike_ratio == Decimal("4")
+    assert signals.trade_pressure_percent == Decimal("75")
+    assert orderbook_signal_label(signals.orderbook_imbalance_percent) == "BID HEAVY"
+    assert trade_pressure_label(signals.trade_pressure_percent) == "UPTICK HEAVY"
+
+
+def test_market_signal_labels_have_strict_neutral_boundaries() -> None:
+    assert orderbook_signal_label(Decimal("60")) == "BALANCED"
+    assert orderbook_signal_label(Decimal("40")) == "BALANCED"
+    assert orderbook_signal_label(Decimal("39.99")) == "ASK HEAVY"
+    assert trade_pressure_label(Decimal("60")) == "MIXED"
+    assert trade_pressure_label(Decimal("40")) == "MIXED"
+    assert trade_pressure_label(Decimal("39.99")) == "DOWNTICK HEAVY"
+    assert orderbook_signal_label(None) == "INSUFFICIENT"
+    assert trade_pressure_label(None) == "INSUFFICIENT"
+
+
+def test_market_signals_return_none_for_zero_or_insufficient_denominators() -> None:
+    snapshot = sample_snapshot()
+    empty = replace(
+        snapshot,
+        orderbook=Orderbook("USD", asks=(), bids=(), timestamp=None),
+        trades=(
+            Trade(Decimal("100"), Decimal("1"), "2026-08-25T10:00:00Z", "USD"),
+            Trade(Decimal("100"), Decimal("2"), "2026-08-25T09:59:59Z", "USD"),
+        ),
+        candles=(
+            Candle(
+                "2026-08-25T10:00:00Z",
+                Decimal("1"),
+                Decimal("1"),
+                Decimal("1"),
+                Decimal("1"),
+                Decimal("0"),
+                "USD",
+            ),
+        ),
+    )
+    signals = market_signals(empty, Decimal("100"))
+    assert signals.orderbook_imbalance_percent is None
+    assert signals.bid_ask_ratio is None
+    assert signals.volume_spike_ratio is None
+    assert signals.trade_pressure_percent is None
