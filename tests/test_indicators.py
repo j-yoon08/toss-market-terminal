@@ -7,7 +7,17 @@ from decimal import Decimal
 
 import pytest
 
-from toss_market_terminal.indicators import aggregate_candles, ema_series, session_vwap_series
+from toss_market_terminal.indicators import (
+    IndicatorSnapshot,
+    SupportResistance,
+    aggregate_candles,
+    ema_series,
+    indicator_snapshot,
+    relative_volume,
+    rsi_series,
+    session_vwap_series,
+    support_resistance,
+)
 from toss_market_terminal.models import Candle
 
 
@@ -363,3 +373,338 @@ def test_session_vwap_currency_mismatch_rejected() -> None:
     )
     with pytest.raises(ValueError):
         session_vwap_series(candles)
+
+
+# --- rsi_series -------------------------------------------------------------
+
+
+def test_rsi_all_gains_is_100() -> None:
+    # Chronological closes 10, 12, 14, 16: three consecutive gains, no losses.
+    candles = tuple(
+        candle(f"2026-01-05T10:0{minute}:00Z", str(c), str(c), str(c), str(c), "1")
+        for minute, c in ((3, 16), (2, 14), (1, 12), (0, 10))  # newest-first
+    )
+    assert rsi_series(candles, 3) == (Decimal("100"), None, None, None)
+
+
+def test_rsi_all_losses_is_0() -> None:
+    # Chronological closes 16, 14, 12, 10: three consecutive losses, no gains.
+    candles = tuple(
+        candle(f"2026-01-05T10:0{minute}:00Z", str(c), str(c), str(c), str(c), "1")
+        for minute, c in ((3, 10), (2, 12), (1, 14), (0, 16))  # newest-first
+    )
+    assert rsi_series(candles, 3) == (Decimal("0"), None, None, None)
+
+
+def test_rsi_flat_closes_is_50() -> None:
+    candles = tuple(
+        candle(f"2026-01-05T10:0{minute}:00Z", "10", "10", "10", "10", "1")
+        for minute in (3, 2, 1, 0)
+    )
+    assert rsi_series(candles, 3) == (Decimal("50"), None, None, None)
+
+
+def test_rsi_mixed_hand_calculated_seed_and_continuation() -> None:
+    # Chronological closes 10, 12, 10, 13 (period=2):
+    #   seed diffs +2, -2 -> avg_gain=1, avg_loss=1 -> RSI = 100 - 100/2 = 50
+    #   next diff +3 -> avg_gain=(1*1+3)/2=2, avg_loss=(1*1+0)/2=0.5
+    #       -> RSI = 100 - 100/(1 + 2/0.5) = 100 - 20 = 80
+    candles = (
+        candle("2026-01-05T10:03:00Z", "13", "13", "13", "13", "1"),  # newest
+        candle("2026-01-05T10:02:00Z", "10", "10", "10", "10", "1"),
+        candle("2026-01-05T10:01:00Z", "12", "12", "12", "12", "1"),
+        candle("2026-01-05T10:00:00Z", "10", "10", "10", "10", "1"),  # oldest
+    )
+    assert rsi_series(candles, 2) == (Decimal("80"), Decimal("50"), None, None)
+
+
+def test_rsi_warmup_insufficient_all_none() -> None:
+    candles = (
+        candle("2026-01-05T10:02:00Z", "3", "3", "3", "3", "1"),
+        candle("2026-01-05T10:01:00Z", "2", "2", "2", "2", "1"),
+        candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),
+    )
+    assert rsi_series(candles, 5) == (None, None, None)
+    assert rsi_series((), 5) == ()
+
+
+def test_rsi_invalid_periods_rejected() -> None:
+    one = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),)
+    for bad_period in (0, -1, True, False, 2.5, "3", None):
+        with pytest.raises(ValueError):
+            rsi_series(one, bad_period)
+
+
+def test_rsi_currency_mismatch_rejected() -> None:
+    candles = (
+        candle("2026-01-05T10:01:00Z", "1", "1", "1", "1", "1", "KRW"),
+        candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1", "USD"),
+    )
+    with pytest.raises(ValueError):
+        rsi_series(candles, 5)
+
+
+# --- relative_volume ----------------------------------------------------
+
+
+def test_relative_volume_odd_baseline_median() -> None:
+    candles = (
+        candle("2026-01-05T10:03:00Z", "1", "1", "1", "1", "60"),  # newest
+        candle("2026-01-05T10:02:00Z", "1", "1", "1", "1", "10"),
+        candle("2026-01-05T10:01:00Z", "1", "1", "1", "1", "20"),
+        candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "30"),
+    )
+    # Baseline {10, 20, 30}, median 20; 60 / 20 = 3.
+    assert relative_volume(candles, lookback=3, minimum_baseline=3) == Decimal("3")
+
+
+def test_relative_volume_even_baseline_median() -> None:
+    candles = (
+        candle("2026-01-05T10:04:00Z", "1", "1", "1", "1", "50"),  # newest
+        candle("2026-01-05T10:03:00Z", "1", "1", "1", "1", "10"),
+        candle("2026-01-05T10:02:00Z", "1", "1", "1", "1", "20"),
+        candle("2026-01-05T10:01:00Z", "1", "1", "1", "1", "30"),
+        candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "40"),
+    )
+    # Baseline {10, 20, 30, 40}, median (20+30)/2=25; 50 / 25 = 2.
+    assert relative_volume(candles, lookback=4, minimum_baseline=3) == Decimal("2")
+
+
+def test_relative_volume_insufficient_baseline_is_none() -> None:
+    candles = (
+        candle("2026-01-05T10:03:00Z", "1", "1", "1", "1", "60"),  # newest
+        candle("2026-01-05T10:02:00Z", "1", "1", "1", "1", "0"),  # excluded (non-positive)
+        candle("2026-01-05T10:01:00Z", "1", "1", "1", "1", "20"),
+        candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "-5"),  # excluded (non-positive)
+    )
+    assert relative_volume(candles, lookback=3, minimum_baseline=3) is None
+
+
+def test_relative_volume_non_positive_latest_is_none() -> None:
+    candles = (
+        candle("2026-01-05T10:03:00Z", "1", "1", "1", "1", "0"),  # newest, non-positive
+        candle("2026-01-05T10:02:00Z", "1", "1", "1", "1", "10"),
+        candle("2026-01-05T10:01:00Z", "1", "1", "1", "1", "20"),
+        candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "30"),
+    )
+    assert relative_volume(candles, lookback=3, minimum_baseline=3) is None
+
+
+def test_relative_volume_no_candles_is_none() -> None:
+    assert relative_volume((), lookback=3, minimum_baseline=3) is None
+
+
+def test_relative_volume_invalid_params_rejected() -> None:
+    one = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),)
+    for bad_value in (0, -1, True, False, 2.5, "3", None):
+        with pytest.raises(ValueError):
+            relative_volume(one, lookback=bad_value, minimum_baseline=1)
+        with pytest.raises(ValueError):
+            relative_volume(one, lookback=5, minimum_baseline=bad_value)
+
+
+def test_relative_volume_minimum_exceeding_lookback_rejected() -> None:
+    one = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),)
+    with pytest.raises(ValueError):
+        relative_volume(one, lookback=2, minimum_baseline=3)
+
+
+def test_relative_volume_currency_mismatch_rejected() -> None:
+    candles = (
+        candle("2026-01-05T10:01:00Z", "1", "1", "1", "1", "10", "KRW"),
+        candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "10", "USD"),
+    )
+    with pytest.raises(ValueError):
+        relative_volume(candles, lookback=1, minimum_baseline=1)
+
+
+# --- support_resistance / SupportResistance ------------------------------
+
+
+def test_support_resistance_no_candles_all_none() -> None:
+    assert support_resistance(()) == SupportResistance()
+
+
+def test_support_resistance_previous_close_same_session_uses_second_daily() -> None:
+    intraday = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),)
+    dailies = (
+        # Newest daily candle shares the intraday session (still-open day).
+        candle("2026-01-05T00:00:00Z", "1", "1", "1", "100", "1"),
+        candle("2026-01-04T00:00:00Z", "1", "1", "1", "90", "1"),
+    )
+    result = support_resistance(intraday, daily_candles=dailies)
+    assert result.previous_close == Decimal("90")
+
+
+def test_support_resistance_previous_close_next_date_uses_newest_daily() -> None:
+    intraday = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),)
+    dailies = (
+        # Newest daily candle is a fully closed prior day.
+        candle("2026-01-04T00:00:00Z", "1", "1", "1", "80", "1"),
+    )
+    result = support_resistance(intraday, daily_candles=dailies)
+    assert result.previous_close == Decimal("80")
+
+
+def test_support_resistance_session_isolation_by_date_and_offset() -> None:
+    candles = (
+        candle("2026-01-05T09:04:00+09:00", "1", "50", "40", "1", "1"),  # newest
+        candle("2026-01-05T09:00:00+09:00", "1", "60", "45", "1", "1"),  # same session
+        candle(
+            "2026-01-05T09:04:00Z", "1", "1000", "900", "1", "1"
+        ),  # same wall clock, diff offset
+    )
+    result = support_resistance(candles, lookback=3, pivot_window=1)
+    # Session high/low only cover the two +09:00 candles.
+    assert result.session_high == Decimal("60")
+    assert result.session_low == Decimal("40")
+    # Recent high/low ignore session identity and span the full lookback.
+    assert result.recent_high == Decimal("1000")
+    assert result.recent_low == Decimal("40")
+
+
+def test_support_resistance_recent_high_low_spans_lookback() -> None:
+    candles = tuple(
+        candle(f"2026-01-05T10:0{minute}:00Z", "1", str(high), str(low), "1", "1")
+        for minute, high, low in ((2, 30, 25), (1, 50, 10), (0, 20, 15))
+    )
+    result = support_resistance(candles, lookback=3, pivot_window=1)
+    assert result.recent_high == Decimal("50")
+    assert result.recent_low == Decimal("10")
+
+
+def _pivot_candle(minute: int, high: str, low: str) -> Candle:
+    return candle(f"2026-01-05T10:{minute:02d}:00Z", high, high, low, low, "1")
+
+
+def test_support_resistance_returns_most_recent_confirmed_pivot() -> None:
+    # Newest-first highs: 10, 15, 12, 20, 11, 9. Index 1 (H=15) is a valid
+    # pivot (10 < 15 > 12) and is more recent than index 3 (H=20), which is
+    # also a valid pivot (12 < 20 > 11) but older. The most recent one wins.
+    candles = tuple(
+        _pivot_candle(minute, high, "1")
+        for minute, high in ((5, "10"), (4, "15"), (3, "12"), (2, "20"), (1, "11"), (0, "9"))
+    )
+    result = support_resistance(candles, lookback=6, pivot_window=1)
+    assert result.swing_high == Decimal("15")
+
+
+def test_support_resistance_swing_low_returns_most_recent() -> None:
+    # Mirrors the high case: lows 90, 40, 70, 20, 80, 100. Index 1 (L=40) is
+    # a valid low pivot (90 > 40 < 70) and is more recent than index 3 (L=20).
+    candles = tuple(
+        _pivot_candle(minute, "1000", low)
+        for minute, low in ((5, "90"), (4, "40"), (3, "70"), (2, "20"), (1, "80"), (0, "100"))
+    )
+    result = support_resistance(candles, lookback=6, pivot_window=1)
+    assert result.swing_low == Decimal("40")
+
+
+def test_support_resistance_plateau_rejected_falls_back() -> None:
+    # Highs 10, 12, 12, 12, 9, 10 (newest-first): indices 1-3 are all tied
+    # plateaus and must be rejected; only index 4 (H=9? no) -- use values
+    # where the only strict pivot is further back than the plateau run.
+    candles = tuple(
+        _pivot_candle(minute, high, "1")
+        for minute, high in ((5, "10"), (4, "12"), (3, "12"), (2, "12"), (1, "8"), (0, "9"))
+    )
+    # Index1 (12) ties index2(12) -> rejected. Index2(12) ties both neighbors -> rejected.
+    # Index3(12) ties index2(12) -> rejected. Index4(8): neighbors idx3=12, idx5=10... wait
+    # idx4's only valid check is against idx3 and idx5's low count; with pivot_window=1
+    # valid range is [1, 4]. Index4 (H=8): neighbors idx3=12, idx5=10 -> not a high pivot.
+    result = support_resistance(candles, lookback=6, pivot_window=1)
+    assert result.swing_high is None
+
+
+def test_support_resistance_plateau_all_tied_is_none() -> None:
+    candles = tuple(
+        _pivot_candle(minute, high, "1")
+        for minute, high in ((4, "10"), (3, "12"), (2, "12"), (1, "12"), (0, "10"))
+    )
+    result = support_resistance(candles, lookback=5, pivot_window=1)
+    assert result.swing_high is None
+
+
+def test_support_resistance_pivot_requires_neighbors_both_sides() -> None:
+    # The newest candle is the global high but has no newer neighbor, so it
+    # can never be confirmed as a pivot even though it dominates everything.
+    candles = tuple(
+        _pivot_candle(minute, high, "1")
+        for minute, high in ((3, "100"), (2, "5"), (1, "50"), (0, "5"))
+    )
+    result = support_resistance(candles, lookback=4, pivot_window=1)
+    assert result.swing_high == Decimal("50")
+
+
+def test_support_resistance_pivot_insufficient_candles_is_none() -> None:
+    candles = tuple(_pivot_candle(minute, high, "1") for minute, high in ((1, "10"), (0, "20")))
+    result = support_resistance(candles, lookback=2, pivot_window=2)
+    assert result.swing_high is None
+    assert result.swing_low is None
+
+
+def test_support_resistance_invalid_params_rejected() -> None:
+    one = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),)
+    for bad_value in (0, -1, True, False, 2.5, "3", None):
+        with pytest.raises(ValueError):
+            support_resistance(one, lookback=bad_value)
+        with pytest.raises(ValueError):
+            support_resistance(one, pivot_window=bad_value)
+
+
+def test_support_resistance_currency_mismatch_rejected() -> None:
+    intraday = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1", "USD"),)
+    dailies = (candle("2026-01-05T00:00:00Z", "1", "1", "1", "1", "1", "KRW"),)
+    with pytest.raises(ValueError):
+        support_resistance(intraday, daily_candles=dailies)
+
+
+def test_support_resistance_naive_timestamp_rejected() -> None:
+    naive = datetime(2026, 1, 5, 10, 0).astimezone(UTC).replace(tzinfo=None)
+    assert naive.tzinfo is None
+    intraday = (candle(naive.isoformat(), "1", "1", "1", "1", "1"),)
+    with pytest.raises(ValueError):
+        support_resistance(intraday)
+
+
+# --- IndicatorSnapshot / indicator_snapshot -------------------------------
+
+
+def test_indicator_snapshot_sufficient_data_matches_component_calls() -> None:
+    candles = (
+        candle("2026-01-05T10:03:00Z", "13", "13", "13", "13", "60"),  # newest
+        candle("2026-01-05T10:02:00Z", "10", "10", "10", "10", "10"),
+        candle("2026-01-05T10:01:00Z", "12", "12", "12", "12", "20"),
+        candle("2026-01-05T10:00:00Z", "10", "10", "10", "10", "30"),  # oldest
+    )
+    result = indicator_snapshot(
+        candles,
+        rsi_period=2,
+        volume_lookback=3,
+        minimum_baseline=3,
+        level_lookback=4,
+        pivot_window=1,
+    )
+    assert isinstance(result, IndicatorSnapshot)
+    assert result.rsi == Decimal("80")
+    assert result.relative_volume == Decimal("3")
+    assert result.levels == support_resistance(
+        candles, daily_candles=(), lookback=4, pivot_window=1
+    )
+
+
+def test_indicator_snapshot_insufficient_data_no_fabricated_zeros() -> None:
+    candles = (candle("2026-01-05T10:00:00Z", "10", "10", "10", "10", "1"),)
+    result = indicator_snapshot(candles)
+    assert result.rsi is None
+    assert result.relative_volume is None
+    assert result.levels is not None
+    assert result.levels.previous_close is None
+    assert result.levels.swing_high is None
+    assert result.levels.swing_low is None
+
+
+def test_indicator_snapshot_invalid_rsi_period_rejected() -> None:
+    one = (candle("2026-01-05T10:00:00Z", "1", "1", "1", "1", "1"),)
+    with pytest.raises(ValueError):
+        indicator_snapshot(one, rsi_period=0)
