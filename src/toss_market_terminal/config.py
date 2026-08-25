@@ -22,12 +22,16 @@ class Credentials:
     @classmethod
     def load(cls, path: Path = DEFAULT_CREDENTIALS_PATH) -> Credentials:
         path = path.expanduser()
-        if path.is_symlink():
-            raise CredentialError("자격증명 파일은 심볼릭 링크일 수 없습니다.")
         try:
+            if path.is_symlink():
+                raise CredentialError("자격증명 파일은 심볼릭 링크일 수 없습니다.")
             file_stat = path.stat()
+        except CredentialError:
+            raise
         except FileNotFoundError as exc:
             raise CredentialError(f"자격증명 파일을 찾을 수 없습니다: {path}") from exc
+        except OSError as exc:
+            raise CredentialError("자격증명 파일 상태를 안전하게 확인하지 못했습니다.") from exc
         if not stat.S_ISREG(file_stat.st_mode):
             raise CredentialError("자격증명 경로가 일반 파일이 아닙니다.")
         if file_stat.st_uid != os.getuid():

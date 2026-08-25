@@ -64,7 +64,7 @@ async def test_auth_error_is_reported_once_without_retry() -> None:
 def test_rejected_subscription_is_explicit() -> None:
     rejected = parse_stream_frame(
         '{"type":"subscriptions","subscribed":[],"rejected":'
-        '[{"target":"trade:us:AAPL","code":"stock-not-found","message":"no"}]}',
+        '[{"target":"trade:us:AAPL","code":"[red]stock-not-found[/]","message":"no"}]}',
         "AAPL",
     )
-    assert rejected == StreamStatus("rejected", "stock-not-found")
+    assert rejected == StreamStatus("rejected", "redstock-not-found")

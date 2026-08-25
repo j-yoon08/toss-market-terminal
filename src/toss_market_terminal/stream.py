@@ -75,7 +75,14 @@ def parse_stream_frame(raw: str, symbol: str) -> StreamEvent | None:
         rejected = frame.get("rejected")
         if isinstance(rejected, list) and rejected:
             safe_codes = sorted(
-                {str(item.get("code", "rejected")) for item in rejected if isinstance(item, dict)}
+                {
+                    "".join(
+                        ch for ch in str(item.get("code", "rejected")) if ch.isalnum() or ch in "-_"
+                    )[:80]
+                    or "rejected"
+                    for item in rejected
+                    if isinstance(item, dict)
+                }
             )
             return StreamStatus("rejected", ",".join(safe_codes))
         subscribed = frame.get("subscribed")

@@ -43,3 +43,17 @@ def test_rejects_symlink(tmp_path: Path) -> None:
     link.symlink_to(real)
     with pytest.raises(CredentialError, match="심볼릭"):
         Credentials.load(link)
+
+
+def test_wraps_stat_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "openapi.json"
+    original_stat = Path.stat
+
+    def guarded_stat(candidate: Path, *args: object, **kwargs: object):
+        if candidate == path:
+            raise PermissionError("denied")
+        return original_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", guarded_stat)
+    with pytest.raises(CredentialError, match="상태를 안전하게"):
+        Credentials.load(path)
