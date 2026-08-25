@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 from zoneinfo import ZoneInfo
 
 from rich.text import Text
@@ -63,6 +63,7 @@ WATCHLIST_REFRESH_SECONDS = 15.0
 CANDLE_RESYNC_SECONDS = 30.0
 CHART_RENDER_INTERVAL_SECONDS = 0.25
 COMPACT_WIDTH_THRESHOLD = 117
+LiveCandleStatus = Literal["updated", "late", "unavailable"]
 
 
 def safe_status_error(exc: Exception) -> str:
@@ -689,20 +690,20 @@ class TossMarketApp(App[int]):
         if self.is_mounted:
             self._render_watchlist()
 
-    def _record_live_trade(self, trade: Trade) -> bool:
+    def _record_live_trade(self, trade: Trade) -> LiveCandleStatus:
         if self.snapshot is None:
-            return False
+            return "unavailable"
         base_candles = self._live_candles or self.snapshot.candles
         base_daily = self._live_daily_candles or self.snapshot.daily_candles
         updated_candles = apply_trade_to_candles(base_candles, trade)
         if base_candles and updated_candles == base_candles:
-            return False
+            return "late"
         updated_daily = apply_trade_to_candles(base_daily, trade, interval="1d")
         self._live_candles = updated_candles
         self._live_daily_candles = updated_daily
         self._live_candle_revision += 1
         self._live_trade_buffer.append((self._live_candle_revision, trade))
-        return True
+        return "updated"
 
     def _publish_live_chart(self) -> None:
         if self.snapshot is None or not self._live_candles:
@@ -726,18 +727,24 @@ class TossMarketApp(App[int]):
         last = self._last_chart_render_monotonic
         elapsed = self.chart_render_interval_seconds if last is None else now - last
         delay = max(0.0, self.chart_render_interval_seconds - elapsed)
+        pending = self.chart_render_task
+        if pending is not None and not pending.done() and delay > 0:
+            return
         if delay == 0:
             self._publish_live_chart()
             return
-        if self.chart_render_task is None or self.chart_render_task.done():
-            self.chart_render_task = asyncio.create_task(
-                self._publish_live_chart_after(delay, self.symbol)
-            )
+        self.chart_render_task = asyncio.create_task(
+            self._publish_live_chart_after(delay, self.symbol)
+        )
 
     async def _publish_live_chart_after(self, delay: float, symbol: str) -> None:
         try:
             await asyncio.sleep(delay)
-            if self.symbol == symbol:
+            last = self._last_chart_render_monotonic
+            elapsed = (
+                self.chart_render_interval_seconds if last is None else time.monotonic() - last
+            )
+            if self.symbol == symbol and elapsed >= self.chart_render_interval_seconds:
                 self._publish_live_chart()
         finally:
             if self.chart_render_task is asyncio.current_task():
@@ -808,21 +815,20 @@ class TossMarketApp(App[int]):
                     continue
                 self._recover_protocol_status()
                 try:
-                    candle_updated: bool | None = self._record_live_trade(event.trade)
+                    candle_status: LiveCandleStatus | None = self._record_live_trade(event.trade)
                 except ValueError:
-                    candle_updated = None
+                    candle_status = None
                     self._set_candle_sync_degraded("WS live · candle update failed")
-                if candle_updated is False:
-                    continue
                 self.trades.appendleft(event.trade)
-                self.current_price = event.trade.price
-                self.current_currency = event.trade.currency
-                self.current_timestamp = event.trade.timestamp
                 self.last_tick_monotonic = time.monotonic()
-                self._evaluate_active_alerts()
+                if candle_status != "late":
+                    self.current_price = event.trade.price
+                    self.current_currency = event.trade.currency
+                    self.current_timestamp = event.trade.timestamp
+                    self._evaluate_active_alerts()
+                    self._render_summary()
                 self._render_trades()
-                self._render_summary()
-                if candle_updated:
+                if candle_status == "updated":
                     self._schedule_live_chart_render()
                 else:
                     self._render_stats()

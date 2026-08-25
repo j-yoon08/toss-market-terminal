@@ -1152,3 +1152,131 @@ async def test_candle_resync_failure_is_degraded_and_success_recovers(tmp_path: 
         assert not app.candle_sync_degraded
         assert app.connection_state == "LIVE"
         assert app.connection_detail == "topics=2"
+
+
+async def test_trade_without_snapshot_keeps_tape_quote_and_price_alert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class OneTradeStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("120"), Decimal("2"), "2026-08-25T10:01:00+09:00", "USD"),
+            )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", OneTradeStream)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings=Settings(
+            watchlist=("AAPL",),
+            alerts=(AlertRule("A1", "AAPL", "above", Decimal("115")),),
+        ),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.snapshot = None
+        app._live_candles = ()
+        app._live_daily_candles = ()
+        app.current_price = None
+        app.current_timestamp = None
+        app.client = FakeClient()  # type: ignore[assignment]
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        assert app.current_price == Decimal("120")
+        assert app.current_timestamp == "2026-08-25T10:01:00+09:00"
+        assert app.trades[0].price == Decimal("120")
+        assert app.latest_alert is not None
+        assert app.latest_alert.rule.id == "A1"
+
+
+async def test_late_trade_stays_on_tape_without_rewinding_quote_or_candle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class LateTradeStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("999"), Decimal("3"), "2026-08-25T09:59:59+09:00", "USD"),
+            )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", LateTradeStream)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings=Settings(
+            watchlist=("AAPL",),
+            alerts=(AlertRule("LATE", "AAPL", "above", Decimal("500")),),
+        ),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        original_close = app.snapshot.candles[0].close_price
+        original_price = app.current_price
+        original_timestamp = app.current_timestamp
+        app.client = FakeClient()  # type: ignore[assignment]
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        assert app.trades[0].price == Decimal("999")
+        assert app.current_price == original_price
+        assert app.current_timestamp == original_timestamp
+        assert app.snapshot.candles[0].close_price == original_close
+        assert app.latest_alert is None
+
+
+async def test_pending_trailing_render_skips_duplicate_after_immediate_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    published = 0
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        chart_render_interval_seconds=0.05,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        original_publish = app._publish_live_chart
+
+        def tracked_publish() -> None:
+            nonlocal published
+            published += 1
+            original_publish()
+
+        monkeypatch.setattr(app, "_publish_live_chart", tracked_publish)
+        app._last_chart_render_monotonic = tui_module.time.monotonic() - 1
+        pending = asyncio.create_task(app._publish_live_chart_after(0.03, app.symbol))
+        app.chart_render_task = pending
+
+        app._schedule_live_chart_render()
+        assert published == 1
+        await pending
+        await pilot.pause()
+
+        assert published == 1
+        assert app.chart_render_task is None

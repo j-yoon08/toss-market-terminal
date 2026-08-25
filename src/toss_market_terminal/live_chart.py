@@ -30,14 +30,12 @@ def _minute_key(parsed: datetime) -> datetime:
     return parsed.astimezone(UTC).replace(second=0, microsecond=0)
 
 
-def _daily_key(parsed: datetime, reference: datetime | None) -> tuple[int, int]:
+def _daily_key(parsed: datetime, reference: datetime | None) -> int:
     if reference is not None:
         offset = reference.utcoffset()
         if offset is not None:
             parsed = parsed.astimezone(timezone(offset))
-    return parsed.date().toordinal(), int(
-        (parsed.utcoffset() or UTC.utcoffset(None)).total_seconds()
-    )
+    return parsed.date().toordinal()
 
 
 def _bucket_key(parsed: datetime, interval: CandleInterval, reference: datetime | None) -> object:
