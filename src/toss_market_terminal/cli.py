@@ -13,6 +13,15 @@ from rich.console import Console
 from .client import TossApiError, TossMarketClient
 from .config import DEFAULT_CREDENTIALS_PATH, CredentialError, Credentials
 from .render import snapshot_renderable
+from .settings import (
+    DEFAULT_SETTINGS_PATH,
+    SettingsError,
+    SettingsStore,
+    with_alert,
+    with_watchlist_symbol,
+    without_alert,
+    without_watchlist_symbol,
+)
 from .stream import StreamStatus, TossMarketStream, infer_market, normalize_symbol
 from .tui import TossMarketApp
 
@@ -78,6 +87,67 @@ async def run_probe(symbol: str, credentials_path: Path, seconds: float) -> int:
     return 0 if subscribed else 2
 
 
+def run_watchlist_list(settings_path: Path) -> int:
+    settings = SettingsStore(settings_path).load()
+    print("SYMBOL\tALERTS")
+    for symbol in settings.watchlist:
+        active = sum(1 for rule in settings.alerts if rule.symbol == symbol and rule.enabled)
+        print(f"{symbol}\t{active}")
+    return 0
+
+
+def run_watchlist_add(settings_path: Path, symbol: str) -> int:
+    normalized = normalize_symbol(symbol)
+    store = SettingsStore(settings_path)
+    settings = store.load()
+    updated, created = with_watchlist_symbol(settings, normalized)
+    if created:
+        store.save(updated)
+        print(f"ADDED\t{normalized}")
+    else:
+        print(f"EXISTS\t{normalized}")
+    return 0
+
+
+def run_watchlist_remove(settings_path: Path, symbol: str) -> int:
+    normalized = normalize_symbol(symbol)
+    store = SettingsStore(settings_path)
+    settings = store.load()
+    updated = without_watchlist_symbol(settings, normalized)
+    store.save(updated)
+    print(f"REMOVED\t{normalized}")
+    return 0
+
+
+def run_alert_list(settings_path: Path) -> int:
+    settings = SettingsStore(settings_path).load()
+    print("ID\tSYMBOL\tKIND\tTHRESHOLD\tENABLED")
+    for rule in settings.alerts:
+        enabled = "true" if rule.enabled else "false"
+        print(f"{rule.id}\t{rule.symbol}\t{rule.kind}\t{rule.threshold}\t{enabled}")
+    return 0
+
+
+def run_alert_add(settings_path: Path, symbol: str, kind: str, threshold: str) -> int:
+    normalized = normalize_symbol(symbol)
+    store = SettingsStore(settings_path)
+    settings = store.load()
+    updated, created = with_alert(settings, normalized, kind, threshold)
+    store.save(updated)
+    print(f"ADDED\t{created.id}")
+    return 0
+
+
+def run_alert_remove(settings_path: Path, alert_id: str) -> int:
+    normalized_id = alert_id.strip().upper()
+    store = SettingsStore(settings_path)
+    settings = store.load()
+    updated = without_alert(settings, normalized_id)
+    store.save(updated)
+    print(f"REMOVED\t{normalized_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="toss-market",
@@ -88,6 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_CREDENTIALS_PATH,
         help=f"자격증명 경로 (기본값: {DEFAULT_CREDENTIALS_PATH})",
+    )
+    parser.add_argument(
+        "--settings",
+        type=Path,
+        dest="settings_path",
+        default=DEFAULT_SETTINGS_PATH,
+        help=f"설정 파일 경로 (기본값: {DEFAULT_SETTINGS_PATH})",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -101,23 +178,65 @@ def build_parser() -> argparse.ArgumentParser:
     probe = subparsers.add_parser("probe", help="REST + WebSocket 조회 전용 연결 검증")
     probe.add_argument("symbol")
     probe.add_argument("--seconds", type=float, default=8.0)
+
+    watchlist = subparsers.add_parser("watchlist", help="관심종목 관리 (설정 파일 기반)")
+    watchlist.add_argument("--settings", type=Path, dest="settings", default=None)
+    watchlist_sub = watchlist.add_subparsers(dest="watchlist_command", required=True)
+    watchlist_sub.add_parser("list")
+    watchlist_add = watchlist_sub.add_parser("add")
+    watchlist_add.add_argument("symbol")
+    watchlist_remove = watchlist_sub.add_parser("remove")
+    watchlist_remove.add_argument("symbol")
+
+    alert = subparsers.add_parser("alert", help="로컬 알림 규칙 관리 (설정 파일 기반)")
+    alert.add_argument("--settings", type=Path, dest="settings", default=None)
+    alert_sub = alert.add_subparsers(dest="alert_command", required=True)
+    alert_sub.add_parser("list")
+    alert_add = alert_sub.add_parser("add")
+    alert_add.add_argument("symbol")
+    alert_add.add_argument(
+        "kind", choices=["above", "below", "change-above", "change-below", "volume-spike"]
+    )
+    alert_add.add_argument("threshold")
+    alert_remove = alert_sub.add_parser("remove")
+    alert_remove.add_argument("id")
+
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    def settings_file() -> Path:
+        return getattr(args, "settings", None) or args.settings_path
+
     try:
-        symbol = normalize_symbol(args.symbol)
-        if args.command == "snapshot":
-            return asyncio.run(run_snapshot(symbol, args.credentials, args.json_output))
-        if args.command == "probe":
+        if args.command in {"snapshot", "probe"}:
+            symbol = normalize_symbol(args.symbol)
+            if args.command == "snapshot":
+                return asyncio.run(run_snapshot(symbol, args.credentials, args.json_output))
             if not 1 <= args.seconds <= 60:
                 raise ValueError("probe 시간은 1~60초여야 합니다.")
             return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
         if args.command == "watch":
-            result = TossMarketApp(symbol, args.credentials).run()
+            symbol = normalize_symbol(args.symbol)
+            result = TossMarketApp(symbol, args.credentials, settings_path=settings_file()).run()
             return result or 0
-    except (CredentialError, TossApiError, ValueError) as exc:
+        if args.command == "watchlist":
+            if args.watchlist_command == "list":
+                return run_watchlist_list(settings_file())
+            if args.watchlist_command == "add":
+                return run_watchlist_add(settings_file(), args.symbol)
+            if args.watchlist_command == "remove":
+                return run_watchlist_remove(settings_file(), args.symbol)
+        if args.command == "alert":
+            if args.alert_command == "list":
+                return run_alert_list(settings_file())
+            if args.alert_command == "add":
+                return run_alert_add(settings_file(), args.symbol, args.kind, args.threshold)
+            if args.alert_command == "remove":
+                return run_alert_remove(settings_file(), args.id)
+    except (CredentialError, TossApiError, SettingsError, ValueError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
