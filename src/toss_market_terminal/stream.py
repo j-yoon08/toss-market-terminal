@@ -9,12 +9,19 @@ from typing import Any
 from uuid import uuid4
 
 from websockets.asyncio.client import connect
-from websockets.exceptions import InvalidStatus
+from websockets.exceptions import ConnectionClosedOK, InvalidStatus
 
 from .client import TossApiError, TossMarketClient
 from .models import Orderbook, Trade, infer_market, normalize_symbol
 
 WS_URL = "wss://openapi-ws.tossinvest.com/ws/v1"
+# Bounded silence watchdog: no server frame at all (trade/orderbook/pong/ack)
+# within this many seconds forces a reconnect instead of trusting a socket
+# that looks open but has gone quiet. Comfortably above the 60s app PING so a
+# normal keepalive round-trip never trips it, yet still bounded for quiet
+# symbols. Injectable per-instance (see ``TossMarketStream.__init__``) so
+# tests can use a much shorter value without patching module state.
+DEFAULT_WS_SILENCE_TIMEOUT_SECONDS = 80.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,8 +104,16 @@ def parse_stream_frame(raw: str, symbol: str) -> StreamEvent | None:
 
 
 class TossMarketStream:
-    def __init__(self, client: TossMarketClient) -> None:
+    def __init__(
+        self,
+        client: TossMarketClient,
+        *,
+        silence_timeout_seconds: float = DEFAULT_WS_SILENCE_TIMEOUT_SECONDS,
+    ) -> None:
+        if silence_timeout_seconds <= 0:
+            raise ValueError("무응답 감시 시간은 양수여야 합니다.")
         self._client = client
+        self._silence_timeout_seconds = silence_timeout_seconds
 
     async def events(self, symbol: str, market: str | None = None) -> AsyncIterator[StreamEvent]:
         symbol = normalize_symbol(symbol)
@@ -124,7 +139,19 @@ class TossMarketStream:
                     attempt = 0
                     keepalive = asyncio.create_task(self._keepalive(websocket))
                     try:
-                        async for raw in websocket:
+                        while True:
+                            try:
+                                raw = await asyncio.wait_for(
+                                    websocket.recv(), timeout=self._silence_timeout_seconds
+                                )
+                            except TimeoutError as exc:
+                                # No server frame at all (not even pong) within
+                                # the watchdog window: treat exactly like any
+                                # other connection failure below -- reconnect
+                                # with jittered backoff, then re-subscribe.
+                                raise ConnectionError("stream-idle-timeout") from exc
+                            except ConnectionClosedOK:
+                                break
                             if not isinstance(raw, str):
                                 continue
                             event = parse_stream_frame(raw, symbol)

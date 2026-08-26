@@ -49,6 +49,7 @@ from .models import (
     MarketSnapshot,
     OpenOrdersPage,
     Orderbook,
+    PortfolioSnapshot,
     Trade,
     find_open_order_duplicates,
 )
@@ -61,6 +62,7 @@ from .order_preview import (
 )
 from .order_ticket import OrderConfirmScreen, OrderTicketScreen, build_ticket_capture
 from .order_transport import TossOrderTransport
+from .portfolio import PortfolioScreen
 from .render import (
     CHART_MODE_LABELS,
     DOWN_COLOR,
@@ -74,6 +76,7 @@ from .render import (
     chart_renderable,
     direction_style,
     ema_relation_label_ko,
+    format_age,
     format_decimal,
     format_multiple,
     format_percent,
@@ -102,9 +105,11 @@ KST = ZoneInfo("Asia/Seoul")
 WATCHLIST_REFRESH_SECONDS = 15.0
 CANDLE_RESYNC_SECONDS = 30.0
 CHART_RENDER_INTERVAL_SECONDS = 0.25
+PORTFOLIO_REFRESH_SECONDS = 30.0
 COMPACT_WIDTH_THRESHOLD = 117
 LiveCandleStatus = Literal["updated", "late", "unavailable"]
 LiveTransportFactory = Callable[[str, int], LiveOrderTransport]
+PortfolioLoader = Callable[[], Awaitable[PortfolioSnapshot]]
 
 
 @dataclass
@@ -162,13 +167,6 @@ def connection_state_color(state: str, live: bool) -> str:
     if live:
         return UP_COLOR
     return MUTED_COLOR
-
-
-def format_age(monotonic_value: float | None) -> str:
-    """Bounded, truthful age since ``monotonic_value``; ``"—"`` when never observed."""
-    if monotonic_value is None:
-        return "—"
-    return f"{max(0.0, time.monotonic() - monotonic_value):.1f}s"
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +266,7 @@ class WatchlistAddScreen(ModalScreen[str | None]):
 HELP_LINES = (
     ("q", "종료"),
     ("r", "REST 재동기화"),
+    ("p", "포트폴리오 보기(계좌/보유/미체결)"),
     ("a", "관심종목 추가"),
     ("b", "PAPER 매수 미리보기(주문 전송 없음)"),
     ("s", "PAPER 매도 미리보기(주문 전송 없음)"),
@@ -284,6 +283,7 @@ class HelpScreen(ModalScreen[None]):
     BINDINGS: ClassVar = [
         Binding("escape", "close", "닫기"),
         Binding("question_mark", "close", "닫기"),
+        Binding("p", "noop", "닫기", show=False),
     ]
     CSS = """
     HelpScreen {
@@ -322,6 +322,9 @@ class HelpScreen(ModalScreen[None]):
     def action_close(self) -> None:
         self.dismiss(None)
 
+    def action_noop(self) -> None:
+        """모달 격리용 no-op. 어떤 상태도 바꾸지 않는다."""
+
 
 class TossMarketApp(App[int]):
     TITLE = "Toss Market Terminal"
@@ -329,6 +332,7 @@ class TossMarketApp(App[int]):
     BINDINGS: ClassVar = [
         Binding("q", "quit", "종료"),
         Binding("r", "refresh", "재동기화"),
+        Binding("p", "toggle_portfolio", "포트폴리오"),
         Binding("1", "intraday", "1-5 타임프레임"),
         Binding("2", "chart_5m", "5분봉", show=False),
         Binding("3", "chart_15m", "15분봉", show=False),
@@ -453,9 +457,11 @@ class TossMarketApp(App[int]):
         watchlist_refresh_seconds: float = WATCHLIST_REFRESH_SECONDS,
         candle_resync_seconds: float = CANDLE_RESYNC_SECONDS,
         chart_render_interval_seconds: float = CHART_RENDER_INTERVAL_SECONDS,
+        portfolio_refresh_seconds: float = PORTFOLIO_REFRESH_SECONDS,
         manual_live_orders: bool = False,
         live_audit_log: LiveAuditLog | None = None,
         live_transport_factory: LiveTransportFactory | None = None,
+        account_seq: int | None = None,
     ) -> None:
         super().__init__()
         if symbol is None and initial_snapshot is not None:
@@ -468,6 +474,12 @@ class TossMarketApp(App[int]):
         self.settings_path = settings_path
         self.settings = settings if settings is not None else Settings()
         self.watchlist_refresh_seconds = watchlist_refresh_seconds
+        if account_seq is not None and account_seq <= 0:
+            raise ValueError("account_seq는 양의 정수여야 합니다.")
+        self.account_seq = account_seq
+        if portfolio_refresh_seconds <= 0:
+            raise ValueError("포트폴리오 재동기화 주기는 양수여야 합니다.")
+        self.portfolio_refresh_seconds = portfolio_refresh_seconds
         if candle_resync_seconds <= 0:
             raise ValueError("캔들 재동기화 주기는 양수여야 합니다.")
         if chart_render_interval_seconds < 0:
@@ -536,6 +548,17 @@ class TossMarketApp(App[int]):
         self.access_token_loader: Callable[[], Awaitable[str]] | None = None
         # 미리보기 생성 서비스 팩토리(순수 도메인 PaperPreviewService). 테스트 대체 가능.
         self.paper_preview_service_factory: Callable[[], PaperPreviewService] | None = None
+        # Phase-1 포트폴리오 상태(계좌 읽기 전용, GET만). 마지막 성공 스냅샷을
+        # 유지하고, 실패해도 시장 WS/연결 상태는 절대 건드리지 않는다.
+        self.portfolio_task: asyncio.Task[None] | None = None
+        self.portfolio_refresh_lock = asyncio.Lock()
+        self.portfolio_snapshot: PortfolioSnapshot | None = None
+        self.portfolio_stale = False
+        self.portfolio_error: str | None = None
+        self.portfolio_synced_monotonic: float | None = None
+        self._portfolio_screen: PortfolioScreen | None = None
+        # 테스트 주입 지점(connect_live=False에서도 포트폴리오 새로고침을 검증할 수 있다).
+        self.portfolio_loader: PortfolioLoader | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="topbar", markup=False)
@@ -568,10 +591,12 @@ class TossMarketApp(App[int]):
             self.connection_state = "PREVIEW" if not self.connect_live else "SNAPSHOT"
             self._render_all()
             if not self.connect_live:
+                self._maybe_start_portfolio_polling()
                 return
 
         if not self.symbol and not self.connect_live:
             self._show_symbol_picker()
+            self._maybe_start_portfolio_polling()
             return
 
         try:
@@ -581,6 +606,9 @@ class TossMarketApp(App[int]):
             return
         self.client = TossMarketClient(credentials)
         await self._load_persisted_watchlist()
+        # Independent of symbol selection: portfolio data has its own account
+        # scope and must never block the market feed/symbol picker.
+        self._maybe_start_portfolio_polling()
         if not self.symbol:
             await self._refresh_watchlist_prices()
             self._show_symbol_picker()
@@ -590,6 +618,21 @@ class TossMarketApp(App[int]):
         self.feed_task = asyncio.create_task(self._run_feed())
         self.watchlist_task = asyncio.create_task(self._run_watchlist_polling())
         self.candle_sync_task = asyncio.create_task(self._run_candle_resync())
+
+    def _maybe_start_portfolio_polling(self) -> None:
+        """Start the background account-refresh loop at most once.
+
+        Ordinary disconnected fixture apps (``connect_live=False`` with no
+        ``portfolio_loader`` injected) never start it, so unit tests that
+        never touch the portfolio feature see no stray task/network attempt.
+        Real ``connect_live`` runs always start it -- portfolio has its own
+        account scope and must never depend on a symbol being selected.
+        """
+        if self.portfolio_task is not None:
+            return
+        if not (self.connect_live or self.portfolio_loader is not None):
+            return
+        self.portfolio_task = asyncio.create_task(self._run_portfolio_polling())
 
     def _show_symbol_picker(self) -> None:
         """Render a neutral start state until the operator selects a watchlist row."""
@@ -608,6 +651,7 @@ class TossMarketApp(App[int]):
             self.candle_sync_task,
             self.watchlist_task,
             self.feed_task,
+            self.portfolio_task,
         ):
             if task:
                 task.cancel()
@@ -632,6 +676,66 @@ class TossMarketApp(App[int]):
     def action_toggle_help(self) -> None:
         self.push_screen(HelpScreen())
 
+    def action_toggle_portfolio(self) -> None:
+        if self._portfolio_screen is not None:
+            self._portfolio_screen.dismiss(None)
+            return
+        if self.client is None and self.portfolio_loader is None:
+            self.notify(
+                "계좌 정보를 사용할 수 없어 포트폴리오를 열 수 없습니다.",
+                title="PORTFOLIO",
+                severity="warning",
+            )
+            return
+        screen = PortfolioScreen()
+        self._portfolio_screen = screen
+        self.push_screen(screen, self._on_portfolio_closed)
+        if self.portfolio_snapshot is None:
+            self.run_worker(self._refresh_portfolio(), exclusive=False)
+
+    def _on_portfolio_closed(self, _result: None) -> None:
+        self._portfolio_screen = None
+
+    async def _load_portfolio_snapshot(self) -> PortfolioSnapshot:
+        loader = self.portfolio_loader
+        if loader is not None:
+            return await loader()
+        if self.client is None:
+            raise RuntimeError("client-unavailable")
+        return await self.client.portfolio_snapshot(self.account_seq)
+
+    async def _refresh_portfolio(self) -> bool:
+        """One read-only account refresh. Never touches market/WS connection state."""
+        if self.portfolio_refresh_lock.locked():
+            return False
+        async with self.portfolio_refresh_lock:
+            try:
+                snapshot = await self._load_portfolio_snapshot()
+            except Exception as exc:
+                self.portfolio_stale = True
+                self.portfolio_error = safe_status_error(exc)
+                if self._portfolio_screen is not None:
+                    self._portfolio_screen.refresh_view()
+                return False
+            self.portfolio_snapshot = snapshot
+            self.portfolio_stale = False
+            self.portfolio_error = None
+            self.portfolio_synced_monotonic = time.monotonic()
+            if self._portfolio_screen is not None:
+                self._portfolio_screen.refresh_view()
+            return True
+
+    async def _run_portfolio_polling(self) -> None:
+        """Bounded background refresh: prompt first fetch, then fixed interval."""
+        while True:
+            try:
+                await self._refresh_portfolio()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.portfolio_stale = True
+            await asyncio.sleep(self.portfolio_refresh_seconds)
+
     def action_paper_buy_preview(self) -> None:
         self.run_worker(self._open_paper_ticket(OrderSide.BUY), exclusive=False)
 
@@ -653,7 +757,7 @@ class TossMarketApp(App[int]):
             return await loader(captured_symbol)
         if self.client is None:
             raise RuntimeError("client-unavailable")
-        return await self.client.account_context(captured_symbol)
+        return await self.client.account_context(captured_symbol, self.account_seq)
 
     async def _open_paper_ticket(self, side: OrderSide) -> None:
         if self._ticket_open_lock.locked():

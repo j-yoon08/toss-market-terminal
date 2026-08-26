@@ -54,7 +54,7 @@ AccountLoader = Callable[[str], Awaitable[AccountContext]]
 PreviewServiceFactory = Callable[[], PaperPreviewService]
 
 #: 모달 위에서 절대 앱(관심목록/차트) 동작으로 새어 나가면 안 되는 키 방어 목록.
-_ISOLATION_KEYS: tuple[str, ...] = ("a", "b", "c", "j", "k", "q", "r", "s")
+_ISOLATION_KEYS: tuple[str, ...] = ("a", "b", "c", "j", "k", "p", "q", "r", "s")
 
 
 def sanitize_ticket_error(exc: Exception) -> str:

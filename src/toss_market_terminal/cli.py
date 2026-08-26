@@ -239,12 +239,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="수동 LIVE 승인 화면 활성화(환경 게이트와 주문별 최종 확인도 필요)",
     )
+    watch.add_argument(
+        "--account-seq",
+        type=int,
+        default=None,
+        dest="account_seq",
+        help="포트폴리오/계좌 컨텍스트에 사용할 계좌 식별자(생략 시 자동 선택)",
+    )
 
     live = subparsers.add_parser(
         "live",
         help="수동 LIVE TUI 실행(앱에서 관심종목 선택, 주문마다 최종 승인)",
     )
     live.add_argument("symbol", nargs="?", help="선택적 시작 종목(생략 시 앱에서 선택)")
+    live.add_argument(
+        "--account-seq",
+        type=int,
+        default=None,
+        dest="account_seq",
+        help="포트폴리오/계좌 컨텍스트와 주문 계좌에 사용할 계좌 식별자(생략 시 자동 선택)",
+    )
 
     probe = subparsers.add_parser("probe", help="REST + WebSocket 조회 전용 연결 검증")
     probe.add_argument("symbol")
@@ -298,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"watch", "live"}:
             live_shortcut = args.command == "live"
             symbol = normalize_symbol(args.symbol) if args.symbol is not None else None
+            if args.account_seq is not None and args.account_seq <= 0:
+                raise ValueError("--account-seq는 양의 정수여야 합니다.")
             previous_gate = os.environ.get(MANUAL_LIVE_ENV_KEY)
             if live_shortcut:
                 os.environ[MANUAL_LIVE_ENV_KEY] = MANUAL_LIVE_ENV_VALUE
@@ -307,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.credentials,
                     settings_path=settings_file(),
                     manual_live_orders=live_shortcut or getattr(args, "live_orders", False),
+                    account_seq=args.account_seq,
                 ).run()
                 return result or 0
             finally:

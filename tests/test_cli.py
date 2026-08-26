@@ -190,6 +190,7 @@ def test_live_shortcut_enables_both_gates_only_for_app_run(
             "credentials": cli.DEFAULT_CREDENTIALS_PATH,
             "settings_path": DEFAULT_SETTINGS_PATH,
             "manual_live_orders": True,
+            "account_seq": None,
         }
     ]
     assert os.environ[key] == "previous"

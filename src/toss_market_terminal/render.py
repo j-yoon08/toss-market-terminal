@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -138,6 +139,13 @@ def format_multiple(value: Decimal | None) -> str:
         return "—"
     places = 0 if abs(value) >= Decimal("10") else 2
     return f"{value:.{places}f}배"
+
+
+def format_age(monotonic_value: float | None) -> str:
+    """Bounded, truthful age since ``monotonic_value``; ``"—"`` when never observed."""
+    if monotonic_value is None:
+        return "—"
+    return f"{max(0.0, time.monotonic() - monotonic_value):.1f}s"
 
 
 def format_trade_time(timestamp: str) -> str:

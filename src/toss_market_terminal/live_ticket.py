@@ -18,7 +18,7 @@ from .live_order import (
 )
 from .order_preview import canonical_decimal_text
 
-_ISOLATION_KEYS = ("a", "b", "c", "j", "k", "q", "r", "s", "m")
+_ISOLATION_KEYS = ("a", "b", "c", "j", "k", "p", "q", "r", "s", "m")
 REVIEW_ARM_SECONDS = 0.75
 
 

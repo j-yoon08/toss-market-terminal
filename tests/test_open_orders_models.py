@@ -63,6 +63,56 @@ def test_open_order_parses_official_example() -> None:
     assert order.status == "PENDING"
     assert order.quantity == Decimal("10")
     assert order.price == Decimal("70000")
+    assert order.filled_quantity == Decimal("0")
+    assert order.remaining_quantity == Decimal("10")
+
+
+# --- OpenOrder.execution.filledQuantity / remaining_quantity ------------------
+
+
+def test_open_order_parses_partial_fill_and_computes_remaining() -> None:
+    order = OpenOrder.from_api(
+        official_order(
+            status="PARTIAL_FILLED",
+            quantity="10",
+            execution={"filledQuantity": "3"},
+        )
+    )
+    assert order.filled_quantity == Decimal("3")
+    assert order.remaining_quantity == Decimal("7")
+
+
+def test_open_order_fully_filled_leaves_zero_remaining() -> None:
+    order = OpenOrder.from_api(
+        official_order(status="FILLED", quantity="10", execution={"filledQuantity": "10"})
+    )
+    assert order.filled_quantity == Decimal("10")
+    assert order.remaining_quantity == Decimal("0")
+
+
+def test_open_order_rejects_missing_execution_block() -> None:
+    raw = official_order()
+    raw.pop("execution")
+    with pytest.raises(ValueError):
+        OpenOrder.from_api(raw)
+
+
+def test_open_order_rejects_missing_filled_quantity_field() -> None:
+    raw = official_order(execution={"averageFilledPrice": None})
+    with pytest.raises(ValueError):
+        OpenOrder.from_api(raw)
+
+
+def test_open_order_rejects_negative_filled_quantity() -> None:
+    with pytest.raises(ValueError):
+        OpenOrder.from_api(official_order(quantity="10", execution={"filledQuantity": "-1"}))
+
+
+def test_open_order_rejects_filled_quantity_exceeding_quantity() -> None:
+    """accepted != filled: a filled amount above the ordered quantity is an
+    unsupported shape rather than a value this client can trust."""
+    with pytest.raises(ValueError):
+        OpenOrder.from_api(official_order(quantity="10", execution={"filledQuantity": "11"}))
 
 
 def test_open_order_market_order_price_is_none() -> None:

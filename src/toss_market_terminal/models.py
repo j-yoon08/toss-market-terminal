@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -539,24 +540,37 @@ class OpenOrder:
     status: str
     quantity: Decimal
     price: Decimal | None
+    filled_quantity: Decimal
+    remaining_quantity: Decimal
 
     @classmethod
     def from_api(cls, raw: Any) -> OpenOrder:
         body = _require_dict(raw, "order")
-        for key in ("orderId", "symbol", "side", "orderType", "status", "quantity"):
+        for key in ("orderId", "symbol", "side", "orderType", "status", "quantity", "execution"):
             if key not in body:
                 raise DataShapeError(f"order.{key} 값이 누락되었습니다.")
         side = body["side"]
         if side not in ("BUY", "SELL"):
             raise DataShapeError("order.side 값은 BUY 또는 SELL이어야 합니다.")
+        quantity = as_decimal(body["quantity"], "order.quantity")
+        execution = _require_dict(body["execution"], "order.execution")
+        if "filledQuantity" not in execution:
+            raise DataShapeError("order.execution.filledQuantity 값이 누락되었습니다.")
+        filled_quantity = as_decimal(execution["filledQuantity"], "order.execution.filledQuantity")
+        if filled_quantity < 0 or filled_quantity > quantity:
+            # accepted != filled: a filled amount outside [0, quantity] is an
+            # unsupported shape rather than a value this client can trust.
+            raise DataShapeError("order.execution.filledQuantity 값이 올바르지 않습니다.")
         return cls(
             order_id=_require_str(body["orderId"], "order.orderId"),
             symbol=_require_str(body["symbol"], "order.symbol"),
             side=side,
             order_type=_require_str(body["orderType"], "order.orderType"),
             status=_require_str(body["status"], "order.status"),
-            quantity=as_decimal(body["quantity"], "order.quantity"),
+            quantity=quantity,
             price=_require_decimal_or_none(body.get("price"), "order.price"),
+            filled_quantity=filled_quantity,
+            remaining_quantity=quantity - filled_quantity,
         )
 
 
@@ -611,3 +625,24 @@ def find_open_order_duplicates(
         and order.side == side
         and order.status not in TERMINAL_OPEN_ORDER_STATUSES
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 portfolio snapshot: one immutable, privacy-safe read of everything
+# the portfolio screen needs (account identity, KRW/USD buying power, full
+# holdings, all OPEN orders) plus a deterministic sync instant. Assembled by
+# ``TossMarketClient.portfolio_snapshot`` from already-validated GET-only
+# results; it carries no fields this module cannot already prove are safe.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioSnapshot:
+    scope: str
+    order_endpoints_called: bool
+    account: Account
+    krw_buying_power: BuyingPower
+    usd_buying_power: BuyingPower
+    holdings: HoldingsOverview
+    open_orders: OpenOrdersPage
+    synced_at: datetime

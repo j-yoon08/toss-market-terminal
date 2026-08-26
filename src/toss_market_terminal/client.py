@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -18,6 +19,7 @@ from .models import (
     MarketSnapshot,
     OpenOrdersPage,
     Orderbook,
+    PortfolioSnapshot,
     Price,
     StockInfo,
     Trade,
@@ -420,3 +422,28 @@ class TossMarketClient:
             params["symbol"] = normalized_symbol
         result = await self._open_orders_get("/api/v1/orders", params, account_seq=seq)
         return OpenOrdersPage.from_api(result)
+
+    # ------------------------------------------------------------------
+    # Phase-1 portfolio snapshot: one read-only fan-out over accounts,
+    # holdings, KRW+USD buying power, and all OPEN orders. No mutation.
+    # ------------------------------------------------------------------
+
+    async def portfolio_snapshot(self, account_seq: int | None = None) -> PortfolioSnapshot:
+        accounts = await self.accounts()
+        account = self._select_account(accounts, account_seq)
+        holdings, krw_power, usd_power, open_orders = await asyncio.gather(
+            self.holdings(account.account_seq),
+            self.buying_power(account.account_seq, "KRW"),
+            self.buying_power(account.account_seq, "USD"),
+            self.open_orders(account.account_seq),
+        )
+        return PortfolioSnapshot(
+            scope="account_read_only",
+            order_endpoints_called=False,
+            account=account,
+            krw_buying_power=krw_power,
+            usd_buying_power=usd_power,
+            holdings=holdings,
+            open_orders=open_orders,
+            synced_at=datetime.now(UTC),
+        )
