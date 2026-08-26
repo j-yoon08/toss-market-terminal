@@ -2,6 +2,15 @@
 
 토스증권 **공식 Open API**로 관심 종목·현재가·호가·체결·캔들 차트를 보여주는 조회 전용 실시간 터미널입니다. 넓은 터미널에서는 관심 종목·호가·차트·체결을 함께 표시하고, 좁은 SSH 터미널에서는 호가·체결 중심의 compact 화면으로 전환합니다.
 
+## v0.7a 주요 기능 (paper preview 경계)
+
+- `order_preview` 모듈: 주문 **미리보기 전용** 도메인 계층으로, HTTP 클라이언트 의존성이 없고 어떤 주문 엔드포인트도 알지 못하며 호출할 수 없습니다(전송·재시도 불가).
+- `PaperPreviewService`는 검증된 미리보기만 생성하며 `mode=PAPER_PREVIEW`, `order_endpoint_called=false`, `automatic_retry=false`, `manual_approval_only=true`를 항상 명시합니다.
+- 엄격한 Decimal 입력 파서(문자열/정수만, bool·float·NaN·Infinity·0·음수·과길이 텍스트 거부)와 시장별 수량 규칙(KR 정수, US LIMIT/MARKET 매수 정수, US MARKET 매도만 소수) 적용
+- 리스크 게이트 fail-closed: BUY는 추정 금액 ≤ 매수가능금액, SELL은 수량 ≤ 보유 수량, KRW/USD 외 조합 거부, 단일 주문 안전 상한(기본 KRW 100,000 / USD 100 — 설정 가능한 안전 장치이며 투자 권고가 아님)
+- 원문 계좌번호·토큰은 저장 구조상 불가능하고 마스킹된 계좌번호만 보관되며, 직렬화·오류 메시지에도 원문이 노출되지 않습니다
+- 주문 의도 불변 필드 + 안전 정책 버전의 canonical JSON SHA-256 지문(타임스탬프·비밀 제외)과 사람이 확인하는 승인 문구(`APPROVE <SIDE> <SYMBOL> <수량> <지문 앞 8자>`) 제공
+
 ## v0.6 주요 기능
 
 - `toss-market account SYMBOL` 읽기 전용 계좌 조회: 보유 종목 정보와 매수가능금액을 한 번에 확인
