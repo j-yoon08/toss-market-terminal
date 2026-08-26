@@ -469,8 +469,8 @@ class TossMarketClient:
             raise ValueError("종료 주문 조회 기간은 date 값이어야 합니다.")
         if start_date > end_date:
             raise ValueError("종료 주문 조회 시작일은 종료일보다 늦을 수 없습니다.")
-        if (end_date - start_date).days > 30:
-            raise ValueError("종료 주문 조회 기간은 최대 31일(inclusive)입니다.")
+        if (end_date - start_date).days >= 30:
+            raise ValueError("종료 주문 조회 기간은 최대 30일(inclusive)입니다.")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("종료 주문 조회 건수는 1~20이어야 합니다.")
         result = await self._open_orders_get(

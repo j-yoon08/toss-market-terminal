@@ -252,6 +252,7 @@ async def test_client_closed_orders_is_bounded_get_only() -> None:
     "kwargs",
     [
         {"start_date": date(2026, 8, 28), "end_date": date(2026, 8, 27)},
+        {"start_date": date(2026, 7, 28), "end_date": date(2026, 8, 27)},
         {"start_date": date(2026, 7, 1), "end_date": date(2026, 8, 27)},
         {"start_date": date(2026, 8, 1), "end_date": date(2026, 8, 27), "limit": 21},
     ],
