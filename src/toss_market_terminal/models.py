@@ -21,13 +21,33 @@ def infer_market(symbol: str) -> str:
     return "kr" if len(symbol) == 6 and symbol.isdigit() else "us"
 
 
+# v0.6: account context is limited to the two official settlement currencies.
+SUPPORTED_ACCOUNT_CURRENCIES = ("KRW", "USD")
+
+
+def infer_account_currency(symbol: str) -> str:
+    """Infer the settlement currency of a symbol for buying-power lookups.
+
+    KR symbols are exactly 6 digits; everything else is treated as US.
+    """
+    return "KRW" if infer_market(symbol) == "kr" else "USD"
+
+
 class DataShapeError(ValueError):
     """The provider returned an unsupported public market-data shape."""
+
+
+# Official decimal fields are strings with maxLength 30; anything beyond that
+# is not a supported shape. The bound also guarantees Decimal parsing can never
+# produce astronomically large exponents (finite but unrepresentable digits).
+MAX_DECIMAL_TEXT_LENGTH = 30
 
 
 def as_decimal(value: Any, field: str) -> Decimal:
     if not isinstance(value, (str, int)):
         raise DataShapeError(f"{field} 값이 decimal 문자열이 아닙니다.")
+    if len(str(value)) > MAX_DECIMAL_TEXT_LENGTH:
+        raise DataShapeError(f"{field} 값의 자릿수가 너무 깁니다.")
     try:
         parsed = Decimal(str(value))
     except InvalidOperation as exc:
@@ -151,3 +171,349 @@ class MarketSnapshot:
     trades: tuple[Trade, ...]
     candles: tuple[Candle, ...]
     daily_candles: tuple[Candle, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# v0.6 read-only account context models.
+#
+# Privacy rules enforced here:
+#   * raw account numbers are never stored on any model (masked only),
+#   * all decimals are strictly parsed from finite decimal strings/ints,
+#   * unknown enum strings are preserved verbatim instead of rejected,
+#   * any malformed shape fails closed with DataShapeError (a ValueError).
+# ---------------------------------------------------------------------------
+
+
+def mask_account_no(account_no: str) -> str:
+    """Mask an account number so at most the last 4 characters remain."""
+    if len(account_no) <= 4:
+        return "*" * len(account_no)
+    return "*" * (len(account_no) - 4) + account_no[-4:]
+
+
+def _require_dict(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise DataShapeError(f"{field} 값은 객체여야 합니다.")
+    return value
+
+
+def _require_str(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise DataShapeError(f"{field} 값은 비어 있지 않은 문자열이어야 합니다.")
+    return value
+
+
+def _require_decimal_or_none(value: Any, field: str) -> Decimal | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > MAX_DECIMAL_TEXT_LENGTH:
+        raise DataShapeError(f"{field} 값이 decimal 문자열이 아닙니다.")
+    return as_decimal(value, field)
+
+
+def as_account_seq(value: Any, field: str = "accountSeq") -> int:
+    """Strictly parse a positive integer account sequence key.
+
+    Booleans, floats, numeric strings and non-positive values are all
+    rejected: the provider declares this field as a true JSON integer.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise DataShapeError(f"{field} 값은 양의 정수여야 합니다.")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class CurrencyAmounts:
+    """Official ``Price`` schema: currency-scoped sums without FX conversion."""
+
+    krw: Decimal
+    usd: Decimal | None
+
+    @classmethod
+    def from_api(cls, raw: Any) -> CurrencyAmounts:
+        body = _require_dict(raw, "amounts")
+        krw = as_decimal(body.get("krw"), "amounts.krw")
+        usd = _require_decimal_or_none(body.get("usd"), "amounts.usd")
+        return cls(krw=krw, usd=usd)
+
+    def for_currency(self, currency: str) -> Decimal | None:
+        if currency == "KRW":
+            return self.krw
+        if currency == "USD":
+            return self.usd
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class Account:
+    """Privacy-safe account identity. The raw account number is never stored."""
+
+    account_seq: int
+    account_type: str
+    masked_account_no: str
+
+    @classmethod
+    def from_api(cls, raw: Any) -> Account:
+        body = _require_dict(raw, "account")
+        try:
+            account_no = _require_str(body["accountNo"], "account.accountNo")
+            account_seq = as_account_seq(body["accountSeq"])
+            account_type = _require_str(body["accountType"], "account.accountType")
+        except KeyError as exc:
+            raise DataShapeError(f"account 필드가 누락되었습니다: {exc.args[0]}") from exc
+        # Unknown enum strings are preserved; only emptiness is invalid.
+        return cls(
+            account_seq=account_seq,
+            account_type=account_type,
+            masked_account_no=mask_account_no(account_no),
+        )
+
+    @property
+    def is_brokerage(self) -> bool:
+        return self.account_type == "BROKERAGE"
+
+
+@dataclass(frozen=True, slots=True)
+class Cost:
+    commission: Decimal
+    tax: Decimal | None
+
+    @classmethod
+    def from_api(cls, raw: Any) -> Cost:
+        body = _require_dict(raw, "cost")
+        if "commission" not in body:
+            raise DataShapeError("cost.commission 값이 누락되었습니다.")
+        if "tax" not in body:
+            raise DataShapeError("cost.tax 값이 누락되었습니다.")
+        tax = body["tax"]
+        if tax is not None and not isinstance(tax, str):
+            raise DataShapeError("cost.tax 값이 decimal 문자열이 아닙니다.")
+        return cls(
+            commission=as_decimal(body["commission"], "cost.commission"),
+            tax=_require_decimal_or_none(tax, "cost.tax"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DailyProfitLoss:
+    amount: Decimal
+    rate: Decimal
+
+    @classmethod
+    def from_api(cls, raw: Any, *, amount_field: str = "dailyProfitLoss.amount") -> DailyProfitLoss:
+        body = _require_dict(raw, "dailyProfitLoss")
+        for key in ("amount", "rate"):
+            if key not in body:
+                raise DataShapeError(f"dailyProfitLoss.{key} 값이 누락되었습니다.")
+        return cls(
+            amount=as_decimal(body["amount"], f"{amount_field}.amount"),
+            rate=as_decimal(body["rate"], f"{amount_field}.rate"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfitLoss:
+    amount: Decimal
+    amount_after_cost: Decimal
+    rate: Decimal
+    rate_after_cost: Decimal
+
+    @classmethod
+    def from_api(cls, raw: Any) -> ProfitLoss:
+        body = _require_dict(raw, "profitLoss")
+        for key in ("amount", "amountAfterCost", "rate", "rateAfterCost"):
+            if key not in body:
+                raise DataShapeError(f"profitLoss.{key} 값이 누락되었습니다.")
+        return cls(
+            amount=as_decimal(body["amount"], "profitLoss.amount"),
+            amount_after_cost=as_decimal(body["amountAfterCost"], "profitLoss.amountAfterCost"),
+            rate=as_decimal(body["rate"], "profitLoss.rate"),
+            rate_after_cost=as_decimal(body["rateAfterCost"], "profitLoss.rateAfterCost"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MarketValue:
+    purchase_amount: Decimal
+    amount: Decimal
+    amount_after_cost: Decimal
+
+    @classmethod
+    def from_api(cls, raw: Any) -> MarketValue:
+        body = _require_dict(raw, "marketValue")
+        for key in ("purchaseAmount", "amount", "amountAfterCost"):
+            if key not in body:
+                raise DataShapeError(f"marketValue.{key} 값이 누락되었습니다.")
+        return cls(
+            purchase_amount=as_decimal(body["purchaseAmount"], "marketValue.purchaseAmount"),
+            amount=as_decimal(body["amount"], "marketValue.amount"),
+            amount_after_cost=as_decimal(body["amountAfterCost"], "marketValue.amountAfterCost"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HoldingsItem:
+    symbol: str
+    name: str
+    market_country: str
+    currency: str
+    quantity: Decimal
+    last_price: Decimal
+    average_purchase_price: Decimal
+    market_value: MarketValue
+    profit_loss: ProfitLoss
+    daily_profit_loss: DailyProfitLoss
+    cost: Cost
+
+    @classmethod
+    def from_api(cls, raw: Any) -> HoldingsItem:
+        body = _require_dict(raw, "holdings.item")
+        for key in (
+            "symbol",
+            "name",
+            "marketCountry",
+            "currency",
+            "quantity",
+            "lastPrice",
+            "averagePurchasePrice",
+        ):
+            if key not in body:
+                raise DataShapeError(f"holdings.item.{key} 값이 누락되었습니다.")
+        return cls(
+            symbol=_require_str(body["symbol"], "holdings.item.symbol"),
+            name=_require_str(body["name"], "holdings.item.name"),
+            market_country=_require_str(body["marketCountry"], "holdings.item.marketCountry"),
+            currency=_require_str(body["currency"], "holdings.item.currency"),
+            quantity=as_decimal(body["quantity"], "holdings.item.quantity"),
+            last_price=as_decimal(body["lastPrice"], "holdings.item.lastPrice"),
+            average_purchase_price=as_decimal(
+                body["averagePurchasePrice"], "holdings.item.averagePurchasePrice"
+            ),
+            market_value=MarketValue.from_api(body.get("marketValue")),
+            profit_loss=ProfitLoss.from_api(body.get("profitLoss")),
+            daily_profit_loss=DailyProfitLoss.from_api(body.get("dailyProfitLoss")),
+            cost=Cost.from_api(body.get("cost")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OverviewMarketValue:
+    amount: CurrencyAmounts
+    amount_after_cost: CurrencyAmounts
+
+    @classmethod
+    def from_api(cls, raw: Any) -> OverviewMarketValue:
+        body = _require_dict(raw, "holdings.marketValue")
+        for key in ("amount", "amountAfterCost"):
+            if key not in body:
+                raise DataShapeError(f"marketValue.{key} 값이 누락되었습니다.")
+        return cls(
+            amount=CurrencyAmounts.from_api(body["amount"]),
+            amount_after_cost=CurrencyAmounts.from_api(body["amountAfterCost"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OverviewProfitLoss:
+    amount: CurrencyAmounts
+    amount_after_cost: CurrencyAmounts
+    rate: Decimal
+    rate_after_cost: Decimal
+
+    @classmethod
+    def from_api(cls, raw: Any) -> OverviewProfitLoss:
+        body = _require_dict(raw, "holdings.profitLoss")
+        for key in ("amount", "amountAfterCost", "rate", "rateAfterCost"):
+            if key not in body:
+                raise DataShapeError(f"profitLoss.{key} 값이 누락되었습니다.")
+        return cls(
+            amount=CurrencyAmounts.from_api(body["amount"]),
+            amount_after_cost=CurrencyAmounts.from_api(body["amountAfterCost"]),
+            rate=as_decimal(body["rate"], "overviewProfitLoss.rate"),
+            rate_after_cost=as_decimal(body["rateAfterCost"], "overviewProfitLoss.rateAfterCost"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OverviewDailyProfitLoss:
+    amount: CurrencyAmounts
+    rate: Decimal
+
+    @classmethod
+    def from_api(cls, raw: Any) -> OverviewDailyProfitLoss:
+        body = _require_dict(raw, "holdings.dailyProfitLoss")
+        for key in ("amount", "rate"):
+            if key not in body:
+                raise DataShapeError(f"dailyProfitLoss.{key} 값이 누락되었습니다.")
+        return cls(
+            amount=CurrencyAmounts.from_api(body["amount"]),
+            rate=as_decimal(body["rate"], "overviewDailyProfitLoss.rate"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HoldingsOverview:
+    total_purchase_amount: CurrencyAmounts
+    market_value: OverviewMarketValue
+    profit_loss: OverviewProfitLoss
+    daily_profit_loss: OverviewDailyProfitLoss
+    items: tuple[HoldingsItem, ...]
+
+    @classmethod
+    def from_api(cls, raw: Any) -> HoldingsOverview:
+        body = _require_dict(raw, "holdings.overview")
+        for key in ("totalPurchaseAmount", "marketValue", "profitLoss", "dailyProfitLoss"):
+            if key not in body:
+                raise DataShapeError(f"holdings.{key} 값이 누락되었습니다.")
+        items_raw = body.get("items")
+        if not isinstance(items_raw, list):
+            raise DataShapeError("holdings.items 값은 배열이어야 합니다.")
+        return cls(
+            total_purchase_amount=CurrencyAmounts.from_api(body["totalPurchaseAmount"]),
+            market_value=OverviewMarketValue.from_api(body["marketValue"]),
+            profit_loss=OverviewProfitLoss.from_api(body["profitLoss"]),
+            daily_profit_loss=OverviewDailyProfitLoss.from_api(body["dailyProfitLoss"]),
+            items=tuple(HoldingsItem.from_api(item) for item in items_raw),
+        )
+
+    def find_item(self, symbol: str) -> HoldingsItem | None:
+        normalized = symbol.strip().upper()
+        for item in self.items:
+            if item.symbol.upper() == normalized:
+                return item
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class BuyingPower:
+    currency: str
+    cash_buying_power: Decimal
+
+    @classmethod
+    def from_api(cls, raw: Any) -> BuyingPower:
+        body = _require_dict(raw, "buyingPower")
+        currency = _require_str(body.get("currency"), "buyingPower.currency")
+        if "cashBuyingPower" not in body:
+            raise DataShapeError("buyingPower.cashBuyingPower 값이 누락되었습니다.")
+        # Unknown currency strings are preserved here; callers restrict to KRW/USD.
+        return cls(
+            currency=currency,
+            cash_buying_power=as_decimal(body["cashBuyingPower"], "buyingPower.cashBuyingPower"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AccountContext:
+    """Privacy-safe read-only account context for one symbol.
+
+    ``scope`` and ``order_endpoints_called`` make the boundary explicit in
+    output; the account number only ever appears in masked form.
+    """
+
+    scope: str
+    order_endpoints_called: bool
+    account: Account
+    symbol: str
+    holding: HoldingsItem | None
+    holding_quantity: Decimal
+    buying_power: BuyingPower

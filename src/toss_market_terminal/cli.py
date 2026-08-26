@@ -12,6 +12,7 @@ from rich.console import Console
 
 from .client import TossApiError, TossMarketClient
 from .config import DEFAULT_CREDENTIALS_PATH, CredentialError, Credentials
+from .models import AccountContext
 from .render import snapshot_renderable
 from .settings import (
     DEFAULT_SETTINGS_PATH,
@@ -40,6 +41,54 @@ async def run_snapshot(symbol: str, credentials_path: Path, json_output: bool) -
         print(json.dumps(asdict(snapshot), ensure_ascii=False, default=json_default))
     else:
         Console().print(snapshot_renderable(snapshot))
+    return 0
+
+
+def account_context_payload(context: AccountContext) -> dict[str, object]:
+    """Privacy-safe JSON shape: masked account number only, explicit boundary."""
+    payload = asdict(context)
+    # Defense in depth: the raw account number is never stored on any model.
+    # Enforce the masking shape (all but the last 4 chars are '*') so a future
+    # model change cannot leak it into CLI JSON unnoticed.
+    masked = payload["account"]["masked_account_no"]
+    if len(masked) < 4 or masked[:-4] != "*" * (len(masked) - 4):
+        raise ValueError("계좌번호가 마스킹되지 않았습니다.")
+    return payload
+
+
+async def run_account(
+    symbol: str,
+    credentials_path: Path,
+    account_seq: int | None,
+    json_output: bool,
+) -> int:
+    credentials = Credentials.load(credentials_path)
+    async with TossMarketClient(credentials) as client:
+        context = await client.account_context(symbol, account_seq)
+    if json_output:
+        payload = account_context_payload(context)
+        payload.setdefault("scope", "account_read_only")
+        print(json.dumps(payload, ensure_ascii=False, default=json_default))
+        return 0
+    console = Console()
+    item = context.holding
+    console.print(
+        f"[bold]계좌[/bold] {context.account.masked_account_no} "
+        f"({context.account.account_type}, seq={context.account.account_seq})"
+    )
+    console.print(f"[bold]심볼[/bold] {context.symbol}")
+    if item is None:
+        console.print("[dim]보유 정보 없음 (보유 수량 0으로 조회)[/dim]")
+    else:
+        console.print(
+            f"보유 수량 {item.quantity} · 평단 {item.average_purchase_price} "
+            f"{item.currency} · 평가액 {item.market_value.amount} {item.currency}"
+        )
+        rate_pct = item.profit_loss.rate_after_cost * 100
+        console.print(f"평가손익 {item.profit_loss.amount} ({rate_pct:.2f}%)")
+    power = context.buying_power
+    console.print(f"[bold]매수가능금액[/bold] {power.cash_buying_power} {power.currency}")
+    console.print("[dim]scope=account_read_only · 주문 API 호출 없음[/dim]")
     return 0
 
 
@@ -172,6 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("symbol")
     snapshot.add_argument("--json", action="store_true", dest="json_output")
 
+    account = subparsers.add_parser(
+        "account", help="계좌·보유·매수가능금액 조회 (읽기 전용, 계좌번호 마스킹)"
+    )
+    account.add_argument("symbol")
+    account.add_argument("--account-seq", type=int, default=None, dest="account_seq")
+    account.add_argument("--json", action="store_true", dest="json_output")
+
     watch = subparsers.add_parser("watch", help="실시간 Textual TUI 실행")
     watch.add_argument("symbol")
 
@@ -211,10 +267,16 @@ def main(argv: list[str] | None = None) -> int:
         return getattr(args, "settings", None) or args.settings_path
 
     try:
-        if args.command in {"snapshot", "probe"}:
+        if args.command in {"snapshot", "account", "probe"}:
             symbol = normalize_symbol(args.symbol)
             if args.command == "snapshot":
                 return asyncio.run(run_snapshot(symbol, args.credentials, args.json_output))
+            if args.command == "account":
+                if args.account_seq is not None and args.account_seq <= 0:
+                    raise ValueError("--account-seq는 양의 정수여야 합니다.")
+                return asyncio.run(
+                    run_account(symbol, args.credentials, args.account_seq, args.json_output)
+                )
             if not 1 <= args.seconds <= 60:
                 raise ValueError("probe 시간은 1~60초여야 합니다.")
             return asyncio.run(run_probe(symbol, args.credentials, args.seconds))

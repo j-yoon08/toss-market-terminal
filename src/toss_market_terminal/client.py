@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -10,12 +10,18 @@ import httpx
 from .config import Credentials
 from .models import (
     MAX_BATCH_SYMBOLS,
+    Account,
+    AccountContext,
+    BuyingPower,
     Candle,
+    HoldingsOverview,
     MarketSnapshot,
     Orderbook,
     Price,
     StockInfo,
     Trade,
+    as_account_seq,
+    infer_account_currency,
     normalize_symbol,
 )
 
@@ -29,12 +35,36 @@ READ_ONLY_PATHS = frozenset(
         "/api/v1/candles",
     }
 )
+# v0.6: read-only account-context GET endpoints. Account-scoped paths require
+# the X-Tossinvest-Account header with a positive integer account_seq.
+ACCOUNT_READ_ONLY_PATHS = frozenset(
+    {
+        "/api/v1/accounts",
+        "/api/v1/holdings",
+        "/api/v1/buying-power",
+    }
+)
+# v0.6 restriction: only these currencies are accepted for buying-power lookups.
+ACCOUNT_CURRENCY_CODES = frozenset({"KRW", "USD"})
 
 
-@dataclass(frozen=True, slots=True)
 class TossApiError(RuntimeError):
+    """Sanitized API failure: only an HTTP status and a safe short code.
+
+    Deliberately a plain exception subclass rather than a frozen/slotted
+    dataclass: slotted dataclasses leave ``__traceback__`` unwritable, which
+    turns any escaping traceback attachment into a TypeError. Plain
+    ``RuntimeError`` subclassing preserves the sanitized message behavior
+    without that defect.
+    """
+
     status_code: int
     code: str
+
+    def __init__(self, status_code: int, code: str) -> None:
+        super().__init__(status_code, code)
+        self.status_code = status_code
+        self.code = code
 
     def __str__(self) -> str:
         return f"Toss Open API 요청 실패 (HTTP {self.status_code}, code={self.code})"
@@ -107,15 +137,23 @@ class TossMarketClient:
             self._token_expires_at = time.monotonic() + max(expires_in, 1)
             return token
 
+    async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+        if method != "GET":
+            # Structural guarantee: this client can never issue mutations.
+            raise ValueError(f"허용되지 않은 HTTP 메서드: {method}")
+        token = await self.access_token()
+        response = await self._http.request(
+            method,
+            path,
+            headers={"Authorization": f"Bearer {token}"},
+            **kwargs,
+        )
+        return response
+
     async def _get(self, path: str, params: dict[str, Any]) -> Any:
         if path not in READ_ONLY_PATHS:
             raise ValueError(f"허용되지 않은 API 경로: {path}")
-        token = await self.access_token()
-        response = await self._http.get(
-            path,
-            params=params,
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        response = await self._request_json("GET", path, params=params)
         if response.status_code != 200:
             raise self._sanitized_error(response)
         try:
@@ -123,6 +161,39 @@ class TossMarketClient:
             return body["result"]
         except (KeyError, TypeError, ValueError) as exc:
             raise TossApiError(response.status_code, "invalid-market-data-response") from exc
+
+    async def _account_get(
+        self,
+        path: str,
+        params: dict[str, Any],
+        *,
+        account_seq: int | None = None,
+    ) -> Any:
+        """GET an account-scoped endpoint with the X-Tossinvest-Account header.
+
+        The path allowlist and the positive-integer seq check both run before
+        any network activity, and failures never echo the raw request.
+        ``/api/v1/accounts`` is account-listing only and sends no seq header.
+        """
+        if path not in ACCOUNT_READ_ONLY_PATHS:
+            raise ValueError(f"허용되지 않은 API 경로: {path}")
+        headers = {}
+        token = await self.access_token()
+        headers["Authorization"] = f"Bearer {token}"
+        if path != "/api/v1/accounts":
+            seq = as_account_seq(account_seq)
+            headers["X-Tossinvest-Account"] = str(seq)
+        response = await self._http.get(path, params=params, headers=headers)
+        if response.status_code != 200:
+            raise self._sanitized_error(response)
+        try:
+            body = response.json()
+            result = body["result"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TossApiError(response.status_code, "invalid-account-data-response") from exc
+        if not isinstance(result, (dict, list)):
+            raise TossApiError(response.status_code, "invalid-account-data-response")
+        return result
 
     @staticmethod
     def _sanitized_error(response: httpx.Response) -> TossApiError:
@@ -226,3 +297,84 @@ class TossMarketClient:
             candles=candles,
             daily_candles=daily_candles,
         )
+
+    # ------------------------------------------------------------------
+    # v0.6 read-only account context.
+    # ------------------------------------------------------------------
+
+    async def accounts(self) -> tuple[Account, ...]:
+        result = await self._account_get("/api/v1/accounts", {})
+        if not isinstance(result, list):
+            raise TossApiError(200, "invalid-accounts-response")
+        accounts = tuple(Account.from_api(item) for item in result)
+        seqs = [account.account_seq for account in accounts]
+        if len(set(seqs)) != len(seqs):
+            raise TossApiError(200, "duplicate-account-seq")
+        return accounts
+
+    async def holdings(self, account_seq: int, symbol: str | None = None) -> HoldingsOverview:
+        # Validate before any token or network activity.
+        normalized_symbol = normalize_symbol(symbol) if symbol is not None else None
+        seq = as_account_seq(account_seq)
+        params: dict[str, Any] = {}
+        if normalized_symbol is not None:
+            params["symbol"] = normalized_symbol
+        result = await self._account_get("/api/v1/holdings", params, account_seq=seq)
+        if not isinstance(result, dict):
+            raise TossApiError(200, "invalid-holdings-response")
+        return HoldingsOverview.from_api(result)
+
+    async def buying_power(self, account_seq: int, currency: str) -> BuyingPower:
+        # Strict validation before any token or network activity.
+        if not isinstance(currency, str) or currency not in ACCOUNT_CURRENCY_CODES:
+            raise ValueError("매수가능금액 조회 통화는 KRW 또는 USD만 지원합니다.")
+        seq = as_account_seq(account_seq)
+        result = await self._account_get(
+            "/api/v1/buying-power", {"currency": currency}, account_seq=seq
+        )
+        if not isinstance(result, dict):
+            raise TossApiError(200, "invalid-buying-power-response")
+        power = BuyingPower.from_api(result)
+        if power.currency != currency:
+            # Fail closed when the response is not in the requested currency.
+            raise TossApiError(200, "buying-power-currency-mismatch")
+        return power
+
+    def _select_account(self, accounts: tuple[Account, ...], account_seq: int | None) -> Account:
+        """Explicit valid seq wins; otherwise auto-select a single BROKERAGE."""
+        if account_seq is not None:
+            seq = as_account_seq(account_seq)
+            for account in accounts:
+                if account.account_seq == seq:
+                    return account
+            raise ValueError("지정한 계좌 식별자를 찾을 수 없습니다.")
+        brokerage = [a for a in accounts if a.is_brokerage]
+        if len(brokerage) == 1:
+            return brokerage[0]
+        if not brokerage:
+            raise ValueError("조회 가능한 종합매매(BROKERAGE) 계좌가 없습니다.")
+        raise ValueError("종합매매 계좌가 여러 개입니다. --account-seq로 지정하세요.")
+
+    async def account_context(self, symbol: str, account_seq: int | None = None) -> AccountContext:
+        normalized = normalize_symbol(symbol)
+        accounts = await self.accounts()
+        account = self._select_account(accounts, account_seq)
+        overview = await self.holdings(account.account_seq, symbol=normalized)
+        item = overview.find_item(normalized)
+        inferred_currency = item.currency if item else infer_account_currency(normalized)
+        if inferred_currency not in ACCOUNT_CURRENCY_CODES:
+            # Fail closed before any buying-power request for exotic currencies.
+            raise ValueError(
+                "지원하지 않는 보유 자산 통화입니다. KRW 또는 USD만 조회할 수 있습니다."
+            )
+        power = await self.buying_power(account.account_seq, inferred_currency)
+        context = AccountContext(
+            scope="account_read_only",
+            order_endpoints_called=False,
+            account=account,
+            symbol=normalized,
+            holding=item,
+            holding_quantity=Decimal("0") if item is None else item.quantity,
+            buying_power=power,
+        )
+        return context
