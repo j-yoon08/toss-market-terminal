@@ -4,7 +4,7 @@
 
 ## v0.8.0 주요 기능 (기본 PAPER · 수동 승인 LIVE)
 
-- `toss-market watch SYMBOL`은 항상 PAPER 기본입니다. 실제 주문용 단축 명령은 `toss-market live SYMBOL`이며, 실행 구간에만 runtime/env gate를 함께 활성화합니다. 기존 `watch --live-orders` 경로는 환경 게이트가 별도로 없으면 계속 차단됩니다.
+- `toss-market watch SYMBOL`은 항상 PAPER 기본입니다. 실제 주문용 기본 명령은 `toss-market live`이며, 저장된 관심 목록에서 종목을 선택합니다. 선택적 호환 형식 `toss-market live SYMBOL`도 유지합니다. live 실행 구간에만 runtime/env gate를 함께 활성화하며, 기존 `watch --live-orders` 경로는 환경 게이트가 별도로 없으면 계속 차단됩니다.
 - `b`/`s` 티켓에서 PAPER 미리보기를 먼저 만들고 확인한 뒤, live 명령에서만 별도 최종 승인 모달이 열립니다. 사용자는 방향·종목·수량·가격·계좌를 확인하고, 검토 잠금이 해제된 뒤 새로 `Enter`를 눌러 주문 접수를 요청합니다. 문구 입력은 없습니다.
 - 제출 직전에 계좌·보유수량·매수가능금액을 다시 조회하고 risk gate를 재실행합니다. 이어 `GET /api/v1/orders?status=OPEN`으로 같은 종목·방향의 미체결 주문을 확인하며, 활성 상태 또는 알 수 없는 상태가 있으면 fail-closed로 차단합니다.
 - 안전 점검 뒤 기존 OAuth token을 just-in-time으로 재사용해 별도 동기 transport를 `asyncio.to_thread`에서 실행합니다. POST는 계획당 최대 1회이며 timeout·5xx·응답 불일치 등 모호한 결과 뒤에는 절대 자동 재시도하지 않습니다.
@@ -133,7 +133,7 @@ uv run toss-market --settings /tmp/toss-market-settings.json watchlist add AAPL
 
 `toss-market watch SYMBOL`의 실행 심볼은 화면의 관심 목록에 일시적으로 포함되지만 설정 파일에 자동 저장되지는 않습니다.
 
-실행 중인 TUI에서는 `a`를 누르고 심볼을 입력한 뒤 `Enter`를 누르면 관심 종목에 저장되고 목록에 즉시 반영됩니다. `Esc`는 입력을 취소합니다. 공식 API에 연결된 상태에서는 저장 전에 종목 존재 여부를 확인합니다.
+실행 중인 TUI에서는 `a`를 누르고 심볼을 입력한 뒤 `Enter`를 누르면 관심 종목에 저장되고 목록에 즉시 반영됩니다. 추가만으로 활성 주문 종목이 바뀌지는 않으며, 목록에서 `↑`/`↓`로 이동한 뒤 `Enter`를 눌러 명시적으로 선택합니다. `Esc`는 입력을 취소합니다. 공식 API에 연결된 상태에서는 저장 전에 종목 존재 여부를 확인합니다.
 
 ## 로컬 알림
 
@@ -188,16 +188,16 @@ uv run toss-market watch 005930
 위 명령은 PAPER 기본입니다. 수동 LIVE 승인 화면은 전용 단축 명령으로 실행합니다.
 
 ```bash
-uv run toss-market live AAPL
+uv run toss-market live
 ```
 
 `toss-market`을 user tool로 설치한 환경에서는 더 짧게 실행할 수 있습니다.
 
 ```bash
-toss-market live AAPL
+toss-market live
 ```
 
-전용 `live` 명령은 실행 중에만 내부 runtime/env gate를 함께 켜고 종료 시 원래 환경으로 복원합니다. 이 상태에서도 주문은 자동 전송되지 않습니다. `b`/`s` PAPER 티켓과 확인 단계를 완료한 다음, 별도 LIVE 모달에서 방향·종목·수량·가격·마스킹 계좌를 확인합니다. 모달이 열린 직후에는 Enter가 잠겨 있고, 0.75초 검토 시간이 지난 뒤 새로 `Enter`를 누르면 **실제 주문 접수 요청**이 전송됩니다. 이는 체결 완료를 의미하지 않습니다. PAPER 확인 Enter가 반복되면 검토 타이머가 다시 시작되어 연속 입력만으로는 LIVE 제출되지 않습니다. `Esc` 취소, 계획 만료, 잔고 변화, 미체결 중복, 감사로그 preflight 실패는 모두 POST 0회로 차단됩니다.
+전용 `live` 명령은 실행 중에만 내부 runtime/env gate를 함께 켜고 종료 시 원래 환경으로 복원합니다. 기본 무인자 실행은 활성 종목 없이 저장된 관심 목록을 보여줍니다. `↑`/`↓`로 이동하고 `Enter`를 눌러 주문 대상 종목을 선택하며, 목록이 비었거나 새 종목이 필요하면 `a`로 추가합니다. 추가만으로는 자동 선택되지 않습니다. 기존 `toss-market live AAPL` 형식도 선택적 시작 종목 호환용으로 유지됩니다. 이 상태에서도 주문은 자동 전송되지 않습니다. `b`/`s` PAPER 티켓과 확인 단계를 완료한 다음, 별도 LIVE 모달에서 방향·종목·수량·가격·마스킹 계좌를 확인합니다. 모달이 열린 직후에는 Enter가 잠겨 있고, 0.75초 검토 시간이 지난 뒤 새로 `Enter`를 누르면 **실제 주문 접수 요청**이 전송됩니다. 이는 체결 완료를 의미하지 않습니다. PAPER 확인 Enter가 반복되면 검토 타이머가 다시 시작되어 연속 입력만으로는 LIVE 제출되지 않습니다. `Esc` 취소, 계획 만료, 잔고 변화, 미체결 중복, 감사로그 preflight 실패는 모두 POST 0회로 차단됩니다.
 
 연결 검증:
 

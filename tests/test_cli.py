@@ -142,8 +142,11 @@ def test_watch_live_orders_flag_is_explicit_and_default_off() -> None:
 
 
 def test_live_shortcut_is_an_explicit_subcommand() -> None:
-    args = build_parser().parse_args(["live", "aapl"])
+    args = build_parser().parse_args(["live"])
     assert args.command == "live"
+    assert args.symbol is None
+
+    args = build_parser().parse_args(["live", "aapl"])
     assert args.symbol == "aapl"
 
 
@@ -172,7 +175,7 @@ def test_live_shortcut_enables_both_gates_only_for_app_run(
     monkeypatch.setenv(key, "previous")
 
     class FakeApp:
-        def __init__(self, symbol: str, credentials: object, **kwargs: object) -> None:
+        def __init__(self, symbol: str | None, credentials: object, **kwargs: object) -> None:
             captured.append({"symbol": symbol, "credentials": credentials, **kwargs})
 
         def run(self) -> int:
@@ -180,16 +183,33 @@ def test_live_shortcut_enables_both_gates_only_for_app_run(
             return 0
 
     monkeypatch.setattr(cli, "TossMarketApp", FakeApp)
-    assert main(["live", "aapl"]) == 0
+    assert main(["live"]) == 0
     assert captured == [
         {
-            "symbol": "AAPL",
+            "symbol": None,
             "credentials": cli.DEFAULT_CREDENTIALS_PATH,
             "settings_path": DEFAULT_SETTINGS_PATH,
             "manual_live_orders": True,
         }
     ]
     assert os.environ[key] == "previous"
+
+
+def test_live_shortcut_keeps_optional_start_symbol_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str | None] = []
+
+    class FakeApp:
+        def __init__(self, symbol: str | None, *_args: object, **_kwargs: object) -> None:
+            captured.append(symbol)
+
+        def run(self) -> int:
+            return 0
+
+    monkeypatch.setattr(cli, "TossMarketApp", FakeApp)
+    assert main(["live", "aapl"]) == 0
+    assert captured == ["AAPL"]
 
 
 def test_live_shortcut_restores_missing_gate_when_app_raises(
@@ -208,7 +228,7 @@ def test_live_shortcut_restores_missing_gate_when_app_raises(
 
     monkeypatch.setattr(cli, "TossMarketApp", FailingApp)
     with pytest.raises(RuntimeError, match="fixture failure"):
-        main(["live", "AAPL"])
+        main(["live"])
     assert key not in os.environ
 
 

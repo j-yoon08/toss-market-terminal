@@ -202,7 +202,7 @@ def run_alert_remove(settings_path: Path, alert_id: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="toss-market",
-        description="토스증권 공식 Open API 기반 조회 전용 실시간 주식 터미널",
+        description="토스증권 공식 Open API 기반 PAPER 기본 실시간 주식 터미널",
     )
     parser.add_argument(
         "--credentials",
@@ -237,14 +237,14 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument(
         "--live-orders",
         action="store_true",
-        help="수동 LIVE 승인 화면 활성화(환경 게이트와 정확한 승인문구도 필요)",
+        help="수동 LIVE 승인 화면 활성화(환경 게이트와 주문별 최종 확인도 필요)",
     )
 
     live = subparsers.add_parser(
         "live",
-        help="수동 LIVE TUI 단축 실행(주문마다 별도 최종 승인 필요)",
+        help="수동 LIVE TUI 실행(앱에서 관심종목 선택, 주문마다 최종 승인)",
     )
-    live.add_argument("symbol")
+    live.add_argument("symbol", nargs="?", help="선택적 시작 종목(생략 시 앱에서 선택)")
 
     probe = subparsers.add_parser("probe", help="REST + WebSocket 조회 전용 연결 검증")
     probe.add_argument("symbol")
@@ -296,8 +296,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("probe 시간은 1~60초여야 합니다.")
             return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
         if args.command in {"watch", "live"}:
-            symbol = normalize_symbol(args.symbol)
             live_shortcut = args.command == "live"
+            symbol = normalize_symbol(args.symbol) if args.symbol is not None else None
             previous_gate = os.environ.get(MANUAL_LIVE_ENV_KEY)
             if live_shortcut:
                 os.environ[MANUAL_LIVE_ENV_KEY] = MANUAL_LIVE_ENV_VALUE

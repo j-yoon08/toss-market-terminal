@@ -431,11 +431,19 @@ class TossMarketApp(App[int]):
     Screen.chart-focus #chart-panel { width: 60%; }
     Screen.chart-focus #orderbook-panel { width: 20%; }
     Screen.chart-focus #trades-panel { width: 20%; }
+    Screen.symbol-picker #watchlist-panel { display: block; width: 100%; }
+    Screen.symbol-picker #orderbook-panel,
+    Screen.symbol-picker #chart-panel,
+    Screen.symbol-picker #trades-panel { display: none; }
+    Screen.compact.symbol-picker #watchlist-panel { display: block; width: 100%; }
+    Screen.compact.symbol-picker #orderbook-panel,
+    Screen.compact.symbol-picker #chart-panel,
+    Screen.compact.symbol-picker #trades-panel { display: none; }
     """
 
     def __init__(
         self,
-        symbol: str,
+        symbol: str | None,
         credentials_path: Path,
         *,
         initial_snapshot: MarketSnapshot | None = None,
@@ -450,8 +458,10 @@ class TossMarketApp(App[int]):
         live_transport_factory: LiveTransportFactory | None = None,
     ) -> None:
         super().__init__()
-        self.symbol = normalize_symbol(symbol)
-        self.market = infer_market(self.symbol)
+        if symbol is None and initial_snapshot is not None:
+            symbol = initial_snapshot.stock.symbol
+        self.symbol = normalize_symbol(symbol) if symbol is not None else ""
+        self.market = infer_market(self.symbol) if self.symbol else ""
         self.credentials_path = credentials_path
         self.initial_snapshot = initial_snapshot
         self.connect_live = connect_live
@@ -560,6 +570,10 @@ class TossMarketApp(App[int]):
             if not self.connect_live:
                 return
 
+        if not self.symbol and not self.connect_live:
+            self._show_symbol_picker()
+            return
+
         try:
             credentials = Credentials.load(self.credentials_path)
         except CredentialError as exc:
@@ -567,10 +581,26 @@ class TossMarketApp(App[int]):
             return
         self.client = TossMarketClient(credentials)
         await self._load_persisted_watchlist()
+        if not self.symbol:
+            await self._refresh_watchlist_prices()
+            self._show_symbol_picker()
+            self.watchlist_task = asyncio.create_task(self._run_watchlist_polling())
+            return
         await self._refresh_snapshot()
         self.feed_task = asyncio.create_task(self._run_feed())
         self.watchlist_task = asyncio.create_task(self._run_watchlist_polling())
         self.candle_sync_task = asyncio.create_task(self._run_candle_resync())
+
+    def _show_symbol_picker(self) -> None:
+        """Render a neutral start state until the operator selects a watchlist row."""
+        self.screen.set_class(True, "symbol-picker")
+        self.connection_state = "SELECT"
+        self.connection_detail = "↑/↓ 이동 · Enter 선택 · a 종목 추가"
+        self.query_one("#summary", Static).update(
+            "관심 종목을 선택하세요\n↑/↓ 이동 · Enter 선택 · a 종목 추가"
+        )
+        self._render_watchlist()
+        self._render_chrome()
 
     async def on_unmount(self) -> None:
         for task in (
@@ -635,6 +665,13 @@ class TossMarketApp(App[int]):
             )
             return
         async with self._ticket_open_lock:
+            if not self.symbol:
+                self.notify(
+                    "먼저 관심 목록에서 종목을 선택하세요.",
+                    title="PAPER PREVIEW",
+                    severity="warning",
+                )
+                return
             capture = build_ticket_capture(
                 self.symbol,
                 self.current_price,
@@ -1057,7 +1094,7 @@ class TossMarketApp(App[int]):
 
     def _watchlist_with_active(self, persisted: tuple[str, ...]) -> tuple[str, ...]:
         configured = list(dict.fromkeys(persisted))
-        if self.symbol not in configured:
+        if self.symbol and self.symbol not in configured:
             if len(configured) >= 12:
                 configured = configured[:11]
             configured.append(self.symbol)
@@ -1107,7 +1144,7 @@ class TossMarketApp(App[int]):
             return True
 
     def _refresh_watchlist_rows_from_snapshot(self) -> None:
-        if self.snapshot is None or self.current_price is None:
+        if self.snapshot is None or self.current_price is None or not self.symbol:
             return
         active_alerts = sum(
             1 for rule in self.settings.alerts if rule.symbol == self.symbol and rule.enabled
@@ -1179,6 +1216,8 @@ class TossMarketApp(App[int]):
         return events
 
     def _evaluate_active_alerts(self) -> tuple[AlertEvent, ...]:
+        if not self.symbol:
+            return ()
         return self._evaluate_alerts(
             symbol=self.symbol,
             current_price=self.current_price,
@@ -1249,6 +1288,8 @@ class TossMarketApp(App[int]):
 
             self.symbol = normalized
             self.market = infer_market(normalized)
+            if self.is_mounted:
+                self.screen.set_class(False, "symbol-picker")
             self.stream_live = False
             self.subscription_detail = ""
             self.protocol_degraded = False
@@ -1283,18 +1324,22 @@ class TossMarketApp(App[int]):
                 self._render_watchlist()
 
             if self.client is None:
+                self.connection_state = "PREVIEW" if not self.connect_live else "SELECTED"
+                self._render_chrome()
                 return
             await self._refresh_snapshot()
             self.feed_task = asyncio.create_task(
                 self._run_feed(symbol=normalized, market=self.market)
             )
+            if self.connect_live and self.candle_sync_task is None:
+                self.candle_sync_task = asyncio.create_task(self._run_candle_resync())
 
     async def _refresh_snapshot(self) -> bool:
         async with self.refresh_lock:
             return await self._refresh_snapshot_locked()
 
     async def _refresh_snapshot_locked(self) -> bool:
-        if self.client is None:
+        if self.client is None or not self.symbol:
             return False
         requested_symbol = self.symbol
         start_revision = self._live_candle_revision
@@ -1481,6 +1526,8 @@ class TossMarketApp(App[int]):
         if self.client is None:
             return
         feed_symbol = symbol or self.symbol
+        if not feed_symbol:
+            return
         feed_market = market or infer_market(feed_symbol)
         stream = TossMarketStream(self.client)
         async for event in stream.events(feed_symbol, feed_market):

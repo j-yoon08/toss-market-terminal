@@ -323,6 +323,120 @@ async def test_watchlist_navigation_uses_cursor_and_selects_row(tmp_path: Path) 
         assert app.market == "kr"
 
 
+async def test_live_picker_starts_without_active_symbol_then_selects_watchlist_row(
+    tmp_path: Path,
+) -> None:
+    app = TossMarketApp(
+        None,
+        tmp_path / "unused.json",
+        connect_live=False,
+        settings=Settings(watchlist=("AAPL", "NVDA")),
+        manual_live_orders=True,
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        assert app.symbol == ""
+        assert app.connection_state == "SELECT"
+        assert app.screen.has_class("symbol-picker")
+        assert "관심 종목을 선택" in app.query_one("#summary", Static).render().plain
+        table = app.query_one("#watchlist", DataTable)
+        assert app.query_one("#watchlist-panel").styles.display != "none"
+        symbols = [table.get_cell_at(Coordinate(row, 0)) for row in range(table.row_count)]
+        assert symbols == [" AAPL", " NVDA"]
+
+        await pilot.press("b")
+        await pilot.pause()
+        assert app.last_paper_preview is None
+        assert app.screen.has_class("symbol-picker")
+        assert any("종목을 선택" in item.message for item in app._notifications)
+
+        await app.action_watch_select()
+        await pilot.pause()
+        assert app.symbol == "AAPL"
+        assert app.market == "us"
+        assert not app.screen.has_class("symbol-picker")
+        assert table.get_cell_at(Coordinate(0, 0)) == ">AAPL"
+
+
+async def test_live_picker_adds_symbol_without_auto_selecting_it(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    store.save(Settings())
+    app = TossMarketApp(
+        None,
+        tmp_path / "unused.json",
+        connect_live=False,
+        settings_path=settings_path,
+        settings=Settings(),
+        manual_live_orders=True,
+    )
+
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        await app._add_watchlist_symbol("nvda")
+        await pilot.pause()
+        table = app.query_one("#watchlist", DataTable)
+        assert store.load().watchlist == ("NVDA",)
+        assert app.symbol == ""
+        assert table.get_cell_at(Coordinate(0, 0)) == " NVDA"
+
+        await app.action_watch_select()
+        await pilot.pause()
+        assert app.symbol == "NVDA"
+        assert table.get_cell_at(Coordinate(0, 0)) == ">NVDA"
+
+
+async def test_connected_live_picker_loads_watchlist_without_starting_symbol_feed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    SettingsStore(settings_path).save(Settings(watchlist=("AAPL", "NVDA")))
+    calls: list[object] = []
+
+    class FakeCredentials:
+        @staticmethod
+        def load(path: Path) -> object:
+            calls.append(("credentials", path))
+            return object()
+
+    class PickerClient:
+        def __init__(self, _credentials: object) -> None:
+            calls.append("client")
+
+        async def prices(self, symbols: list[str]) -> dict[str, Price]:
+            calls.append(("prices", tuple(symbols)))
+            return {}
+
+        async def snapshot(self, _symbol: str) -> MarketSnapshot:
+            raise AssertionError("snapshot must wait for explicit symbol selection")
+
+        async def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(tui_module, "Credentials", FakeCredentials)
+    monkeypatch.setattr(tui_module, "TossMarketClient", PickerClient)
+    app = TossMarketApp(
+        None,
+        tmp_path / "credentials.json",
+        settings_path=settings_path,
+        manual_live_orders=True,
+    )
+
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        assert app.symbol == ""
+        assert app.watchlist_symbols == ("AAPL", "NVDA")
+        assert app.connection_state == "SELECT"
+        assert app.feed_task is None
+        assert app.candle_sync_task is None
+        assert app.watchlist_task is not None
+        assert ("prices", ("AAPL", "NVDA")) in calls
+
+    assert "close" in calls
+
+
 def test_app_binding_keys_are_unique_and_include_watchlist_add() -> None:
     keys = [binding.key for binding in TossMarketApp.BINDINGS]
     assert len(keys) == len(set(keys))
