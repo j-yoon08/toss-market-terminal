@@ -2,9 +2,17 @@
 
 토스증권 **공식 Open API**로 관심 종목·현재가·호가·체결·캔들 차트를 보여주는 조회 전용 실시간 터미널입니다. 넓은 터미널에서는 관심 종목·호가·차트·체결을 함께 표시하고, 좁은 SSH 터미널에서는 호가·체결 중심의 compact 화면으로 전환합니다.
 
+## v0.8b 주요 기능 (동기 주문 전송 계층 — TUI/CLI 미연결)
+
+- `order_transport` 모듈: `LiveOrderPacket`을 고정 경로 `/api/v1/orders`로 **정확히 한 번** POST하는 동기 `TossOrderTransport`. 재시도 루프가 없으며, 리다이렉트를 따르지 않습니다.
+- 자격증명 모듈을 import하지 않고 OAuth 발급을 하지 않습니다. 호출자가 **미리 발급한** 액세스 토큰과 양의 정수 `account_seq`만 생성자로 받으며, httpx 클라이언트는 기본 생성 또는 주입이 가능하고 주입된 클라이언트는 닫지 않습니다.
+- 전송 전에 페이로드를 엄격히 재검증합니다(수량 기반 필드 집합 정확 일치, LIMIT 한정 `price`, MARKET은 `price` 없음, 금액 필드·추가 필드 거부). 검증 실패는 네트워크 호출 없이 차단됩니다.
+- 400/401/403/404/409/422/429는 브로커 오류 `code`만 정제해 `LiveOrderTransportError`로 변환됩니다. 타임아웃·연결 실패·5xx·리다이렉트·JSON 판독 불가·응답 불일치는 원문 정보 없이 모호 실패 예외로 처리되어 절대 재제출해서는 안 됩니다.
+- 성공 응답은 `orderId`와 일치하는 `clientOrderId`가 있을 때만 `{order_id, client_order_id}`로 정제되며, repr에는 토큰·계좌 값이 노출되지 않습니다.
+
 ## v0.8a 주요 기능 (수동 라이브 실행 PLAN/GATE 코어 — 미연결)
 
-- `live_order` 모듈: 수동 라이브 주문의 **계획·게이트 코어만** 구현한 상태이며, **아직 어떤 라이브 경로(transport 구현)도 연결되어 있지 않습니다.** 실제 주문이 나갈 수 있는 코드 경로는 존재하지 않습니다.
+- `live_order` 모듈: 수동 라이브 주문의 **계획·게이트 코어**입니다. v0.8b에서 별도 transport가 추가됐지만 CLI/TUI와 executor에는 아직 연결되지 않아 앱에서 실제 주문을 시작할 수 없습니다.
 - `create_live_plan`은 유효한 `PAPER_PREVIEW`(주문 엔드포인트 미호출·자동 재시도 없음·수동 승인 전용 플래그)만 승격하며, canonical intent 페이로드의 SHA-256 지문을 재계산해 위조된 미리보기를 거부합니다.
 - 계획은 만료 시간(기본 300초, 타임존 aware UTC 전용, 테스트용 주입 가능 시계)을 가지며 지문·안전 정책·의도 스냅샷에 묶인 불변 객체입니다.
 - 공식 페이로드는 수량 기반 필드만 허용합니다(`clientOrderId`, `symbol`, `side`, `orderType`, `quantity`, `timeInForce=DAY`, LIMIT 한정 `price`, `confirmHighValueOrder=false`). 금액 기반 필드와 알 수 없는 추가 필드는 구조적으로 존재할 수 없습니다. 클라이언트 주문 ID는 지문에서 결정적으로 파생되는 `tmt-` + 32자 hex(36자 이하)로 멱등성을 제공합니다.
@@ -57,8 +65,8 @@
 
 ## 안전 경계
 
-- 호출 가능한 REST 경로는 공개 시장 데이터 5개와 계좌 조회 3개(`/api/v1/accounts`, `/api/v1/holdings`, `/api/v1/buying-power`)로 코드에 고정되어 있으며, 모두 GET 전용입니다.
-- 주문 생성·정정·취소 등 POST를 포함한 모든 변경 요청은 클라이언트 구조상 발생할 수 없습니다.
+- 기본 `TossMarketClient`에서 호출 가능한 REST 경로는 공개 시장 데이터 5개와 계좌 조회 3개(`/api/v1/accounts`, `/api/v1/holdings`, `/api/v1/buying-power`)로 고정되어 있으며, 모두 GET 전용입니다.
+- 별도 `TossOrderTransport`에는 수동 주문 생성을 위한 `POST /api/v1/orders` 하나만 존재합니다. 현재 CLI/TUI에는 연결되지 않았고 정정·취소·조건주문 경로는 없습니다.
 - 계좌 조회는 읽기 전용 스코프(`account_read_only`)로만 동작하며 주문 API는 호출하지 않습니다.
 - 자격증명과 액세스 토큰을 로그·설정·화면에 출력하지 않습니다.
 - 자격증명 파일이 일반 파일, 현재 사용자 소유, 정확히 `0600` 권한일 때만 실행됩니다.

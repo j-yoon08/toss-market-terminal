@@ -230,7 +230,7 @@ def test_packet_fields_are_exact_and_quantity_based():
     assert p["symbol"] == "005930"
     assert p["side"] == "BUY"
     assert p["orderType"] == "LIMIT"
-    assert p["quantity"] == 1
+    assert p["quantity"] == "1"
     assert p["timeInForce"] == "DAY"
     assert p["price"] == "50000"
     assert p["confirmHighValueOrder"] is False
@@ -241,7 +241,7 @@ def test_market_order_payload_has_no_price():
     packet = lo.build_live_packet(make_plan(usd_preview()))
     assert packet.payload["orderType"] == "MARKET"
     assert "price" not in packet.payload or packet.payload.get("price") is None
-    assert packet.payload["quantity"] == 2
+    assert packet.payload["quantity"] == "2"
     assert packet.payload["side"] == "SELL"
 
 

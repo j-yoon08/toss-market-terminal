@@ -283,7 +283,9 @@ def build_live_packet(plan: LiveOrderPlan) -> LiveOrderPacket:
         "symbol": intent.symbol,
         "side": side.value,
         "orderType": order_type.value,
-        "quantity": int(quantity_text) if "." not in quantity_text else float(quantity_text),
+        # Toss OpenAPI OrderCreateQuantityBased.quantity is a decimal string.
+        # Keeping it as text also avoids float precision loss for fractional US sells.
+        "quantity": quantity_text,
         "confirmHighValueOrder": False,
     }
     if order_type is OrderTypeLive.LIMIT:
