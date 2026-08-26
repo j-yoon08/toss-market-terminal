@@ -154,7 +154,7 @@ def _verify_existing_file(path: Path) -> None:
         return
     except OSError:
         raise _fail("AUDIT_FILE_UNAVAILABLE") from None
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise _fail("UNSAFE_AUDIT_FILE")
     if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
         raise _fail("UNSAFE_AUDIT_FILE")
@@ -204,6 +204,7 @@ class LiveAuditLog:
                 not stat.S_ISREG(info.st_mode)
                 or info.st_uid != os.getuid()
                 or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1
             ):
                 raise _fail("UNSAFE_AUDIT_FILE")
             return fd

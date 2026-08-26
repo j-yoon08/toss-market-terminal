@@ -136,6 +136,24 @@ def test_final_symlink_is_rejected_without_touching_target(tmp_path: Path) -> No
     with pytest.raises(LiveAuditLogError) as caught:
         LiveAuditLog(path).append(record())
 
+    assert str(caught.value) == "UNSAFE_AUDIT_FILE"
+    assert target.read_text(encoding="utf-8") == "unchanged"
+    assert str(path) not in str(caught.value)
+
+
+def test_final_hardlink_is_rejected_without_touching_target(tmp_path: Path) -> None:
+    leaf = tmp_path / "state"
+    leaf.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.write_text("unchanged", encoding="utf-8")
+    target.chmod(0o600)
+    path = leaf / "audit.jsonl"
+    os.link(target, path)
+
+    with pytest.raises(LiveAuditLogError) as caught:
+        LiveAuditLog(path).append(record())
+
+    assert str(caught.value) == "UNSAFE_AUDIT_FILE"
     assert target.read_text(encoding="utf-8") == "unchanged"
     assert str(path) not in str(caught.value)
 
