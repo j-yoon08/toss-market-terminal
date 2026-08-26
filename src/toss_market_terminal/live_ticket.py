@@ -10,7 +10,12 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
-from .live_order import LiveOrderPlan, build_live_packet, live_approval_phrase
+from .live_order import (
+    LiveOrderPlan,
+    build_live_packet,
+    live_approval_phrase,
+    live_ui_approval_phrase,
+)
 from .order_preview import canonical_decimal_text
 
 _ISOLATION_KEYS = ("a", "b", "c", "j", "k", "q", "r", "s", "m")
@@ -67,7 +72,8 @@ class LiveApprovalScreen(ModalScreen[str | None]):
         super().__init__()
         self.plan = plan
         self.packet = build_live_packet(plan)
-        self.required_phrase = live_approval_phrase(self.packet)
+        self.executor_phrase = live_approval_phrase(self.packet)
+        self.required_phrase = live_ui_approval_phrase(self.packet)
         self._finished = False
 
     def compose(self) -> ComposeResult:
@@ -89,7 +95,8 @@ class LiveApprovalScreen(ModalScreen[str | None]):
             )
             yield Static(summary, id="live-approval-summary", markup=False)
             yield Static(
-                f"아래 문구를 정확히 입력:\n{self.required_phrase}",
+                f"주문 지문: {self.packet.fingerprint}\n"
+                f"아래 짧은 문구를 정확히 입력:\n{self.required_phrase}",
                 id="live-approval-phrase",
                 markup=False,
             )
@@ -111,8 +118,16 @@ class LiveApprovalScreen(ModalScreen[str | None]):
         event.stop()
         if self._finished:
             return
+        if event.value != self.required_phrase:
+            self.notify(
+                "확인 문구가 일치하지 않습니다. 주문은 전송되지 않았습니다.",
+                title="LIVE ORDER BLOCKED",
+                severity="warning",
+            )
+            event.input.select_all()
+            return
         self._finished = True
-        self.dismiss(event.value)
+        self.dismiss(self.executor_phrase)
 
     def action_noop(self) -> None:
         """Prevent application shortcuts leaking through the modal."""

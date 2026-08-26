@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from decimal import Decimal
 from typing import ClassVar
 
@@ -140,6 +141,12 @@ def test_watch_live_orders_flag_is_explicit_and_default_off() -> None:
     assert parser.parse_args(["watch", "AAPL", "--live-orders"]).live_orders is True
 
 
+def test_live_shortcut_is_an_explicit_subcommand() -> None:
+    args = build_parser().parse_args(["live", "aapl"])
+    assert args.command == "live"
+    assert args.symbol == "aapl"
+
+
 def test_watch_passes_live_orders_only_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[dict[str, object]] = []
 
@@ -155,6 +162,54 @@ def test_watch_passes_live_orders_only_when_requested(monkeypatch: pytest.Monkey
     assert main(["watch", "AAPL", "--live-orders"]) == 0
     assert captured[0]["manual_live_orders"] is False
     assert captured[1]["manual_live_orders"] is True
+
+
+def test_live_shortcut_enables_both_gates_only_for_app_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+    key = "TOSS_ENABLE_MANUAL_LIVE_ORDERS"
+    monkeypatch.setenv(key, "previous")
+
+    class FakeApp:
+        def __init__(self, symbol: str, credentials: object, **kwargs: object) -> None:
+            captured.append({"symbol": symbol, "credentials": credentials, **kwargs})
+
+        def run(self) -> int:
+            assert os.environ[key] == "1"
+            return 0
+
+    monkeypatch.setattr(cli, "TossMarketApp", FakeApp)
+    assert main(["live", "aapl"]) == 0
+    assert captured == [
+        {
+            "symbol": "AAPL",
+            "credentials": cli.DEFAULT_CREDENTIALS_PATH,
+            "settings_path": DEFAULT_SETTINGS_PATH,
+            "manual_live_orders": True,
+        }
+    ]
+    assert os.environ[key] == "previous"
+
+
+def test_live_shortcut_restores_missing_gate_when_app_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "TOSS_ENABLE_MANUAL_LIVE_ORDERS"
+    monkeypatch.delenv(key, raising=False)
+
+    class FailingApp:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def run(self) -> int:
+            assert os.environ[key] == "1"
+            raise RuntimeError("fixture failure")
+
+    monkeypatch.setattr(cli, "TossMarketApp", FailingApp)
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        main(["live", "AAPL"])
+    assert key not in os.environ
 
 
 @pytest.mark.parametrize(

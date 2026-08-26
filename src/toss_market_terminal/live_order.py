@@ -37,6 +37,7 @@ RISK_LIMITS_VERSION = "risk-limits/0.7a"
 MANUAL_LIVE_ENV_KEY = "TOSS_ENABLE_MANUAL_LIVE_ORDERS"
 MANUAL_LIVE_ENV_VALUE = "1"
 DEFAULT_TTL_SECONDS = 300
+UI_APPROVAL_FINGERPRINT_LENGTH = 12
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
@@ -184,6 +185,15 @@ def live_approval_phrase(packet: LiveOrderPacket) -> str:
     return (
         f"CONFIRM LIVE {packet.side.value} {packet.symbol} "
         f"{canonical_decimal_text(packet.quantity)} {packet.fingerprint}"
+    )
+
+
+def live_ui_approval_phrase(packet: LiveOrderPacket) -> str:
+    """Human-sized, order-bound UI challenge; never accepted by the executor itself."""
+    fingerprint = packet.fingerprint[:UI_APPROVAL_FINGERPRINT_LENGTH]
+    return (
+        f"LIVE {packet.side.value} {packet.symbol} "
+        f"{canonical_decimal_text(packet.quantity)} {fingerprint}"
     )
 
 

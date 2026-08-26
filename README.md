@@ -1,11 +1,11 @@
 # Toss Market Terminal
 
-토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 runtime 옵션·환경 게이트·주문별 전체 승인문구를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다.
+토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 `live` 실행·주문별 최종 확인문구·내부 전체 지문 executor 게이트를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다.
 
 ## v0.8.0 주요 기능 (기본 PAPER · 수동 승인 LIVE)
 
-- `toss-market watch SYMBOL`은 항상 PAPER 기본입니다. `--live-orders`와 `TOSS_ENABLE_MANUAL_LIVE_ORDERS=1` 중 하나라도 없으면 주문 POST는 실행되지 않습니다.
-- `b`/`s` 티켓에서 PAPER 미리보기를 먼저 만들고 확인한 뒤, live 옵션에서만 별도 최종 승인 모달이 열립니다. 사용자는 주문별 64자 전체 fingerprint에 묶인 문구를 직접 입력해야 합니다.
+- `toss-market watch SYMBOL`은 항상 PAPER 기본입니다. 실제 주문용 단축 명령은 `toss-market live SYMBOL`이며, 실행 구간에만 runtime/env gate를 함께 활성화합니다. 기존 `watch --live-orders` 경로는 환경 게이트가 별도로 없으면 계속 차단됩니다.
+- `b`/`s` 티켓에서 PAPER 미리보기를 먼저 만들고 확인한 뒤, live 명령에서만 별도 최종 승인 모달이 열립니다. 사용자는 방향·종목·수량·12자 지문 코드가 포함된 짧은 문구를 직접 입력하며, UI는 정확히 일치할 때만 기존 64자 전체 fingerprint executor 문구로 변환합니다.
 - 제출 직전에 계좌·보유수량·매수가능금액을 다시 조회하고 risk gate를 재실행합니다. 이어 `GET /api/v1/orders?status=OPEN`으로 같은 종목·방향의 미체결 주문을 확인하며, 활성 상태 또는 알 수 없는 상태가 있으면 fail-closed로 차단합니다.
 - 안전 점검 뒤 기존 OAuth token을 just-in-time으로 재사용해 별도 동기 transport를 `asyncio.to_thread`에서 실행합니다. POST는 계획당 최대 1회이며 timeout·5xx·응답 불일치 등 모호한 결과 뒤에는 절대 자동 재시도하지 않습니다.
 - 결과는 `접수됨(accepted)`·`거절됨(rejected)`·`결과 불명확(ambiguous)`으로 구분합니다. 접수는 체결을 뜻하지 않으며, 제출 뒤 계좌와 미체결 주문을 read-only로 재조회합니다.
@@ -33,7 +33,7 @@
 - `create_live_plan`은 유효한 `PAPER_PREVIEW`(주문 엔드포인트 미호출·자동 재시도 없음·수동 승인 전용 플래그)만 승격하며, canonical intent 페이로드의 SHA-256 지문을 재계산해 위조된 미리보기를 거부합니다.
 - 계획은 만료 시간(기본 300초, 타임존 aware UTC 전용, 테스트용 주입 가능 시계)을 가지며 지문·안전 정책·의도 스냅샷에 묶인 불변 객체입니다.
 - 공식 페이로드는 수량 기반 필드만 허용합니다(`clientOrderId`, `symbol`, `side`, `orderType`, `quantity`, `timeInForce=DAY`, LIMIT 한정 `price`, `confirmHighValueOrder=false`). 금액 기반 필드와 알 수 없는 추가 필드는 구조적으로 존재할 수 없습니다. 클라이언트 주문 ID는 지문에서 결정적으로 파생되는 `tmt-` + 32자 hex(36자 이하)로 멱등성을 제공합니다.
-- 라이브 승인 문구는 반드시 주문별 64자 전체 지문과 정확히 일치해야 하며, 접두 문구나 부분 지문은 통과하지 않습니다. 자동 복사·자동 승인은 없습니다.
+- executor 라이브 승인 문구는 반드시 주문별 64자 전체 지문과 정확히 일치해야 하며, 접두 문구나 부분 지문은 통과하지 않습니다. 사용자 UI는 주문 방향·종목·수량과 12자 지문 코드가 결합된 문구를 직접 입력받고, 정확히 일치할 때만 전체 executor 문구로 변환합니다. 자동 복사·자동 승인은 없습니다.
 - 실행 게이트는 호출 시점에 전부 평가됩니다: 명시적 동의 3플래그, 정확한 승인 문구, 환경 변수 `TOSS_ENABLE_MANUAL_LIVE_ORDERS=1`(정확히 `1`, 기본값은 차단), 만료되지 않은 계획, 지문 재검증, transport 존재. 하나라도 빠지면 fail-closed로 차단되며 게이트 상태는 저장되지 않습니다.
 - 실행기는 주입된 transport를 **정확히 한 번만** 호출합니다. 재시도 루프·타임아웃 재시도가 없고, 모호한 실패 뒤에는 같은 계획을 다시 제출할 수 없으며(동시 호출도 직렬화되어 already attempted 차단), ACCEPTED는 응답이 비어 있지 않은 `order_id`와 일치하는 `client_order_id`를 담은 엄격한 응답일 때만 반환됩니다(접수 ≠ 체결).
 - 원문 브로커 응답·오류 본문은 예외·결과·감사 레코드 어디에도 보존되지 않고, 감사 레코드는 지문·클라이언트 주문 ID·방향/종목/수량·시각·상태·안전 코드만 담습니다(원문 계좌번호·토큰·승인 문구 필드 자체가 없음).
@@ -83,7 +83,7 @@
 ## 안전 경계
 
 - 기본 `TossMarketClient`는 공개 시장 데이터 5개, 계좌 조회 3개, 미체결 주문 조회 1개(`/api/v1/orders`, GET)만 고정 allowlist로 호출합니다.
-- 별도 `TossOrderTransport`에는 수동 주문 생성을 위한 `POST /api/v1/orders` 하나만 존재합니다. TUI에서 runtime 옵션·환경 변수·전체 승인문구·fresh risk/duplicate 검사·감사로그 preflight를 모두 통과해야만 정확히 한 번 연결되며, 정정·취소·조건주문 경로는 없습니다.
+- 별도 `TossOrderTransport`에는 수동 주문 생성을 위한 `POST /api/v1/orders` 하나만 존재합니다. TUI에서 명시적 live 실행·주문결합 UI 확인문구·내부 전체 승인문구·fresh risk/duplicate 검사·감사로그 preflight를 모두 통과해야만 정확히 한 번 연결되며, 정정·취소·조건주문 경로는 없습니다.
 - 계좌 조회는 읽기 전용 스코프(`account_read_only`)로만 동작하며 주문 API는 호출하지 않습니다.
 - 자격증명과 액세스 토큰을 로그·설정·화면에 출력하지 않습니다.
 - 자격증명 파일이 일반 파일, 현재 사용자 소유, 정확히 `0600` 권한일 때만 실행됩니다.
@@ -185,13 +185,19 @@ uv run toss-market watch AAPL
 uv run toss-market watch 005930
 ```
 
-위 명령은 PAPER 기본입니다. 수동 LIVE 승인 화면까지 활성화하려면 해당 실행에만 두 개의 명시적 gate를 함께 지정합니다.
+위 명령은 PAPER 기본입니다. 수동 LIVE 승인 화면은 전용 단축 명령으로 실행합니다.
 
 ```bash
-TOSS_ENABLE_MANUAL_LIVE_ORDERS=1 uv run toss-market watch AAPL --live-orders
+uv run toss-market live AAPL
 ```
 
-이 상태에서도 주문은 자동 전송되지 않습니다. `b`/`s` PAPER 티켓과 확인 단계를 완료한 다음, 별도 LIVE 모달에 표시되는 주문별 전체 승인문구를 직접 입력해야 합니다. `Esc` 취소, 문구 불일치, 계획 만료, 잔고 변화, 미체결 중복, 감사로그 preflight 실패는 모두 POST 0회로 차단됩니다.
+`toss-market`을 user tool로 설치한 환경에서는 더 짧게 실행할 수 있습니다.
+
+```bash
+toss-market live AAPL
+```
+
+전용 `live` 명령은 실행 중에만 내부 runtime/env gate를 함께 켜고 종료 시 원래 환경으로 복원합니다. 이 상태에서도 주문은 자동 전송되지 않습니다. `b`/`s` PAPER 티켓과 확인 단계를 완료한 다음, 별도 LIVE 모달에 표시되는 `LIVE 방향 종목 수량 12자코드` 형식의 주문별 짧은 문구를 직접 입력해야 합니다. 화면에는 검증용 전체 64자 주문 지문도 계속 표시되며, UI가 정확한 짧은 문구만 기존 전체 지문 executor 승인문구로 변환합니다. executor 자체는 짧은 문구를 승인하지 않습니다. `Esc` 취소, 문구 불일치, 계획 만료, 잔고 변화, 미체결 중복, 감사로그 preflight 실패는 모두 POST 0회로 차단됩니다.
 
 연결 검증:
 

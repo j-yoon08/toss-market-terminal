@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from dataclasses import asdict
 from decimal import Decimal
@@ -12,6 +13,7 @@ from rich.console import Console
 
 from .client import TossApiError, TossMarketClient
 from .config import DEFAULT_CREDENTIALS_PATH, CredentialError, Credentials
+from .live_order import MANUAL_LIVE_ENV_KEY, MANUAL_LIVE_ENV_VALUE
 from .models import AccountContext
 from .render import snapshot_renderable
 from .settings import (
@@ -238,6 +240,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="수동 LIVE 승인 화면 활성화(환경 게이트와 정확한 승인문구도 필요)",
     )
 
+    live = subparsers.add_parser(
+        "live",
+        help="수동 LIVE TUI 단축 실행(주문마다 별도 최종 승인 필요)",
+    )
+    live.add_argument("symbol")
+
     probe = subparsers.add_parser("probe", help="REST + WebSocket 조회 전용 연결 검증")
     probe.add_argument("symbol")
     probe.add_argument("--seconds", type=float, default=8.0)
@@ -287,15 +295,26 @@ def main(argv: list[str] | None = None) -> int:
             if not 1 <= args.seconds <= 60:
                 raise ValueError("probe 시간은 1~60초여야 합니다.")
             return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
-        if args.command == "watch":
+        if args.command in {"watch", "live"}:
             symbol = normalize_symbol(args.symbol)
-            result = TossMarketApp(
-                symbol,
-                args.credentials,
-                settings_path=settings_file(),
-                manual_live_orders=args.live_orders,
-            ).run()
-            return result or 0
+            live_shortcut = args.command == "live"
+            previous_gate = os.environ.get(MANUAL_LIVE_ENV_KEY)
+            if live_shortcut:
+                os.environ[MANUAL_LIVE_ENV_KEY] = MANUAL_LIVE_ENV_VALUE
+            try:
+                result = TossMarketApp(
+                    symbol,
+                    args.credentials,
+                    settings_path=settings_file(),
+                    manual_live_orders=live_shortcut or getattr(args, "live_orders", False),
+                ).run()
+                return result or 0
+            finally:
+                if live_shortcut:
+                    if previous_gate is None:
+                        os.environ.pop(MANUAL_LIVE_ENV_KEY, None)
+                    else:
+                        os.environ[MANUAL_LIVE_ENV_KEY] = previous_gate
         if args.command == "watchlist":
             if args.watchlist_command == "list":
                 return run_watchlist_list(settings_file())
