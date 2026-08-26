@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from rich.cells import cell_len
 from textual.coordinate import Coordinate
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, Input, Static
 
 from tests.helpers import sample_snapshot
 from toss_market_terminal import tui as tui_module
@@ -19,7 +19,7 @@ from toss_market_terminal.render import (
     nearest_support_resistance,
 )
 from toss_market_terminal.render import chart_indicator_base as real_chart_indicator_base
-from toss_market_terminal.settings import AlertRule, Settings
+from toss_market_terminal.settings import AlertRule, Settings, SettingsStore
 from toss_market_terminal.stream import OrderbookEvent, StreamStatus, TradeEvent
 from toss_market_terminal.tui import TossMarketApp
 
@@ -298,6 +298,79 @@ async def test_watchlist_navigation_uses_cursor_and_selects_row(tmp_path: Path) 
         await app.action_watch_select()
         assert app.symbol == "005930"
         assert app.market == "kr"
+
+
+def test_app_binding_keys_are_unique_and_include_watchlist_add() -> None:
+    keys = [binding[0] for binding in TossMarketApp.BINDINGS]
+    assert len(keys) == len(set(keys))
+    assert "a" in keys
+
+
+async def test_watchlist_add_binding_persists_and_updates_running_table(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    initial = Settings(watchlist=("AAPL",))
+    store.save(initial)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings_path=settings_path,
+        settings=initial,
+    )
+
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        symbol_input = app.screen.query_one("#watchlist-add-input", Input)
+        symbol_input.value = "nvda"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert store.load().watchlist == ("AAPL", "NVDA")
+        assert app.settings.watchlist == ("AAPL", "NVDA")
+        assert app.watchlist_symbols == ("AAPL", "NVDA")
+        table = app.query_one("#watchlist", DataTable)
+        assert table.row_count == 2
+        assert table.cursor_row == 1
+
+        # Re-adding is idempotent and does not duplicate the persisted row.
+        await pilot.press("a")
+        await pilot.pause()
+        app.screen.query_one("#watchlist-add-input", Input).value = "AAPL"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert store.load().watchlist == ("AAPL", "NVDA")
+        assert table.row_count == 2
+
+
+async def test_watchlist_add_rejects_invalid_symbol_without_writing(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    initial = Settings(watchlist=("AAPL",))
+    store.save(initial)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings_path=settings_path,
+        settings=initial,
+    )
+
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        app.screen.query_one("#watchlist-add-input", Input).value = "bad symbol!"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert store.load().watchlist == ("AAPL",)
+        assert app.watchlist_symbols == ("AAPL",)
+        assert app.query_one("#watchlist", DataTable).row_count == 1
 
 
 def _snapshot_for(symbol: str, price: str, *, market: str, currency: str) -> MarketSnapshot:

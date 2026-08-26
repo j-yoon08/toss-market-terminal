@@ -14,7 +14,8 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Footer, Static
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Input, Static
 
 from .alerts import AlertEvaluator, AlertEvent
 from .client import TossApiError, TossMarketClient
@@ -48,7 +49,7 @@ from .render import (
     volume_bar,
     vwap_distance_percent,
 )
-from .settings import Settings, SettingsStore
+from .settings import Settings, SettingsError, SettingsStore, with_watchlist_symbol
 from .stream import (
     OrderbookEvent,
     StreamStatus,
@@ -89,6 +90,54 @@ class WatchlistRow:
     active_alerts: int
 
 
+class WatchlistAddScreen(ModalScreen[str | None]):
+    BINDINGS: ClassVar = [("escape", "cancel", "취소")]
+    CSS = """
+    WatchlistAddScreen {
+        align: center middle;
+        background: rgba(4, 7, 10, 0.75);
+    }
+    #watchlist-add-dialog {
+        width: 52;
+        height: 9;
+        padding: 1 2;
+        border: solid #607080;
+        background: #0d131a;
+    }
+    #watchlist-add-title {
+        height: 2;
+        color: #d9e1e8;
+        text-style: bold;
+    }
+    #watchlist-add-help {
+        height: 2;
+        color: #7d8998;
+    }
+    #watchlist-add-input {
+        width: 1fr;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="watchlist-add-dialog"):
+            yield Static("관심 종목 추가", id="watchlist-add-title", markup=False)
+            yield Input(placeholder="AAPL 또는 005930", id="watchlist-add-input")
+            yield Static("Enter 저장 · Esc 취소", id="watchlist-add-help", markup=False)
+
+    def on_mount(self) -> None:
+        self.query_one("#watchlist-add-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if not value:
+            event.input.placeholder = "심볼을 입력하세요"
+            return
+        self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class TossMarketApp(App[int]):
     TITLE = "Toss Market Terminal"
     SUB_TITLE = "READ ONLY"
@@ -101,6 +150,7 @@ class TossMarketApp(App[int]):
         ("4", "chart_1h", "1시간봉"),
         ("5", "daily", "일봉"),
         ("c", "toggle_focus", "차트 포커스"),
+        ("a", "add_watchlist", "관심종목 추가"),
         ("up", "watch_up", "위 항목"),
         ("down", "watch_down", "아래 항목"),
         ("j", "watch_down", "아래 항목(j)"),
@@ -232,12 +282,7 @@ class TossMarketApp(App[int]):
         self.candle_sync_task: asyncio.Task[None] | None = None
         self.chart_render_task: asyncio.Task[None] | None = None
         # In-memory only: `watch SYMBOL` never persists the launch symbol.
-        configured = list(dict.fromkeys(self.settings.watchlist))
-        if self.symbol not in configured:
-            if len(configured) >= 12:
-                configured = configured[:11]
-            configured.append(self.symbol)
-        self.watchlist_symbols = tuple(configured)
+        self.watchlist_symbols = self._watchlist_with_active(self.settings.watchlist)
         self.watchlist_rows: dict[str, WatchlistRow] = {}
         self.watchlist_stale = False
         self.alert_evaluator = AlertEvaluator()
@@ -336,6 +381,82 @@ class TossMarketApp(App[int]):
     async def action_refresh(self) -> None:
         await self._refresh_snapshot()
 
+    def action_add_watchlist(self) -> None:
+        self.push_screen(WatchlistAddScreen(), self._add_watchlist_symbol)
+
+    async def _add_watchlist_symbol(self, raw_symbol: str | None) -> None:
+        if raw_symbol is None:
+            return
+        if self.settings_path is None:
+            self.notify(
+                "설정 경로가 없어 관심 종목을 저장할 수 없습니다.",
+                title="WATCHLIST",
+                severity="warning",
+            )
+            return
+        try:
+            normalized = normalize_symbol(raw_symbol)
+        except ValueError:
+            self.notify(
+                "심볼 형식이 올바르지 않습니다.",
+                title="WATCHLIST",
+                severity="warning",
+            )
+            return
+
+        if self.client is not None:
+            try:
+                stock = await self.client.stock(normalized)
+            except TossApiError as exc:
+                message = (
+                    f"종목을 찾을 수 없습니다: {normalized}"
+                    if exc.status_code == 404
+                    else "공식 API에서 종목을 확인하지 못했습니다."
+                )
+                self.notify(message, title="WATCHLIST", severity="warning")
+                return
+            except Exception:
+                self.notify(
+                    "공식 API에서 종목을 확인하지 못했습니다.",
+                    title="WATCHLIST",
+                    severity="warning",
+                )
+                return
+            if stock.symbol != normalized:
+                self.notify(
+                    "공식 API의 종목 응답이 일치하지 않습니다.",
+                    title="WATCHLIST",
+                    severity="warning",
+                )
+                return
+
+        try:
+            store = SettingsStore(self.settings_path)
+            current = store.load()
+            updated, created = with_watchlist_symbol(current, normalized)
+            if created:
+                store.save(updated)
+        except SettingsError as exc:
+            self.notify(str(exc)[:120], title="WATCHLIST", severity="warning")
+            return
+        except OSError:
+            self.notify(
+                "관심 종목 설정을 안전하게 저장하지 못했습니다.",
+                title="WATCHLIST",
+                severity="error",
+            )
+            return
+
+        self.settings = updated
+        self.watchlist_symbols = self._watchlist_with_active(updated.watchlist)
+        self._render_watchlist()
+        if self.client is not None:
+            await self._refresh_watchlist_prices()
+        if normalized in self.watchlist_symbols:
+            self._move_cursor(self.watchlist_symbols.index(normalized))
+        message = f"추가됨: {normalized}" if created else f"이미 등록됨: {normalized}"
+        self.notify(message, title="WATCHLIST", severity="information")
+
     def _set_chart_mode(self, mode: str) -> None:
         self.chart_mode = mode
         self._render_chart()
@@ -382,15 +503,18 @@ class TossMarketApp(App[int]):
             return
         try:
             persisted = SettingsStore(self.settings_path).load()
-            merged = list(persisted.watchlist)
-            if self.symbol not in merged:
-                if len(merged) >= 12:
-                    merged = merged[:11]
-                merged.append(self.symbol)
-            self.watchlist_symbols = tuple(merged)
+            self.watchlist_symbols = self._watchlist_with_active(persisted.watchlist)
             self.settings = persisted
         except Exception:
             self.watchlist_stale = True
+
+    def _watchlist_with_active(self, persisted: tuple[str, ...]) -> tuple[str, ...]:
+        configured = list(dict.fromkeys(persisted))
+        if self.symbol not in configured:
+            if len(configured) >= 12:
+                configured = configured[:11]
+            configured.append(self.symbol)
+        return tuple(configured)
 
     async def _run_watchlist_polling(self) -> None:
         while True:
