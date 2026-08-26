@@ -16,6 +16,7 @@ from .models import (
     Candle,
     HoldingsOverview,
     MarketSnapshot,
+    OpenOrdersPage,
     Orderbook,
     Price,
     StockInfo,
@@ -46,6 +47,10 @@ ACCOUNT_READ_ONLY_PATHS = frozenset(
 )
 # v0.6 restriction: only these currencies are accepted for buying-power lookups.
 ACCOUNT_CURRENCY_CODES = frozenset({"KRW", "USD"})
+# v0.8c: a separate, single-path allowlist for the read-only open-orders GET.
+# Kept apart from ACCOUNT_READ_ONLY_PATHS deliberately: order data is more
+# sensitive than accounts/holdings/buying-power and gets its own narrow gate.
+OPEN_ORDERS_READ_ONLY_PATHS = frozenset({"/api/v1/orders"})
 
 
 class TossApiError(RuntimeError):
@@ -193,6 +198,29 @@ class TossMarketClient:
             raise TossApiError(response.status_code, "invalid-account-data-response") from exc
         if not isinstance(result, (dict, list)):
             raise TossApiError(response.status_code, "invalid-account-data-response")
+        return result
+
+    async def _open_orders_get(self, path: str, params: dict[str, Any], *, account_seq: int) -> Any:
+        """GET the open-orders endpoint with the X-Tossinvest-Account header.
+
+        Gated by its own single-path allowlist (``OPEN_ORDERS_READ_ONLY_PATHS``),
+        separate from both the market-data and the account-context allowlists.
+        This method never issues a POST and never retries.
+        """
+        if path not in OPEN_ORDERS_READ_ONLY_PATHS:
+            raise ValueError(f"허용되지 않은 API 경로: {path}")
+        token = await self.access_token()
+        headers = {"Authorization": f"Bearer {token}", "X-Tossinvest-Account": str(account_seq)}
+        response = await self._http.get(path, params=params, headers=headers)
+        if response.status_code != 200:
+            raise self._sanitized_error(response)
+        try:
+            body = response.json()
+            result = body["result"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TossApiError(response.status_code, "invalid-open-orders-response") from exc
+        if not isinstance(result, dict):
+            raise TossApiError(response.status_code, "invalid-open-orders-response")
         return result
 
     @staticmethod
@@ -378,3 +406,17 @@ class TossMarketClient:
             buying_power=power,
         )
         return context
+
+    # ------------------------------------------------------------------
+    # v0.8c read-only open orders.
+    # ------------------------------------------------------------------
+
+    async def open_orders(self, account_seq: int, symbol: str | None = None) -> OpenOrdersPage:
+        # Validate before any token or network activity.
+        normalized_symbol = normalize_symbol(symbol) if symbol is not None else None
+        seq = as_account_seq(account_seq)
+        params: dict[str, Any] = {"status": "OPEN"}
+        if normalized_symbol is not None:
+            params["symbol"] = normalized_symbol
+        result = await self._open_orders_get("/api/v1/orders", params, account_seq=seq)
+        return OpenOrdersPage.from_api(result)

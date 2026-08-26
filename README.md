@@ -2,6 +2,13 @@
 
 토스증권 **공식 Open API**로 관심 종목·현재가·호가·체결·캔들 차트를 보여주는 조회 전용 실시간 터미널입니다. 넓은 터미널에서는 관심 종목·호가·차트·체결을 함께 표시하고, 좁은 SSH 터미널에서는 호가·체결 중심의 compact 화면으로 전환합니다.
 
+## v0.8c 주요 기능 (읽기 전용 미체결 주문 조회 — TUI/CLI 미연결)
+
+- `TossMarketClient.open_orders(account_seq, symbol=None)`: 계좌·(선택) 심볼별 `status=OPEN` 미체결 주문을 조회하는 GET 전용 메서드. 고정 경로 `/api/v1/orders` 하나만 허용하는 별도 allowlist(`OPEN_ORDERS_READ_ONLY_PATHS`)로 게이트되며, 계좌·시세 조회 allowlist와는 분리되어 있습니다.
+- 응답은 `nextCursor=null`, `hasNext=false`(완전히 채워진 단일 페이지)일 때만 유효한 `OpenOrdersPage`로 파싱되고, 그렇지 않으면 오류로 실패합니다.
+- `find_open_order_duplicates(orders, symbol, side)`: 같은 심볼·같은 방향의 기존 미체결 주문을 찾는 순수 조회 함수. 공식 `OrderStatus` 중 명확히 종료된 상태(`FILLED`/`CANCELED`/`REJECTED`/`REPLACED`/`CANCEL_REJECTED`/`REPLACE_REJECTED`)만 제외하고, 활성 상태나 이 클라이언트가 모르는 상태 문자열은 모두 잠재적 중복으로 fail-closed 취급합니다.
+- 이번 버전은 조회와 중복 탐지 로직만 추가하며, TUI/CLI에는 아직 연결되지 않았습니다. 실제 주문은 실행되지 않았습니다.
+
 ## v0.8b 주요 기능 (동기 주문 전송 계층 — TUI/CLI 미연결)
 
 - `order_transport` 모듈: `LiveOrderPacket`을 고정 경로 `/api/v1/orders`로 **정확히 한 번** POST하는 동기 `TossOrderTransport`. 재시도 루프가 없으며, 리다이렉트를 따르지 않습니다.

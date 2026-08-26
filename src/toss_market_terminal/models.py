@@ -517,3 +517,97 @@ class AccountContext:
     holding: HoldingsItem | None
     holding_quantity: Decimal
     buying_power: BuyingPower
+
+
+# ---------------------------------------------------------------------------
+# v0.8c read-only open orders + duplicate detection.
+#
+# Kept deliberately minimal: only what duplicate detection and basic order
+# identification need. ``status``/``orderType`` are preserved verbatim (the
+# official schema explicitly requires clients to tolerate unknown enum
+# values there); ``side`` is the one genuinely closed enum on this schema,
+# so it is validated strictly since duplicate polarity depends on it.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class OpenOrder:
+    order_id: str
+    symbol: str
+    side: str
+    order_type: str
+    status: str
+    quantity: Decimal
+    price: Decimal | None
+
+    @classmethod
+    def from_api(cls, raw: Any) -> OpenOrder:
+        body = _require_dict(raw, "order")
+        for key in ("orderId", "symbol", "side", "orderType", "status", "quantity"):
+            if key not in body:
+                raise DataShapeError(f"order.{key} 값이 누락되었습니다.")
+        side = body["side"]
+        if side not in ("BUY", "SELL"):
+            raise DataShapeError("order.side 값은 BUY 또는 SELL이어야 합니다.")
+        return cls(
+            order_id=_require_str(body["orderId"], "order.orderId"),
+            symbol=_require_str(body["symbol"], "order.symbol"),
+            side=side,
+            order_type=_require_str(body["orderType"], "order.orderType"),
+            status=_require_str(body["status"], "order.status"),
+            quantity=as_decimal(body["quantity"], "order.quantity"),
+            price=_require_decimal_or_none(body.get("price"), "order.price"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OpenOrdersPage:
+    """A fully-materialized OPEN-status page: no cursor, nothing left to fetch."""
+
+    orders: tuple[OpenOrder, ...]
+
+    @classmethod
+    def from_api(cls, raw: Any) -> OpenOrdersPage:
+        body = _require_dict(raw, "orders.page")
+        for key in ("orders", "nextCursor", "hasNext"):
+            if key not in body:
+                raise DataShapeError(f"orders.page.{key} 값이 누락되었습니다.")
+        orders_raw = body["orders"]
+        if not isinstance(orders_raw, list):
+            raise DataShapeError("orders.page.orders 값은 배열이어야 합니다.")
+        if body["nextCursor"] is not None:
+            raise DataShapeError("OPEN 조회 응답의 nextCursor는 null이어야 합니다.")
+        has_next = body["hasNext"]
+        if not isinstance(has_next, bool) or has_next:
+            raise DataShapeError("OPEN 조회 응답의 hasNext는 false여야 합니다.")
+        return cls(orders=tuple(OpenOrder.from_api(item) for item in orders_raw))
+
+
+# Official OrderStatus values that unambiguously mean an order is no longer
+# open. Everything else -- PENDING/PARTIAL_FILLED/PENDING_CANCEL/
+# PENDING_REPLACE, or any status string this client has never seen -- fails
+# closed as a possible duplicate instead of being silently excluded.
+TERMINAL_OPEN_ORDER_STATUSES = frozenset(
+    {"FILLED", "CANCELED", "REJECTED", "REPLACED", "CANCEL_REJECTED", "REPLACE_REJECTED"}
+)
+
+
+def find_open_order_duplicates(
+    orders: tuple[OpenOrder, ...], symbol: str, side: str
+) -> tuple[OpenOrder, ...]:
+    """Pure lookup for existing open orders that could collide with a new one.
+
+    Matches on normalized symbol and exact side. A status is excluded only
+    when it is a definitely-terminal official status; every active or
+    unrecognized status is kept as a possible duplicate (fail closed).
+    """
+    normalized_symbol = normalize_symbol(symbol)
+    if side not in ("BUY", "SELL"):
+        raise ValueError("side는 BUY 또는 SELL이어야 합니다.")
+    return tuple(
+        order
+        for order in orders
+        if order.symbol.strip().upper() == normalized_symbol
+        and order.side == side
+        and order.status not in TERMINAL_OPEN_ORDER_STATUSES
+    )
