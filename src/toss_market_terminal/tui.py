@@ -165,11 +165,13 @@ def _submit_live_plan_once(
 ) -> tuple[
     LiveOrderAccepted | LiveOrderRejected | LiveOrderAmbiguous,
     tuple[LiveAuditRecord, ...],
+    bool,
 ]:
     """Run the synchronous one-shot executor off the Textual event loop."""
 
     transport = transport_factory(access_token, account_seq)
     executor = ManualLiveOrderExecutor(transport)
+    close_failed = False
     try:
         outcome = executor.execute(
             LiveExecutionRequest(
@@ -188,8 +190,8 @@ def _submit_live_plan_once(
             except Exception:
                 # Closing happens after the one-shot mutation result is known.
                 # It must never overwrite accepted/rejected/ambiguous evidence.
-                pass
-    return outcome, executor.audit_records()
+                close_failed = True
+    return outcome, executor.audit_records(), close_failed
 
 
 class WatchlistAddScreen(ModalScreen[str | None]):
@@ -826,7 +828,7 @@ class TossMarketApp(App[int]):
             # Reserve before crossing the mutation boundary. Any later uncertainty is no-retry.
             self._live_attempted_fingerprints.add(plan.preview_fingerprint)
             try:
-                outcome, audit_records = await asyncio.to_thread(
+                outcome, audit_records, close_failed = await asyncio.to_thread(
                     _submit_live_plan_once,
                     plan,
                     approval_phrase,
@@ -849,6 +851,13 @@ class TossMarketApp(App[int]):
                 except LiveAuditLogError:
                     audit_failed = True
             self.last_live_outcome = outcome
+
+            if close_failed:
+                self.notify(
+                    "주문 결과는 보존됐지만 전송 연결 정리에 실패했습니다.",
+                    title="TRANSPORT CLOSE",
+                    severity="warning",
+                )
 
             if isinstance(outcome, LiveOrderAccepted):
                 self.notify(

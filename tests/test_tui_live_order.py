@@ -194,6 +194,8 @@ async def test_close_failure_cannot_override_accepted_result_or_audit(
     assert transport.close_count == 1
     assert app.last_live_outcome is not None
     assert app.last_live_outcome.status == "accepted"
+    messages = [notification.message for notification in app._notifications]
+    assert any("전송 연결 정리" in message for message in messages)
     audit_text = (tmp_path / "audit-state" / "audit.jsonl").read_text(encoding="utf-8")
     assert '"status":"accepted"' in audit_text
     assert "close provider secret" not in audit_text
