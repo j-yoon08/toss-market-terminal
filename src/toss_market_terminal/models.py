@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -210,6 +210,37 @@ def _require_decimal_or_none(value: Any, field: str) -> Decimal | None:
     if not isinstance(value, str) or len(value) > MAX_DECIMAL_TEXT_LENGTH:
         raise DataShapeError(f"{field} 값이 decimal 문자열이 아닙니다.")
     return as_decimal(value, field)
+
+
+def _require_aware_datetime(value: Any, field: str) -> datetime:
+    text = _require_str(value, field)
+    if len(text) > 64 or text != text.strip():
+        raise DataShapeError(f"{field} 값은 유효한 ISO 8601 시각이어야 합니다.")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DataShapeError(f"{field} 값은 유효한 ISO 8601 시각이어야 합니다.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DataShapeError(f"{field} 값에는 시간대가 포함되어야 합니다.")
+    return parsed
+
+
+def _require_aware_datetime_or_none(value: Any, field: str) -> datetime | None:
+    if value is None:
+        return None
+    return _require_aware_datetime(value, field)
+
+
+def _require_date_or_none(value: Any, field: str) -> date | None:
+    if value is None:
+        return None
+    text = _require_str(value, field)
+    if len(text) != 10 or text != text.strip():
+        raise DataShapeError(f"{field} 값은 YYYY-MM-DD 형식이어야 합니다.")
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise DataShapeError(f"{field} 값은 YYYY-MM-DD 형식이어야 합니다.") from exc
 
 
 def as_account_seq(value: Any, field: str = "accountSeq") -> int:
@@ -595,6 +626,187 @@ class OpenOrdersPage:
         if not isinstance(has_next, bool) or has_next:
             raise DataShapeError("OPEN 조회 응답의 hasNext는 false여야 합니다.")
         return cls(orders=tuple(OpenOrder.from_api(item) for item in orders_raw))
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeRate:
+    """Privacy-safe USD/KRW reference rate returned by the official API."""
+
+    base_currency: str
+    quote_currency: str
+    rate: Decimal
+    mid_rate: Decimal
+    basis_point: Decimal
+    rate_change_type: str
+    valid_from: datetime
+    valid_until: datetime
+
+    @classmethod
+    def from_api(cls, raw: Any) -> ExchangeRate:
+        body = _require_dict(raw, "exchangeRate")
+        for key in (
+            "baseCurrency",
+            "quoteCurrency",
+            "rate",
+            "midRate",
+            "basisPoint",
+            "rateChangeType",
+            "validFrom",
+            "validUntil",
+        ):
+            if key not in body:
+                raise DataShapeError(f"exchangeRate.{key} 값이 누락되었습니다.")
+        base = _require_str(body["baseCurrency"], "exchangeRate.baseCurrency")
+        quote = _require_str(body["quoteCurrency"], "exchangeRate.quoteCurrency")
+        if (base, quote) != ("USD", "KRW"):
+            raise DataShapeError("USD/KRW 환율 응답만 지원합니다.")
+        rate = as_decimal(body["rate"], "exchangeRate.rate")
+        mid_rate = as_decimal(body["midRate"], "exchangeRate.midRate")
+        if rate <= 0 or mid_rate <= 0:
+            raise DataShapeError("exchangeRate 환율은 양수여야 합니다.")
+        change_type = _require_str(body["rateChangeType"], "exchangeRate.rateChangeType")
+        if change_type not in {"UP", "EQUAL", "DOWN"}:
+            raise DataShapeError("exchangeRate.rateChangeType 값이 올바르지 않습니다.")
+        valid_from = _require_aware_datetime(body["validFrom"], "exchangeRate.validFrom")
+        valid_until = _require_aware_datetime(body["validUntil"], "exchangeRate.validUntil")
+        if valid_until <= valid_from:
+            raise DataShapeError("exchangeRate 유효 종료 시각은 시작 시각보다 늦어야 합니다.")
+        return cls(
+            base_currency=base,
+            quote_currency=quote,
+            rate=rate,
+            mid_rate=mid_rate,
+            basis_point=as_decimal(body["basisPoint"], "exchangeRate.basisPoint"),
+            rate_change_type=change_type,
+            valid_from=valid_from,
+            valid_until=valid_until,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedOrder:
+    """Recent closed-order display record that intentionally omits broker order IDs."""
+
+    symbol: str
+    side: str
+    order_type: str
+    status: str
+    currency: str
+    quantity: Decimal
+    price: Decimal | None
+    ordered_at: datetime
+    filled_quantity: Decimal
+    average_filled_price: Decimal | None
+    filled_amount: Decimal | None
+    commission: Decimal | None
+    tax: Decimal | None
+    filled_at: datetime | None
+    settlement_date: date | None
+
+    @classmethod
+    def from_api(cls, raw: Any) -> ClosedOrder:
+        body = _require_dict(raw, "closedOrder")
+        for key in (
+            "orderId",
+            "symbol",
+            "side",
+            "orderType",
+            "status",
+            "currency",
+            "quantity",
+            "price",
+            "orderedAt",
+            "execution",
+        ):
+            if key not in body:
+                raise DataShapeError(f"closedOrder.{key} 값이 누락되었습니다.")
+        # Validate the official shape, then deliberately discard this value:
+        # broker order IDs must not survive into the display model.
+        _require_str(body["orderId"], "closedOrder.orderId")
+        side = body["side"]
+        if side not in ("BUY", "SELL"):
+            raise DataShapeError("closedOrder.side 값은 BUY 또는 SELL이어야 합니다.")
+        currency = _require_str(body["currency"], "closedOrder.currency")
+        if currency not in {"KRW", "USD"}:
+            raise DataShapeError("closedOrder.currency는 KRW 또는 USD여야 합니다.")
+        quantity = as_decimal(body["quantity"], "closedOrder.quantity")
+        if quantity <= 0:
+            raise DataShapeError("closedOrder.quantity는 양수여야 합니다.")
+        execution = _require_dict(body["execution"], "closedOrder.execution")
+        required_execution = (
+            "filledQuantity",
+            "averageFilledPrice",
+            "filledAmount",
+            "commission",
+            "tax",
+            "filledAt",
+            "settlementDate",
+        )
+        for key in required_execution:
+            if key not in execution:
+                raise DataShapeError(f"closedOrder.execution.{key} 값이 누락되었습니다.")
+        filled = as_decimal(execution["filledQuantity"], "closedOrder.execution.filledQuantity")
+        if filled < 0 or filled > quantity:
+            raise DataShapeError("closedOrder.execution.filledQuantity 값이 올바르지 않습니다.")
+        return cls(
+            symbol=normalize_symbol(_require_str(body["symbol"], "closedOrder.symbol")),
+            side=side,
+            order_type=_require_str(body["orderType"], "closedOrder.orderType"),
+            status=_require_str(body["status"], "closedOrder.status"),
+            currency=currency,
+            quantity=quantity,
+            price=_require_decimal_or_none(body.get("price"), "closedOrder.price"),
+            ordered_at=_require_aware_datetime(body["orderedAt"], "closedOrder.orderedAt"),
+            filled_quantity=filled,
+            average_filled_price=_require_decimal_or_none(
+                execution["averageFilledPrice"], "closedOrder.execution.averageFilledPrice"
+            ),
+            filled_amount=_require_decimal_or_none(
+                execution["filledAmount"], "closedOrder.execution.filledAmount"
+            ),
+            commission=_require_decimal_or_none(
+                execution["commission"], "closedOrder.execution.commission"
+            ),
+            tax=_require_decimal_or_none(execution["tax"], "closedOrder.execution.tax"),
+            filled_at=_require_aware_datetime_or_none(
+                execution["filledAt"], "closedOrder.execution.filledAt"
+            ),
+            settlement_date=_require_date_or_none(
+                execution["settlementDate"], "closedOrder.execution.settlementDate"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedOrdersPage:
+    """Bounded first page of CLOSED orders; pagination cursor is never retained."""
+
+    orders: tuple[ClosedOrder, ...]
+    has_more: bool
+
+    @classmethod
+    def from_api(cls, raw: Any) -> ClosedOrdersPage:
+        body = _require_dict(raw, "closedOrders.page")
+        for key in ("orders", "nextCursor", "hasNext"):
+            if key not in body:
+                raise DataShapeError(f"closedOrders.page.{key} 값이 누락되었습니다.")
+        orders_raw = body["orders"]
+        if not isinstance(orders_raw, list):
+            raise DataShapeError("closedOrders.page.orders 값은 배열이어야 합니다.")
+        if len(orders_raw) > 20:
+            raise DataShapeError("종료 주문 응답은 최대 20건이어야 합니다.")
+        has_next = body["hasNext"]
+        if not isinstance(has_next, bool):
+            raise DataShapeError("closedOrders.page.hasNext 값은 boolean이어야 합니다.")
+        cursor = body["nextCursor"]
+        if has_next:
+            _require_str(cursor, "closedOrders.page.nextCursor")
+        elif cursor is not None:
+            raise DataShapeError("종료 주문 마지막 페이지의 nextCursor는 null이어야 합니다.")
+        return cls(
+            orders=tuple(ClosedOrder.from_api(item) for item in orders_raw),
+            has_more=has_next,
+        )
 
 
 # Official OrderStatus values that unambiguously mean an order is no longer

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +15,8 @@ from .models import (
     AccountContext,
     BuyingPower,
     Candle,
+    ClosedOrdersPage,
+    ExchangeRate,
     HoldingsOverview,
     MarketSnapshot,
     OpenOrdersPage,
@@ -38,6 +40,9 @@ READ_ONLY_PATHS = frozenset(
         "/api/v1/candles",
     }
 )
+# Phase-2: reference FX is public GET data but deliberately isolated from the
+# unchanged market snapshot allowlist above.
+EXCHANGE_RATE_READ_ONLY_PATHS = frozenset({"/api/v1/exchange-rate"})
 # v0.6: read-only account-context GET endpoints. Account-scoped paths require
 # the X-Tossinvest-Account header with a positive integer account_seq.
 ACCOUNT_READ_ONLY_PATHS = frozenset(
@@ -168,6 +173,21 @@ class TossMarketClient:
             return body["result"]
         except (KeyError, TypeError, ValueError) as exc:
             raise TossApiError(response.status_code, "invalid-market-data-response") from exc
+
+    async def _exchange_rate_get(self, path: str, params: dict[str, Any]) -> Any:
+        if path not in EXCHANGE_RATE_READ_ONLY_PATHS:
+            raise ValueError(f"허용되지 않은 API 경로: {path}")
+        response = await self._request_json("GET", path, params=params)
+        if response.status_code != 200:
+            raise self._sanitized_error(response)
+        try:
+            body = response.json()
+            result = body["result"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TossApiError(response.status_code, "invalid-exchange-rate-response") from exc
+        if not isinstance(result, dict):
+            raise TossApiError(response.status_code, "invalid-exchange-rate-response")
+        return result
 
     async def _account_get(
         self,
@@ -308,6 +328,13 @@ class TossMarketClient:
             raise TossApiError(200, "invalid-candles-response")
         return tuple(Candle.from_api(item) for item in result["candles"])
 
+    async def exchange_rate(self) -> ExchangeRate:
+        result = await self._exchange_rate_get(
+            "/api/v1/exchange-rate",
+            {"baseCurrency": "USD", "quoteCurrency": "KRW"},
+        )
+        return ExchangeRate.from_api(result)
+
     async def snapshot(self, symbol: str) -> MarketSnapshot:
         stock, price, orderbook, trades = await asyncio.gather(
             self.stock(symbol),
@@ -422,6 +449,41 @@ class TossMarketClient:
             params["symbol"] = normalized_symbol
         result = await self._open_orders_get("/api/v1/orders", params, account_seq=seq)
         return OpenOrdersPage.from_api(result)
+
+    async def closed_orders(
+        self,
+        account_seq: int,
+        *,
+        start_date: date,
+        end_date: date,
+        limit: int = 20,
+    ) -> ClosedOrdersPage:
+        """Fetch one bounded first page of CLOSED orders for a KST date range."""
+        seq = as_account_seq(account_seq)
+        if (
+            not isinstance(start_date, date)
+            or isinstance(start_date, datetime)
+            or not isinstance(end_date, date)
+            or isinstance(end_date, datetime)
+        ):
+            raise ValueError("종료 주문 조회 기간은 date 값이어야 합니다.")
+        if start_date > end_date:
+            raise ValueError("종료 주문 조회 시작일은 종료일보다 늦을 수 없습니다.")
+        if (end_date - start_date).days > 30:
+            raise ValueError("종료 주문 조회 기간은 최대 31일(inclusive)입니다.")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+            raise ValueError("종료 주문 조회 건수는 1~20이어야 합니다.")
+        result = await self._open_orders_get(
+            "/api/v1/orders",
+            {
+                "status": "CLOSED",
+                "from": start_date.isoformat(),
+                "to": end_date.isoformat(),
+                "limit": limit,
+            },
+            account_seq=seq,
+        )
+        return ClosedOrdersPage.from_api(result)
 
     # ------------------------------------------------------------------
     # Phase-1 portfolio snapshot: one read-only fan-out over accounts,

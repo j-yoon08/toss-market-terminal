@@ -6,7 +6,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import ClassVar, Literal
@@ -45,7 +45,9 @@ from .live_ticket import LiveApprovalScreen
 from .models import (
     AccountContext,
     Candle,
+    ClosedOrdersPage,
     DataShapeError,
+    ExchangeRate,
     MarketSnapshot,
     OpenOrdersPage,
     Orderbook,
@@ -106,10 +108,14 @@ WATCHLIST_REFRESH_SECONDS = 15.0
 CANDLE_RESYNC_SECONDS = 30.0
 CHART_RENDER_INTERVAL_SECONDS = 0.25
 PORTFOLIO_REFRESH_SECONDS = 30.0
+EXCHANGE_RATE_REFRESH_SECONDS = 60.0
+ORDER_HISTORY_REFRESH_SECONDS = 300.0
 COMPACT_WIDTH_THRESHOLD = 117
 LiveCandleStatus = Literal["updated", "late", "unavailable"]
 LiveTransportFactory = Callable[[str, int], LiveOrderTransport]
 PortfolioLoader = Callable[[], Awaitable[PortfolioSnapshot]]
+ExchangeRateLoader = Callable[[], Awaitable[ExchangeRate]]
+ClosedOrdersLoader = Callable[[], Awaitable[ClosedOrdersPage]]
 
 
 @dataclass
@@ -458,6 +464,8 @@ class TossMarketApp(App[int]):
         candle_resync_seconds: float = CANDLE_RESYNC_SECONDS,
         chart_render_interval_seconds: float = CHART_RENDER_INTERVAL_SECONDS,
         portfolio_refresh_seconds: float = PORTFOLIO_REFRESH_SECONDS,
+        exchange_rate_refresh_seconds: float = EXCHANGE_RATE_REFRESH_SECONDS,
+        order_history_refresh_seconds: float = ORDER_HISTORY_REFRESH_SECONDS,
         manual_live_orders: bool = False,
         live_audit_log: LiveAuditLog | None = None,
         live_transport_factory: LiveTransportFactory | None = None,
@@ -480,6 +488,12 @@ class TossMarketApp(App[int]):
         if portfolio_refresh_seconds <= 0:
             raise ValueError("포트폴리오 재동기화 주기는 양수여야 합니다.")
         self.portfolio_refresh_seconds = portfolio_refresh_seconds
+        if exchange_rate_refresh_seconds <= 0:
+            raise ValueError("환율 재동기화 주기는 양수여야 합니다.")
+        if order_history_refresh_seconds <= 0:
+            raise ValueError("주문내역 재동기화 주기는 양수여야 합니다.")
+        self.exchange_rate_refresh_seconds = exchange_rate_refresh_seconds
+        self.order_history_refresh_seconds = order_history_refresh_seconds
         if candle_resync_seconds <= 0:
             raise ValueError("캔들 재동기화 주기는 양수여야 합니다.")
         if chart_render_interval_seconds < 0:
@@ -559,6 +573,22 @@ class TossMarketApp(App[int]):
         self._portfolio_screen: PortfolioScreen | None = None
         # 테스트 주입 지점(connect_live=False에서도 포트폴리오 새로고침을 검증할 수 있다).
         self.portfolio_loader: PortfolioLoader | None = None
+        # Phase-2 insights are isolated from both the market stream and the
+        # 30-second account snapshot. Each keeps its own last-good value.
+        self.exchange_rate_task: asyncio.Task[None] | None = None
+        self.order_history_task: asyncio.Task[None] | None = None
+        self.exchange_rate_refresh_lock = asyncio.Lock()
+        self.order_history_refresh_lock = asyncio.Lock()
+        self.exchange_rate: ExchangeRate | None = None
+        self.exchange_rate_stale = False
+        self.exchange_rate_error: str | None = None
+        self.exchange_rate_synced_monotonic: float | None = None
+        self.closed_orders: ClosedOrdersPage | None = None
+        self.order_history_stale = False
+        self.order_history_error: str | None = None
+        self.order_history_synced_monotonic: float | None = None
+        self.exchange_rate_loader: ExchangeRateLoader | None = None
+        self.closed_orders_loader: ClosedOrdersLoader | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="topbar", markup=False)
@@ -628,11 +658,20 @@ class TossMarketApp(App[int]):
         Real ``connect_live`` runs always start it -- portfolio has its own
         account scope and must never depend on a symbol being selected.
         """
-        if self.portfolio_task is not None:
+        if self.portfolio_task is None and (self.connect_live or self.portfolio_loader is not None):
+            self.portfolio_task = asyncio.create_task(self._run_portfolio_polling())
+        if self.exchange_rate_task is None and (
+            self.client is not None or self.exchange_rate_loader is not None
+        ):
+            self.exchange_rate_task = asyncio.create_task(self._run_exchange_rate_polling())
+        self._maybe_start_order_history_polling()
+
+    def _maybe_start_order_history_polling(self) -> None:
+        if self.order_history_task is not None or self.portfolio_snapshot is None:
             return
-        if not (self.connect_live or self.portfolio_loader is not None):
+        if self.client is None and self.closed_orders_loader is None:
             return
-        self.portfolio_task = asyncio.create_task(self._run_portfolio_polling())
+        self.order_history_task = asyncio.create_task(self._run_order_history_polling())
 
     def _show_symbol_picker(self) -> None:
         """Render a neutral start state until the operator selects a watchlist row."""
@@ -652,6 +691,8 @@ class TossMarketApp(App[int]):
             self.watchlist_task,
             self.feed_task,
             self.portfolio_task,
+            self.exchange_rate_task,
+            self.order_history_task,
         ):
             if task:
                 task.cancel()
@@ -690,8 +731,7 @@ class TossMarketApp(App[int]):
         screen = PortfolioScreen()
         self._portfolio_screen = screen
         self.push_screen(screen, self._on_portfolio_closed)
-        if self.portfolio_snapshot is None:
-            self.run_worker(self._refresh_portfolio(), exclusive=False)
+        self._maybe_start_portfolio_polling()
 
     def _on_portfolio_closed(self, _result: None) -> None:
         self._portfolio_screen = None
@@ -721,6 +761,7 @@ class TossMarketApp(App[int]):
             self.portfolio_stale = False
             self.portfolio_error = None
             self.portfolio_synced_monotonic = time.monotonic()
+            self._maybe_start_order_history_polling()
             if self._portfolio_screen is not None:
                 self._portfolio_screen.refresh_view()
             return True
@@ -735,6 +776,99 @@ class TossMarketApp(App[int]):
             except Exception:
                 self.portfolio_stale = True
             await asyncio.sleep(self.portfolio_refresh_seconds)
+
+    async def _load_exchange_rate(self) -> ExchangeRate:
+        if self.exchange_rate_loader is not None:
+            return await self.exchange_rate_loader()
+        if self.client is None:
+            raise RuntimeError("client-unavailable")
+        return await self.client.exchange_rate()
+
+    async def _refresh_exchange_rate(self) -> bool:
+        if self.exchange_rate_refresh_lock.locked():
+            return False
+        async with self.exchange_rate_refresh_lock:
+            try:
+                exchange_rate = await self._load_exchange_rate()
+            except Exception as exc:
+                self.exchange_rate_stale = True
+                self.exchange_rate_error = safe_status_error(exc)
+                if self._portfolio_screen is not None:
+                    self._portfolio_screen.refresh_view()
+                return False
+            self.exchange_rate = exchange_rate
+            self.exchange_rate_stale = False
+            self.exchange_rate_error = None
+            self.exchange_rate_synced_monotonic = time.monotonic()
+            if self._portfolio_screen is not None:
+                self._portfolio_screen.refresh_view()
+            return True
+
+    async def _run_exchange_rate_polling(self) -> None:
+        while True:
+            try:
+                await self._refresh_exchange_rate()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.exchange_rate_stale = True
+            await asyncio.sleep(self.exchange_rate_refresh_seconds)
+
+    async def _load_closed_orders(self) -> ClosedOrdersPage:
+        if self.closed_orders_loader is not None:
+            return await self.closed_orders_loader()
+        if self.client is None or self.portfolio_snapshot is None:
+            raise RuntimeError("portfolio-unavailable")
+        end_date = datetime.now(KST).date()
+        start_date = end_date - timedelta(days=29)
+        return await self.client.closed_orders(
+            self.portfolio_snapshot.account.account_seq,
+            start_date=start_date,
+            end_date=end_date,
+            limit=20,
+        )
+
+    async def _refresh_order_history(self) -> bool:
+        if self.order_history_refresh_lock.locked():
+            return False
+        async with self.order_history_refresh_lock:
+            try:
+                page = await self._load_closed_orders()
+            except Exception as exc:
+                self.order_history_stale = True
+                self.order_history_error = safe_status_error(exc)
+                if self._portfolio_screen is not None:
+                    self._portfolio_screen.refresh_view()
+                return False
+            self.closed_orders = page
+            self.order_history_stale = False
+            self.order_history_error = None
+            self.order_history_synced_monotonic = time.monotonic()
+            if self._portfolio_screen is not None:
+                self._portfolio_screen.refresh_view()
+            return True
+
+    async def _run_order_history_polling(self) -> None:
+        while True:
+            try:
+                await self._refresh_order_history()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.order_history_stale = True
+            await asyncio.sleep(self.order_history_refresh_seconds)
+
+    async def _refresh_portfolio_details(self) -> None:
+        await self._refresh_portfolio()
+        refreshers: list[Awaitable[bool]] = []
+        if self.client is not None or self.exchange_rate_loader is not None:
+            refreshers.append(self._refresh_exchange_rate())
+        if self.portfolio_snapshot is not None and (
+            self.client is not None or self.closed_orders_loader is not None
+        ):
+            refreshers.append(self._refresh_order_history())
+        if refreshers:
+            await asyncio.gather(*refreshers)
 
     def action_paper_buy_preview(self) -> None:
         self.run_worker(self._open_paper_ticket(OrderSide.BUY), exclusive=False)
