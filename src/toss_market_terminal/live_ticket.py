@@ -8,17 +8,18 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Input, Static
+from textual.timer import Timer
+from textual.widgets import Static
 
 from .live_order import (
     LiveOrderPlan,
     build_live_packet,
     live_approval_phrase,
-    live_ui_approval_phrase,
 )
 from .order_preview import canonical_decimal_text
 
 _ISOLATION_KEYS = ("a", "b", "c", "j", "k", "q", "r", "s", "m")
+REVIEW_ARM_SECONDS = 0.75
 
 
 def _isolation_bindings() -> tuple[Binding, ...]:
@@ -26,9 +27,10 @@ def _isolation_bindings() -> tuple[Binding, ...]:
 
 
 class LiveApprovalScreen(ModalScreen[str | None]):
-    """Require exact per-plan phrase entry immediately before live submission."""
+    """Require a fresh Enter after a bounded order-review pause."""
 
     BINDINGS: ClassVar = (
+        Binding("enter", "submit", "주문 접수 요청"),
         Binding("escape", "cancel", "취소"),
         *_isolation_bindings(),
     )
@@ -56,12 +58,11 @@ class LiveApprovalScreen(ModalScreen[str | None]):
         height: auto;
         color: #d9e1e8;
     }
-    #live-approval-phrase {
+    #live-approval-details {
         height: auto;
         margin-top: 1;
         color: #f0ad4e;
     }
-    #live-approval-input { width: 1fr; }
     #live-approval-help {
         height: auto;
         color: #7d8998;
@@ -73,8 +74,9 @@ class LiveApprovalScreen(ModalScreen[str | None]):
         self.plan = plan
         self.packet = build_live_packet(plan)
         self.executor_phrase = live_approval_phrase(self.packet)
-        self.required_phrase = live_ui_approval_phrase(self.packet)
         self._finished = False
+        self._armed = False
+        self._arm_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         intent = self.plan.intent
@@ -96,37 +98,42 @@ class LiveApprovalScreen(ModalScreen[str | None]):
             yield Static(summary, id="live-approval-summary", markup=False)
             yield Static(
                 f"주문 지문: {self.packet.fingerprint}\n"
-                f"아래 짧은 문구를 정확히 입력:\n{self.required_phrase}",
-                id="live-approval-phrase",
+                "방향·종목·수량·가격·계좌를 모두 확인하세요.",
+                id="live-approval-details",
                 markup=False,
             )
-            yield Input(
-                placeholder="전체 승인 문구 입력",
-                id="live-approval-input",
-                max_length=180,
-            )
             yield Static(
-                "Enter 제출 요청 · Esc 취소 · 결과 불명확 시 절대 재시도하지 않음",
+                "확인 잠금 중 · 잠시 후 Enter 주문 접수 요청 · Esc 취소",
                 id="live-approval-help",
                 markup=False,
             )
 
     def on_mount(self) -> None:
-        self.query_one("#live-approval-input", Input).focus()
+        self._arm_timer = self.set_timer(REVIEW_ARM_SECONDS, self._arm_after_review)
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        event.stop()
+    def _arm_after_review(self) -> None:
         if self._finished:
             return
-        if event.value != self.required_phrase:
+        self._armed = True
+        self.query_one("#live-approval-help", Static).update(
+            "Enter 실제 주문 접수 요청(체결 아님) · Esc 취소"
+        )
+
+    def action_submit(self) -> None:
+        if self._finished:
+            return
+        if not self._armed:
+            if self._arm_timer is not None:
+                self._arm_timer.reset()
             self.notify(
-                "확인 문구가 일치하지 않습니다. 주문은 전송되지 않았습니다.",
-                title="LIVE ORDER BLOCKED",
+                "연속 입력을 차단했습니다. 주문 정보를 확인한 뒤 Enter를 다시 누르세요.",
+                title="LIVE ORDER REVIEW",
                 severity="warning",
             )
-            event.input.select_all()
             return
         self._finished = True
+        if self._arm_timer is not None:
+            self._arm_timer.stop()
         self.dismiss(self.executor_phrase)
 
     def action_noop(self) -> None:
@@ -134,6 +141,8 @@ class LiveApprovalScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self._finished = True
+        if self._arm_timer is not None:
+            self._arm_timer.stop()
         self.dismiss(None)
 
 

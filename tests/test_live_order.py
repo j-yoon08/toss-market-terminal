@@ -305,18 +305,6 @@ def test_phrase_binds_to_packet_not_arbitrary_string():
     assert lo.live_approval_phrase(packet) != lo.live_approval_phrase(other)
 
 
-def test_live_ui_approval_phrase_is_short_but_still_order_bound():
-    packet = lo.build_live_packet(make_plan())
-    phrase = lo.live_ui_approval_phrase(packet)
-    assert phrase == f"LIVE BUY 005930 1 {packet.fingerprint[:12]}"
-    assert packet.fingerprint not in phrase
-
-    other = lo.build_live_packet(
-        make_plan(usd_preview(side=op.OrderSide.SELL, quantity="2")),
-    )
-    assert phrase != lo.live_ui_approval_phrase(other)
-
-
 # ---------------------------------------------------------------------------
 # 실행 게이트(호출 시점 평가, 전부 필요)
 # ---------------------------------------------------------------------------
@@ -327,20 +315,6 @@ def _gate_env(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
         monkeypatch.delenv(ENV_KEY, raising=False)
     else:
         monkeypatch.setenv(ENV_KEY, value)
-
-
-def test_executor_never_accepts_short_ui_phrase(monkeypatch):
-    _gate_env(monkeypatch, "1")
-    plan = make_plan()
-    packet = lo.build_live_packet(plan)
-    transport = RecordingTransport(response=ok_response(packet))
-    outcome = lo.ManualLiveOrderExecutor(transport).execute(
-        make_request(plan),
-        approval_phrase=lo.live_ui_approval_phrase(packet),
-        now=utc(1),
-    )
-    assert isinstance(outcome, lo.LiveOrderRejected)
-    assert transport.calls == []
 
 
 def test_all_gates_pass_submits_exactly_once(monkeypatch):

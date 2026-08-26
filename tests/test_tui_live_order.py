@@ -23,7 +23,7 @@ from toss_market_terminal.live_order import (
     create_live_plan,
     live_approval_phrase,
 )
-from toss_market_terminal.live_ticket import LiveApprovalScreen
+from toss_market_terminal.live_ticket import REVIEW_ARM_SECONDS, LiveApprovalScreen
 from toss_market_terminal.models import BuyingPower, OpenOrder, OpenOrdersPage
 from toss_market_terminal.order_preview import OrderSide, OrderType, build_preview
 from toss_market_terminal.tui import TossMarketApp
@@ -421,7 +421,7 @@ async def test_same_fingerprint_never_retries_after_first_attempt(
     assert "ambiguous" in text
 
 
-async def test_live_mode_opens_compact_exact_phrase_modal_after_paper_confirm(
+async def test_live_mode_opens_compact_enter_confirm_modal_after_paper_confirm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -435,17 +435,17 @@ async def test_live_mode_opens_compact_exact_phrase_modal_after_paper_confirm(
         assert type(app.screen).__name__ == "LiveApprovalScreen"
         region = app.screen.query_one("#live-approval-dialog").region
         assert 0 < region.width <= 90 and 0 < region.height <= 30
-        shown = app.screen.query_one("#live-approval-phrase", Static).render().plain
-        assert app.screen.required_phrase in shown
+        shown = app.screen.query_one("#live-approval-details", Static).render().plain
         assert app.screen.packet.fingerprint in shown
         assert len(app.screen.packet.fingerprint) == 64
+        assert len(app.screen.query(Input)) == 0
         await pilot.press("escape")
         await pilot.pause()
 
     assert transport.packets == []
 
 
-async def test_short_ui_phrase_translates_to_full_executor_phrase(
+async def test_enter_confirmation_requires_armed_screen_then_uses_full_executor_phrase(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -458,36 +458,48 @@ async def test_short_ui_phrase_translates_to_full_executor_phrase(
         screen = LiveApprovalScreen(current_plan)
         app.push_screen(screen, results.append)
         await pilot.pause()
-        approval_input = screen.query_one("#live-approval-input", Input)
-        approval_input.value = screen.required_phrase
+
+        # An Enter carried over/repeated from the PAPER screen cannot submit.
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.screen is screen
+        assert results == []
+        assert screen._armed is False
+
+        # Once the review cooldown completes, one fresh Enter submits.
+        screen._arm_after_review()
         await pilot.press("enter")
         await pilot.pause()
 
     assert results == [live_approval_phrase(build_live_packet(current_plan))]
 
 
-async def test_wrong_short_ui_phrase_stays_blocked_in_modal(
+async def test_repeated_early_enter_stays_blocked_until_review_cooldown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
     app = make_live_app(tmp_path, RecordingTransport())
+    current_plan = plan()
     results: list[str | None] = []
 
     async with app.run_test(size=(90, 30)) as pilot:
-        screen = LiveApprovalScreen(plan())
+        screen = LiveApprovalScreen(current_plan)
         app.push_screen(screen, results.append)
-        await pilot.pause()
-        screen.query_one("#live-approval-input", Input).value = "LIVE WRONG"
+        await pilot.pause(REVIEW_ARM_SECONDS / 2)
         await pilot.press("enter")
-        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause(REVIEW_ARM_SECONDS / 2 + 0.05)
         assert app.screen is screen
         assert results == []
         assert screen._finished is False
-        await pilot.press("escape")
+        assert screen._armed is False
+        await pilot.pause(REVIEW_ARM_SECONDS + 0.25)
+        assert screen._armed is True
+        await pilot.press("enter")
         await pilot.pause()
 
-    assert results == [None]
+    assert results == [live_approval_phrase(build_live_packet(current_plan))]
 
 
 async def test_live_runtime_flag_with_env_off_never_opens_approval_modal(

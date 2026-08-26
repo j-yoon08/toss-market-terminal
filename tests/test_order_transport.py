@@ -596,7 +596,7 @@ def test_executor_accepted_via_real_transport(monkeypatch: pytest.MonkeyPatch) -
     executor, plan = _executor_setup(recorder)
     request, phrase = _gated_request(plan)
 
-    outcome = executor.execute(request, phrase)
+    outcome = executor.execute(request, phrase, now=FROZEN_NOW)
 
     assert isinstance(outcome, lo.LiveOrderAccepted)
     assert outcome.order_id == "ORD-777"
@@ -617,7 +617,7 @@ def test_executor_rejected_via_broker_status(monkeypatch: pytest.MonkeyPatch) ->
     executor, plan = _executor_setup(recorder)
     request, phrase = _gated_request(plan)
 
-    outcome = executor.execute(request, phrase)
+    outcome = executor.execute(request, phrase, now=FROZEN_NOW)
 
     assert isinstance(outcome, lo.LiveOrderRejected)
     assert outcome.reason_codes == ("TRANSPORT_SUBMIT_ERROR",)
@@ -640,14 +640,14 @@ def test_executor_ambiguous_never_retries(monkeypatch: pytest.MonkeyPatch) -> No
     executor, plan = _executor_setup(recorder)
     request, phrase = _gated_request(plan)
 
-    first = executor.execute(request, phrase)
+    first = executor.execute(request, phrase, now=FROZEN_NOW)
     assert isinstance(first, lo.LiveOrderAmbiguous)
     assert first.safe_code == "AMBIGUOUS_TRANSPORT_ERROR"
     assert len(recorder.calls) == 1
 
     # 같은 계획 재실행: 성공 응답으로 바꿔 놓아도 already attempted로 차단(재시도 금지).
     state["mode"] = "ok"
-    second = executor.execute(request, phrase)
+    second = executor.execute(request, phrase, now=FROZEN_NOW)
     assert isinstance(second, lo.LiveOrderRejected)
     assert second.status == "blocked"
     assert second.reason_codes == ("ALREADY_ATTEMPTED",)
