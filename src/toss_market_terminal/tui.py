@@ -107,6 +107,29 @@ LiveCandleStatus = Literal["updated", "late", "unavailable"]
 LiveTransportFactory = Callable[[str, int], LiveOrderTransport]
 
 
+@dataclass
+class _CancellationState:
+    requested: bool = False
+
+
+async def _to_thread_uninterruptibly[**P, R](
+    state: _CancellationState,
+    function: Callable[P, R],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> R:
+    """Finish a mutation/audit thread even when Textual cancels its worker."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # asyncio cannot stop an already-running thread. Record the quit
+            # request and keep ownership until the result/audit is durable.
+            state.requested = True
+
+
 def safe_status_error(exc: Exception) -> str:
     if isinstance(exc, (TossApiError, DataShapeError)):
         return str(exc)[:120]
@@ -827,8 +850,10 @@ class TossMarketApp(App[int]):
 
             # Reserve before crossing the mutation boundary. Any later uncertainty is no-retry.
             self._live_attempted_fingerprints.add(plan.preview_fingerprint)
+            cancellation = _CancellationState()
             try:
-                outcome, audit_records, close_failed = await asyncio.to_thread(
+                outcome, audit_records, close_failed = await _to_thread_uninterruptibly(
+                    cancellation,
                     _submit_live_plan_once,
                     plan,
                     approval_phrase,
@@ -847,7 +872,9 @@ class TossMarketApp(App[int]):
             audit_failed = False
             for record in audit_records:
                 try:
-                    await asyncio.to_thread(self.live_audit_log.append, record)
+                    await _to_thread_uninterruptibly(
+                        cancellation, self.live_audit_log.append, record
+                    )
                 except LiveAuditLogError:
                     audit_failed = True
             self.last_live_outcome = outcome
@@ -883,6 +910,12 @@ class TossMarketApp(App[int]):
                     title="AUDIT FAILURE",
                     severity="error",
                 )
+
+            if cancellation.requested:
+                # The broker outcome and every available audit record are now
+                # durable. Honour Textual's original quit/cancel request before
+                # starting optional read-only reconciliation.
+                raise asyncio.CancelledError
 
             # Read-only reconciliation only; never reinterpret acceptance as a fill.
             try:

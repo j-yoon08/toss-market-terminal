@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
+import threading
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -87,6 +89,32 @@ class RecordingTransport:
         self.close_count += 1
         if self.close_failure:
             raise RuntimeError("close provider secret")
+
+
+class BlockingTransport(RecordingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_started = threading.Event()
+        self.submit_release = threading.Event()
+
+    def submit(self, packet: LiveOrderPacket) -> Mapping[str, object]:
+        self.submit_started.set()
+        if not self.submit_release.wait(timeout=5):
+            raise TimeoutError("blocked test transport timed out")
+        return super().submit(packet)
+
+
+class BlockingAuditLog(LiveAuditLog):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.append_started = threading.Event()
+        self.append_release = threading.Event()
+
+    def append(self, record) -> None:
+        self.append_started.set()
+        if not self.append_release.wait(timeout=5):
+            raise RuntimeError("blocked test audit timed out")
+        super().append(record)
 
 
 def make_live_app(tmp_path: Path, transport: RecordingTransport) -> TossMarketApp:
@@ -199,6 +227,62 @@ async def test_close_failure_cannot_override_accepted_result_or_audit(
     audit_text = (tmp_path / "audit-state" / "audit.jsonl").read_text(encoding="utf-8")
     assert '"status":"accepted"' in audit_text
     assert "close provider secret" not in audit_text
+
+
+async def test_cancellation_during_submit_waits_for_and_audits_broker_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
+    transport = BlockingTransport()
+    app = make_live_app(tmp_path, transport)
+    current_plan = plan()
+
+    async with app.run_test(size=(90, 30)):
+        task = asyncio.create_task(
+            app._submit_live_plan(
+                current_plan, live_approval_phrase(build_live_packet(current_plan))
+            )
+        )
+        assert await asyncio.to_thread(transport.submit_started.wait, 2)
+        task.cancel()
+        transport.submit_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(transport.packets) == 1
+    assert app.last_live_outcome is not None
+    assert app.last_live_outcome.status == "accepted"
+    audit_text = (tmp_path / "audit-state" / "audit.jsonl").read_text(encoding="utf-8")
+    assert '"status":"accepted"' in audit_text
+
+
+async def test_cancellation_during_audit_append_finishes_durable_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
+    transport = RecordingTransport()
+    app = make_live_app(tmp_path, transport)
+    audit_path = tmp_path / "blocking-audit" / "audit.jsonl"
+    blocking_audit = BlockingAuditLog(audit_path)
+    app.live_audit_log = blocking_audit
+    current_plan = plan()
+
+    async with app.run_test(size=(90, 30)):
+        task = asyncio.create_task(
+            app._submit_live_plan(
+                current_plan, live_approval_phrase(build_live_packet(current_plan))
+            )
+        )
+        assert await asyncio.to_thread(blocking_audit.append_started.wait, 2)
+        task.cancel()
+        blocking_audit.append_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(transport.packets) == 1
+    assert app.last_live_outcome is not None
+    assert app.last_live_outcome.status == "accepted"
+    assert '"status":"accepted"' in audit_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("gate", ["wrong-phrase", "env-off", "runtime-off"])
