@@ -115,6 +115,13 @@ def test_exchange_rate_rejects_untrusted_shapes(overrides: dict[str, object]) ->
         ExchangeRate.from_api(official_exchange_rate(**overrides))
 
 
+def test_exchange_rate_and_closed_order_reject_exponent_decimals() -> None:
+    with pytest.raises(ValueError):
+        ExchangeRate.from_api(official_exchange_rate(midRate="1e1000000"))
+    with pytest.raises(ValueError):
+        ClosedOrder.from_api(official_closed_order(quantity="1e999999"))
+
+
 def test_closed_order_parses_execution_but_never_retains_order_id() -> None:
     order = ClosedOrder.from_api(official_closed_order())
     assert order.symbol == "AAPL"

@@ -584,9 +584,11 @@ class TossMarketApp(App[int]):
         self.exchange_rate_error: str | None = None
         self.exchange_rate_synced_monotonic: float | None = None
         self.closed_orders: ClosedOrdersPage | None = None
+        self.order_history_account_seq: int | None = None
         self.order_history_stale = False
         self.order_history_error: str | None = None
         self.order_history_synced_monotonic: float | None = None
+        self.order_history_wakeup = asyncio.Event()
         self.exchange_rate_loader: ExchangeRateLoader | None = None
         self.closed_orders_loader: ClosedOrdersLoader | None = None
 
@@ -757,7 +759,23 @@ class TossMarketApp(App[int]):
                 if self._portfolio_screen is not None:
                     self._portfolio_screen.refresh_view()
                 return False
+            previous_account_seq = (
+                self.portfolio_snapshot.account.account_seq
+                if self.portfolio_snapshot is not None
+                else None
+            )
             self.portfolio_snapshot = snapshot
+            if (
+                previous_account_seq is not None
+                and previous_account_seq != snapshot.account.account_seq
+            ):
+                # Never render account A's last-good history beneath account B.
+                self.closed_orders = None
+                self.order_history_account_seq = None
+                self.order_history_stale = False
+                self.order_history_error = None
+                self.order_history_synced_monotonic = None
+                self.order_history_wakeup.set()
             self.portfolio_stale = False
             self.portfolio_error = None
             self.portfolio_synced_monotonic = time.monotonic()
@@ -814,15 +832,18 @@ class TossMarketApp(App[int]):
                 self.exchange_rate_stale = True
             await asyncio.sleep(self.exchange_rate_refresh_seconds)
 
-    async def _load_closed_orders(self) -> ClosedOrdersPage:
+    async def _load_closed_orders(self, account_seq: int | None = None) -> ClosedOrdersPage:
         if self.closed_orders_loader is not None:
             return await self.closed_orders_loader()
         if self.client is None or self.portfolio_snapshot is None:
             raise RuntimeError("portfolio-unavailable")
+        requested_account_seq = (
+            self.portfolio_snapshot.account.account_seq if account_seq is None else account_seq
+        )
         end_date = datetime.now(KST).date()
         start_date = end_date - timedelta(days=29)
         return await self.client.closed_orders(
-            self.portfolio_snapshot.account.account_seq,
+            requested_account_seq,
             start_date=start_date,
             end_date=end_date,
             limit=20,
@@ -832,15 +853,28 @@ class TossMarketApp(App[int]):
         if self.order_history_refresh_lock.locked():
             return False
         async with self.order_history_refresh_lock:
+            snapshot = self.portfolio_snapshot
+            if snapshot is None:
+                return False
+            requested_account_seq = snapshot.account.account_seq
             try:
-                page = await self._load_closed_orders()
+                page = await self._load_closed_orders(requested_account_seq)
             except Exception as exc:
+                current = self.portfolio_snapshot
+                if current is None or current.account.account_seq != requested_account_seq:
+                    self.order_history_wakeup.set()
+                    return False
                 self.order_history_stale = True
                 self.order_history_error = safe_status_error(exc)
                 if self._portfolio_screen is not None:
                     self._portfolio_screen.refresh_view()
                 return False
+            current = self.portfolio_snapshot
+            if current is None or current.account.account_seq != requested_account_seq:
+                self.order_history_wakeup.set()
+                return False
             self.closed_orders = page
+            self.order_history_account_seq = requested_account_seq
             self.order_history_stale = False
             self.order_history_error = None
             self.order_history_synced_monotonic = time.monotonic()
@@ -856,7 +890,14 @@ class TossMarketApp(App[int]):
                 raise
             except Exception:
                 self.order_history_stale = True
-            await asyncio.sleep(self.order_history_refresh_seconds)
+            try:
+                await asyncio.wait_for(
+                    self.order_history_wakeup.wait(),
+                    timeout=self.order_history_refresh_seconds,
+                )
+            except TimeoutError:
+                pass
+            self.order_history_wakeup.clear()
 
     async def _refresh_portfolio_details(self) -> None:
         await self._refresh_portfolio()

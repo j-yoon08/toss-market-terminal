@@ -470,6 +470,7 @@ class PortfolioScreen(ModalScreen[None]):
             )
 
     def on_mount(self) -> None:
+        self.set_interval(1.0, self.refresh_view)
         self.call_after_refresh(self.refresh_view)
 
     def on_resize(self, event: events.Resize) -> None:

@@ -38,19 +38,23 @@ class DataShapeError(ValueError):
     """The provider returned an unsupported public market-data shape."""
 
 
-# Official decimal fields are strings with maxLength 30; anything beyond that
-# is not a supported shape. The bound also guarantees Decimal parsing can never
-# produce astronomically large exponents (finite but unrepresentable digits).
+# Official decimal fields are plain decimal strings with maxLength 30. Reject
+# exponent notation even when short (for example ``1e1000000``), otherwise a
+# tiny response can trigger Decimal overflow or million-character rendering.
 MAX_DECIMAL_TEXT_LENGTH = 30
+DECIMAL_TEXT_PATTERN = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$")
 
 
 def as_decimal(value: Any, field: str) -> Decimal:
     if not isinstance(value, (str, int)):
         raise DataShapeError(f"{field} 값이 decimal 문자열이 아닙니다.")
-    if len(str(value)) > MAX_DECIMAL_TEXT_LENGTH:
+    text = str(value)
+    if len(text) > MAX_DECIMAL_TEXT_LENGTH:
         raise DataShapeError(f"{field} 값의 자릿수가 너무 깁니다.")
+    if not DECIMAL_TEXT_PATTERN.fullmatch(text):
+        raise DataShapeError(f"{field} 값은 plain decimal 형식이어야 합니다.")
     try:
-        parsed = Decimal(str(value))
+        parsed = Decimal(text)
     except InvalidOperation as exc:
         raise DataShapeError(f"{field} 값을 Decimal로 변환할 수 없습니다.") from exc
     if not parsed.is_finite():

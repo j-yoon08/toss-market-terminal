@@ -16,6 +16,12 @@ def test_decimal_rejects_nonfinite() -> None:
         as_decimal("NaN", "price")
 
 
+@pytest.mark.parametrize("value", ["1e999999", "1E+10", "+1", "1."])
+def test_decimal_rejects_non_plain_or_exponent_forms(value: str) -> None:
+    with pytest.raises(DataShapeError):
+        as_decimal(value, "price")
+
+
 def test_parse_trade_and_orderbook() -> None:
     trade = Trade.from_api(
         {"price": "243.26", "volume": "8", "timestamp": "2026-01-01T00:00:00Z", "currency": "USD"}

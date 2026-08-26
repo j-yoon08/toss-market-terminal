@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -305,6 +307,7 @@ async def test_phase2_failures_keep_last_good_and_do_not_degrade_market(tmp_path
     app = portfolio_app(tmp_path)
     good_exchange = ExchangeRate.from_api(official_exchange_rate())
     good_history = ClosedOrdersPage.from_api(official_closed_page())
+    app.portfolio_snapshot = build_snapshot()
     app.exchange_rate = good_exchange
     app.closed_orders = good_history
     app.connection_state = "LIVE"
@@ -357,3 +360,95 @@ async def test_closed_order_history_reuses_selected_portfolio_account(tmp_path: 
     assert account_seq == app.portfolio_snapshot.account.account_seq
     assert (end_date - start_date).days == 29  # type: ignore[operator]
     assert limit == 20
+
+
+async def test_inflight_history_is_discarded_when_portfolio_account_changes(
+    tmp_path: Path,
+) -> None:
+    app = portfolio_app(tmp_path)
+    old_snapshot = build_snapshot()
+    new_snapshot = replace(
+        old_snapshot,
+        account=replace(old_snapshot.account, account_seq=2),
+    )
+    old_page = ClosedOrdersPage.from_api(official_closed_page())
+    new_page = ClosedOrdersPage.from_api(official_closed_page([]))
+    app.portfolio_snapshot = old_snapshot
+    app.closed_orders = old_page
+    app.order_history_account_seq = old_snapshot.account.account_seq
+    started = asyncio.Event()
+    release = asyncio.Event()
+    history_calls = 0
+
+    async def delayed_history():
+        nonlocal history_calls
+        history_calls += 1
+        if history_calls == 1:
+            started.set()
+            await release.wait()
+            return old_page
+        return new_page
+
+    async def load_new_portfolio():
+        return new_snapshot
+
+    app.closed_orders_loader = delayed_history
+    app.portfolio_loader = load_new_portfolio
+    history_task = asyncio.create_task(app._run_order_history_polling())
+    app.order_history_task = history_task
+    try:
+        await started.wait()
+        assert await app._refresh_portfolio()
+        assert app.closed_orders is None
+        assert app.order_history_account_seq is None
+        assert app.order_history_wakeup.is_set()
+        release.set()
+        for _ in range(30):
+            if app.closed_orders is new_page:
+                break
+            await asyncio.sleep(0.01)
+        assert app.closed_orders is new_page
+        assert app.order_history_account_seq == new_snapshot.account.account_seq
+        assert history_calls == 2
+    finally:
+        history_task.cancel()
+        await asyncio.gather(history_task, return_exceptions=True)
+
+
+async def test_open_portfolio_marks_fx_stale_when_validity_expires_without_refetch(
+    tmp_path: Path,
+) -> None:
+    app = portfolio_app(tmp_path)
+    now = datetime.now(UTC)
+    exchange_calls = 0
+
+    async def load_portfolio():
+        return build_snapshot()
+
+    async def load_exchange():
+        nonlocal exchange_calls
+        exchange_calls += 1
+        return ExchangeRate.from_api(
+            official_exchange_rate(
+                validFrom=(now - timedelta(minutes=1)).isoformat(),
+                validUntil=(now + timedelta(seconds=2)).isoformat(),
+            )
+        )
+
+    async def load_history():
+        return ClosedOrdersPage.from_api(official_closed_page())
+
+    app.portfolio_loader = load_portfolio
+    app.exchange_rate_loader = load_exchange
+    app.closed_orders_loader = load_history
+    async with app.run_test(size=(90, 30)) as pilot:
+        await wait_for_snapshot(app, pilot)
+        await wait_for_insights(app, pilot)
+        await pilot.press("p")
+        await pilot.pause()
+        content = app.screen.query_one("#portfolio-content", Static)
+        assert "FX FRESH" in content.render().plain
+        await asyncio.sleep(2.1)
+        await pilot.pause()
+        assert "FX STALE" in content.render().plain
+        assert exchange_calls == 1
