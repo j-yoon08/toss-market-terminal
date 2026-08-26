@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -22,7 +23,9 @@ from .alerts import AlertEvaluator, AlertEvent
 from .client import TossApiError, TossMarketClient
 from .config import CredentialError, Credentials
 from .live_chart import apply_trade_to_candles
-from .models import Candle, DataShapeError, MarketSnapshot, Orderbook, Trade
+from .models import AccountContext, Candle, DataShapeError, MarketSnapshot, Orderbook, Trade
+from .order_preview import OrderPreview, OrderSide, PaperPreviewService
+from .order_ticket import OrderConfirmScreen, OrderTicketScreen, build_ticket_capture
 from .render import (
     CHART_MODE_LABELS,
     DOWN_COLOR,
@@ -169,6 +172,8 @@ HELP_LINES = (
     ("q", "종료"),
     ("r", "REST 재동기화"),
     ("a", "관심종목 추가"),
+    ("b", "PAPER 매수 미리보기(주문 전송 없음)"),
+    ("s", "PAPER 매도 미리보기(주문 전송 없음)"),
     ("1 2 3 4 5", "1분/5분/15분/1시간/일봉"),
     ("c", "차트 포커스 전환"),
     ("↑ ↓ / j k", "관심 목록 이동"),
@@ -234,6 +239,8 @@ class TossMarketApp(App[int]):
         Binding("5", "daily", "일봉", show=False),
         Binding("c", "toggle_focus", "차트 포커스"),
         Binding("a", "add_watchlist", "관심종목 추가"),
+        Binding("b", "paper_buy_preview", "매수 미리보기(PAPER)", show=False),
+        Binding("s", "paper_sell_preview", "매도 미리보기(PAPER)", show=False),
         Binding("question_mark", "toggle_help", "도움말"),
         Binding("up", "watch_up", "위 항목", show=False),
         Binding("down", "watch_down", "아래 항목", show=False),
@@ -396,6 +403,14 @@ class TossMarketApp(App[int]):
         self._indicator_base: ChartIndicatorBase | None = None
         self._indicator_base_snapshot: MarketSnapshot | None = None
         self._indicator_base_mode: str | None = None
+        # v0.7b PAPER 미리보기 상태(메모리 전용, 디스크 저장 없음).
+        self.last_paper_preview: OrderPreview | None = None
+        self._ticket_open_lock = asyncio.Lock()
+        # 테스트 주입 지점(connect_live=False). 실제 앱은 v0.6 읽기 전용
+        # account_context만 이 경로로 호출한다.
+        self.account_context_loader: Callable[[str], Awaitable[AccountContext]] | None = None
+        # 미리보기 생성 서비스 팩토리(순수 도메인 PaperPreviewService). 테스트 대체 가능.
+        self.paper_preview_service_factory: Callable[[], PaperPreviewService] | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="topbar", markup=False)
@@ -471,6 +486,101 @@ class TossMarketApp(App[int]):
 
     def action_toggle_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_paper_buy_preview(self) -> None:
+        self.run_worker(self._open_paper_ticket(OrderSide.BUY), exclusive=False)
+
+    def action_paper_sell_preview(self) -> None:
+        self.run_worker(self._open_paper_ticket(OrderSide.SELL), exclusive=False)
+
+    # ------------------------------------------------------------------
+    # v0.7b PAPER 주문 미리보기 티켓(전송 경로 없음).
+    # ------------------------------------------------------------------
+
+    async def _load_account_context(self, captured_symbol: str) -> AccountContext:
+        """캡처한 심볼의 읽기 전용 계좌 컨텍스트를 조회한다(v0.6 account_context).
+
+        connect_live=False 환경(테스트)에서는 ``account_context_loader``로
+        가짜 클라이언트의 account_context를 주입할 수 있다.
+        """
+        loader = self.account_context_loader
+        if loader is not None:
+            return await loader(captured_symbol)
+        if self.client is None:
+            raise RuntimeError("client-unavailable")
+        return await self.client.account_context(captured_symbol)
+
+    async def _open_paper_ticket(self, side: OrderSide) -> None:
+        if self._ticket_open_lock.locked():
+            # 중복 b/s 입력 직렬화: 이미 진행 중이면 새 티켓을 만들지 않는다.
+            self.notify(
+                "이미 미리보기 창을 준비 중입니다.",
+                title="PAPER PREVIEW",
+                severity="warning",
+            )
+            return
+        async with self._ticket_open_lock:
+            capture = build_ticket_capture(
+                self.symbol,
+                self.current_price,
+                self.current_currency,
+            )
+            if capture is None:
+                self.notify(
+                    "미리보기를 만들 수 없습니다: 현재가 또는 통화 정보가 없습니다.",
+                    title="PAPER PREVIEW",
+                    severity="warning",
+                )
+                return
+            try:
+                context = await self._load_account_context(capture.symbol)
+            except Exception:
+                self.notify(
+                    "계좌 정보를 확인할 수 없어 미리보기를 열지 않았습니다.",
+                    title="PAPER PREVIEW",
+                    severity="warning",
+                )
+                return
+            if (
+                context.symbol != capture.symbol
+                or context.buying_power.currency != capture.currency
+            ):
+                # 응답 전 종목/통화가 바뀐 stale race도 fail-closed로 닫는다.
+                self.notify(
+                    "종목 정보가 변경되어 미리보기를 열지 않았습니다.",
+                    title="PAPER PREVIEW",
+                    severity="warning",
+                )
+                return
+            self.push_screen(
+                OrderTicketScreen(
+                    capture,
+                    context,
+                    side,
+                    preview_service_factory=self.paper_preview_service_factory,
+                ),
+                lambda preview: self._on_paper_preview_built(side, preview),
+            )
+
+    def _on_paper_preview_built(self, side: OrderSide, preview: OrderPreview | None) -> None:
+        """티켓 모달 결과 콜백: 미리보기가 나오면 확인 모달로 이어간다."""
+        if preview is None:
+            return  # Esc 취소: 아무 것도 저장하지 않는다.
+        self.push_screen(
+            OrderConfirmScreen(preview),
+            lambda ok: self._on_paper_confirmed(preview, bool(ok)),
+        )
+
+    def _on_paper_confirmed(self, preview: OrderPreview, confirmed: bool) -> None:
+        if not confirmed:
+            return  # 취소: 아무 것도 저장하지 않는다.
+        # 확정은 메모리 보관 + 알림일 뿐이다. 어떤 엔드포인트 호출도 없다.
+        self.last_paper_preview = preview
+        self.notify(
+            "PAPER PREVIEW 생성 · 실제 주문은 전송되지 않았습니다.",
+            title="PAPER PREVIEW",
+            severity="information",
+        )
 
     async def _add_watchlist_symbol(self, raw_symbol: str | None) -> None:
         if raw_symbol is None:
