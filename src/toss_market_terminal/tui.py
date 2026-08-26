@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Static
@@ -82,6 +83,32 @@ def safe_indicator_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: 지표 계산 실패"
 
 
+_RECONNECTING_STATES = frozenset({"RECONNECTING", "CONNECTING", "SWITCHING", "SUBSCRIBED"})
+_ERROR_STATES = frozenset({"ERROR", "AUTH_ERROR", "REJECTED"})
+
+
+def connection_state_color(state: str, live: bool) -> str:
+    """Restrained semantic color for a connection state: LIVE cyan/green, DEGRADED amber,
+    reconnecting/transitional blue, error states red; otherwise the muted default.
+    """
+    if state == "DEGRADED":
+        return "#f0ad4e"
+    if state in _ERROR_STATES:
+        return DOWN_COLOR
+    if state in _RECONNECTING_STATES:
+        return "#58a6ff"
+    if live:
+        return UP_COLOR
+    return MUTED_COLOR
+
+
+def format_age(monotonic_value: float | None) -> str:
+    """Bounded, truthful age since ``monotonic_value``; ``"—"`` when never observed."""
+    if monotonic_value is None:
+        return "—"
+    return f"{max(0.0, time.monotonic() - monotonic_value):.1f}s"
+
+
 @dataclass(frozen=True, slots=True)
 class WatchlistRow:
     symbol: str
@@ -138,24 +165,81 @@ class WatchlistAddScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+HELP_LINES = (
+    ("q", "종료"),
+    ("r", "REST 재동기화"),
+    ("a", "관심종목 추가"),
+    ("1 2 3 4 5", "1분/5분/15분/1시간/일봉"),
+    ("c", "차트 포커스 전환"),
+    ("↑ ↓ / j k", "관심 목록 이동"),
+    ("Enter", "선택한 종목으로 전환"),
+    ("?", "도움말 열기/닫기"),
+    ("Esc", "닫기"),
+)
+
+
+class HelpScreen(ModalScreen[None]):
+    BINDINGS: ClassVar = [
+        Binding("escape", "close", "닫기"),
+        Binding("question_mark", "close", "닫기"),
+    ]
+    CSS = """
+    HelpScreen {
+        align: center middle;
+        background: rgba(4, 7, 10, 0.75);
+    }
+    #help-dialog {
+        width: 44;
+        height: 16;
+        padding: 1 2;
+        border: solid #607080;
+        background: #0d131a;
+    }
+    #help-title {
+        height: 1;
+        color: #d9e1e8;
+        text-style: bold;
+    }
+    #help-body {
+        height: 1fr;
+        color: #aab7c4;
+    }
+    #help-footer {
+        height: 1;
+        color: #526273;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-dialog"):
+            yield Static("키보드 단축키", id="help-title", markup=False)
+            body = "\n".join(f"{key:<10}{description}" for key, description in HELP_LINES)
+            yield Static(body, id="help-body", markup=False)
+            yield Static("Esc 또는 ? 닫기", id="help-footer", markup=False)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class TossMarketApp(App[int]):
     TITLE = "Toss Market Terminal"
     SUB_TITLE = "READ ONLY"
     BINDINGS: ClassVar = [
-        ("q", "quit", "종료"),
-        ("r", "refresh", "재동기화"),
-        ("1", "intraday", "1분봉"),
-        ("2", "chart_5m", "5분봉"),
-        ("3", "chart_15m", "15분봉"),
-        ("4", "chart_1h", "1시간봉"),
-        ("5", "daily", "일봉"),
-        ("c", "toggle_focus", "차트 포커스"),
-        ("a", "add_watchlist", "관심종목 추가"),
-        ("up", "watch_up", "위 항목"),
-        ("down", "watch_down", "아래 항목"),
-        ("j", "watch_down", "아래 항목(j)"),
-        ("k", "watch_up", "위 항목(k)"),
-        ("enter", "watch_select", "심볼 전환"),
+        Binding("q", "quit", "종료"),
+        Binding("r", "refresh", "재동기화"),
+        Binding("1", "intraday", "1-5 타임프레임"),
+        Binding("2", "chart_5m", "5분봉", show=False),
+        Binding("3", "chart_15m", "15분봉", show=False),
+        Binding("4", "chart_1h", "1시간봉", show=False),
+        Binding("5", "daily", "일봉", show=False),
+        Binding("c", "toggle_focus", "차트 포커스"),
+        Binding("a", "add_watchlist", "관심종목 추가"),
+        Binding("question_mark", "toggle_help", "도움말"),
+        Binding("up", "watch_up", "위 항목", show=False),
+        Binding("down", "watch_down", "아래 항목", show=False),
+        Binding("j", "watch_down", "아래 항목(j)", show=False),
+        Binding("k", "watch_up", "위 항목(k)", show=False),
+        Binding("enter", "watch_select", "심볼 전환", show=False),
     ]
     CSS = """
     Screen {
@@ -169,7 +253,7 @@ class TossMarketApp(App[int]):
         color: #c9d1d9;
     }
     #summary {
-        height: 6;
+        height: 4;
         margin: 0 1;
         padding: 0 2;
         border: solid #2a3440;
@@ -185,10 +269,10 @@ class TossMarketApp(App[int]):
         border: solid #2a3440;
         background: #0b1118;
     }
-    #watchlist-panel { width: 18%; }
-    #orderbook-panel { width: 28%; }
-    #chart-panel { width: 33%; }
-    #trades-panel { width: 21%; }
+    #watchlist-panel { width: 15%; }
+    #orderbook-panel { width: 24%; }
+    #chart-panel { width: 42%; }
+    #trades-panel { width: 19%; }
     .panel-title {
         height: 2;
         padding: 0 1;
@@ -219,14 +303,14 @@ class TossMarketApp(App[int]):
         padding: 1 2;
     }
     #market-stats {
-        height: 12;
+        height: 10;
         padding: 0 2;
         border-top: solid #2a3440;
         color: #9aa7b4;
     }
     #statusbar {
-        height: 4;
-        padding: 1 2 0 2;
+        height: 2;
+        padding: 0 2;
         background: #0d131a;
         color: #7d8998;
     }
@@ -238,11 +322,11 @@ class TossMarketApp(App[int]):
     Screen.compact #watchlist-panel { display: none; }
     Screen.compact #orderbook-panel { width: 52%; }
     Screen.compact #trades-panel { width: 48%; }
-    Screen.compact #summary { height: 7; }
+    Screen.compact #summary { height: 5; }
     Screen.chart-focus #watchlist-panel { display: none; }
-    Screen.chart-focus #chart-panel { width: 65%; }
-    Screen.chart-focus #orderbook-panel { width: 18%; }
-    Screen.chart-focus #trades-panel { width: 17%; }
+    Screen.chart-focus #chart-panel { width: 60%; }
+    Screen.chart-focus #orderbook-panel { width: 20%; }
+    Screen.chart-focus #trades-panel { width: 20%; }
     """
 
     def __init__(
@@ -303,6 +387,7 @@ class TossMarketApp(App[int]):
         self.indicator_degraded = False
         self.candle_sync_degraded = False
         self.last_tick_monotonic: float | None = None
+        self.last_sync_monotonic: float | None = None
         self._live_candles: tuple[Candle, ...] = ()
         self._live_daily_candles: tuple[Candle, ...] = ()
         self._live_candle_revision = 0
@@ -322,7 +407,7 @@ class TossMarketApp(App[int]):
             with Vertical(id="orderbook-panel", classes="market-panel"):
                 yield Static("ORDER BOOK", classes="panel-title")
                 yield DataTable(
-                    id="orderbook", zebra_stripes=False, show_cursor=False, cell_padding=1
+                    id="orderbook", zebra_stripes=False, show_cursor=False, cell_padding=0
                 )
             with Vertical(id="chart-panel", classes="market-panel"):
                 yield Static("MARKET CHART", classes="panel-title")
@@ -383,6 +468,9 @@ class TossMarketApp(App[int]):
 
     def action_add_watchlist(self) -> None:
         self.push_screen(WatchlistAddScreen(), self._add_watchlist_symbol)
+
+    def action_toggle_help(self) -> None:
+        self.push_screen(HelpScreen())
 
     async def _add_watchlist_symbol(self, raw_symbol: str | None) -> None:
         if raw_symbol is None:
@@ -487,13 +575,16 @@ class TossMarketApp(App[int]):
     def _prepare_tables(self) -> None:
         watchlist = self.query_one("#watchlist", DataTable)
         watchlist.add_column("SYMBOL", width=7)
-        watchlist.add_column("PRICE", width=12)
+        watchlist.add_column("PRICE", width=9)
         watchlist.add_column("A", width=2)
         orderbook = self.query_one("#orderbook", DataTable)
-        orderbook.add_columns("SIDE", "PRICE", "SIZE", "DEPTH")
+        orderbook.add_column("SIDE", width=5)
+        orderbook.add_column("PRICE", width=7)
+        orderbook.add_column("SIZE", width=5)
+        orderbook.add_column("DEPTH", width=8)
         trades = self.query_one("#trades", DataTable)
-        trades.add_column("TIME", width=9)
-        trades.add_column("PRICE", width=10)
+        trades.add_column("TIME", width=8)
+        trades.add_column("PRICE", width=9)
         trades.add_column("SIZE", width=7)
         trades.add_column("", width=1)
 
@@ -577,15 +668,17 @@ class TossMarketApp(App[int]):
         table.clear()
         for symbol in self.watchlist_symbols:
             row = self.watchlist_rows.get(symbol)
-            marker = "•" if row is not None and row.active_alerts else " "
+            alert_marker = "•" if row is not None and row.active_alerts else " "
             count = str(row.active_alerts) if row is not None else "0"
             price_text = f"{row.price} {row.currency}" if row is not None else "—"
             if row is None or self.watchlist_stale:
                 price_text = f"{price_text}*" if self.watchlist_stale else price_text
+            # Text marker distinct from the movable DataTable row cursor.
+            active_prefix = ">" if symbol == self.symbol else " "
             table.add_row(
-                symbol,
-                Text(price_text, style=MUTED_COLOR),
-                f"{marker}{count}",
+                f"{active_prefix}{symbol}",
+                Text(f" {price_text}", style=MUTED_COLOR),
+                f"{alert_marker}{count}",
             )
 
     def _evaluate_alerts(
@@ -710,6 +803,7 @@ class TossMarketApp(App[int]):
             self.current_timestamp = None
             self.snapshot = None
             self.last_tick_monotonic = None
+            self.last_sync_monotonic = None
             self.indicator_degraded = False
             self.candle_sync_degraded = False
             self._live_candles = ()
@@ -729,6 +823,8 @@ class TossMarketApp(App[int]):
             self.connection_state = "SWITCHING"
             self.connection_detail = ""
             self._render_chrome()
+            if self.is_mounted:
+                self._render_watchlist()
 
             if self.client is None:
                 return
@@ -769,6 +865,7 @@ class TossMarketApp(App[int]):
             trade for revision, trade in self._live_trade_buffer if revision > start_revision
         )
         self._apply_snapshot(snapshot, replay_trades=replay_trades)
+        self.last_sync_monotonic = time.monotonic()
         self.indicator_degraded = False
         self.candle_sync_degraded = False
         if was_live:
@@ -916,6 +1013,7 @@ class TossMarketApp(App[int]):
             self._live_candles = candles
             self._live_daily_candles = daily_candles
             self.candle_sync_degraded = False
+            self.last_sync_monotonic = time.monotonic()
             self._publish_live_chart()
             if self.stream_live and not self.protocol_degraded and not self.indicator_degraded:
                 self.connection_state = "LIVE"
@@ -1037,11 +1135,12 @@ class TossMarketApp(App[int]):
         )
         style = direction_style(metrics.change)
         text = Text()
+        # Two lines total: identity, then price/change/high-low-volume. "READ ONLY"
+        # already appears in the topbar, so it is not repeated here.
         text.append(f"{self.symbol}  ", style="bold white")
         text.append(
-            f"{self.snapshot.stock.name} · {self.snapshot.stock.market}  ", style=MUTED_COLOR
+            f"{self.snapshot.stock.name} · {self.snapshot.stock.market}\n", style=MUTED_COLOR
         )
-        text.append("PUBLIC MARKET DATA\n", style="#526273")
         text.append(
             f"{format_decimal(self.current_price, self.current_currency)} {self.current_currency}",
             style=style,
@@ -1052,15 +1151,14 @@ class TossMarketApp(App[int]):
                 f"{format_percent(metrics.change_percent)}",
                 style=style,
             )
-        text.append("\n")
         if metrics.day_high is not None and metrics.day_low is not None:
             text.append(
-                f"HIGH {format_decimal(metrics.day_high, self.current_currency)}   "
-                f"LOW {format_decimal(metrics.day_low, self.current_currency)}   ",
+                f"   HIGH {format_decimal(metrics.day_high, self.current_currency)}   "
+                f"LOW {format_decimal(metrics.day_low, self.current_currency)}",
                 style=MUTED_COLOR,
             )
         if metrics.day_volume is not None:
-            text.append(f"VOL {format_decimal(metrics.day_volume)}", style=MUTED_COLOR)
+            text.append(f"   VOL {format_decimal(metrics.day_volume)}", style=MUTED_COLOR)
         self.query_one("#summary", Static).update(text)
 
     def _render_orderbook(self) -> None:
@@ -1105,7 +1203,7 @@ class TossMarketApp(App[int]):
                 marker, style = "·", MUTED_COLOR
             table.add_row(
                 format_trade_time(trade.timestamp),
-                Text(format_decimal(trade.price, trade.currency), style=style),
+                Text(f" {format_decimal(trade.price, trade.currency)}", style=style),
                 format_decimal(trade.volume),
                 Text(marker, style=style),
             )
@@ -1117,7 +1215,23 @@ class TossMarketApp(App[int]):
         if not chart_content.is_mounted:
             return
         width, height = chart_content.content_size
-        chart_content.update(chart_renderable(self.snapshot, self.chart_mode, width, height))
+        previous_close = market_metrics(
+            self.snapshot,
+            self.current_price,
+            orderbook=self.orderbook,
+            trades=tuple(self.trades),
+            current_timestamp=self.current_timestamp,
+        ).previous_close
+        chart_content.update(
+            chart_renderable(
+                self.snapshot,
+                self.chart_mode,
+                width,
+                height,
+                current_price=self.current_price,
+                previous_close=previous_close,
+            )
+        )
         title = f"MARKET CHART · {CHART_MODE_LABELS[self.chart_mode]}"
         self.query_one("#chart-panel .panel-title", Static).update(title)
 
@@ -1159,23 +1273,21 @@ class TossMarketApp(App[int]):
             trades=tuple(self.trades),
         )
         text = Text()
-        text.append("시장 신호 요약\n", style="bold #c9d1d9")
+        # Bounded summary: every raw line stays <= 52 display cells so the
+        # stats panel never wraps. Market-data pairs fill lines 1-4, chart
+        # indicator pairs fill lines 5-8, then the provenance footer. Absent
+        # data renders as "—"/"데이터 부족" placeholders (never fabricated
+        # values) so the panel height stays constant through DEGRADED and
+        # recovery cycles.
+        text.append("시장 신호 요약", style="bold #c9d1d9")
         if metrics.spread is not None:
             text.append(
-                f"매수·매도 호가 차이 {format_decimal(metrics.spread, self.current_currency)}",
+                f" · 매수·매도 호가 차이 {format_decimal(metrics.spread, self.current_currency)}",
                 style=MUTED_COLOR,
             )
             if metrics.spread_percent is not None:
-                text.append(f" · {metrics.spread_percent:.3f}%\n", style=MUTED_COLOR)
-        if metrics.recent_vwap is not None:
-            text.append(
-                f"체결 평균 {format_decimal(metrics.recent_vwap, self.current_currency)}",
-                style=MUTED_COLOR,
-            )
-            if signals.vwap_distance_percent is not None:
-                text.append(f" · 현재가 {format_percent(signals.vwap_distance_percent)}\n")
-            else:
-                text.append("\n")
+                text.append(f" · {metrics.spread_percent:.3f}%", style=MUTED_COLOR)
+        text.append("\n")
         imbalance = (
             f"{signals.orderbook_imbalance_percent:.1f}%"
             if signals.orderbook_imbalance_percent is not None
@@ -1188,14 +1300,19 @@ class TossMarketApp(App[int]):
             else "—"
         )
         volume_ratio = format_multiple(signals.volume_spike_ratio)
+        if metrics.recent_vwap is not None:
+            vwap_summary = f"체결 평균 {format_decimal(metrics.recent_vwap, self.current_currency)}"
+            if signals.vwap_distance_percent is not None:
+                vwap_summary += f" · 현재가 {format_percent(signals.vwap_distance_percent)}"
+            text.append(vwap_summary + "\n", style=MUTED_COLOR)
         text.append(
             f"호가 {orderbook_signal_label_ko(signals.orderbook_imbalance_percent)} "
             f"{imbalance} · 잔량비 {ratio}\n",
             style=MUTED_COLOR,
         )
         text.append(
-            f"체결 {trade_pressure_label_ko(signals.trade_pressure_percent)} {pressure} · "
-            f"1분 거래량 {volume_ratio}\n",
+            f"체결 {trade_pressure_label_ko(signals.trade_pressure_percent)} "
+            f"{pressure} · 1분 거래량 {volume_ratio}\n",
             style=MUTED_COLOR,
         )
 
@@ -1215,13 +1332,18 @@ class TossMarketApp(App[int]):
                 f"{timeframe_label} 지표 계산 불가 · {self.connection_detail}\n",
                 style="#f0ad4e",
             )
+            text.append(
+                "EMA9/21 — · RSI — · VWAP 데이터 부족\n",
+                style=MUTED_COLOR,
+            )
+            text.append("지지 — · 저항 —\n", style=MUTED_COLOR)
         else:
+            rsi_text = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "—"
             text.append(
                 f"{timeframe_label} 지표 · EMA9/21 "
                 f"{ema_relation_label_ko(indicators.ema_short, indicators.ema_long)}\n",
                 style=MUTED_COLOR,
             )
-            rsi_text = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "—"
             text.append(
                 f"RSI {rsi_text} {rsi_zone_label_ko(indicators.rsi)} · "
                 f"거래량 {format_multiple(indicators.relative_volume)}\n",
@@ -1229,18 +1351,15 @@ class TossMarketApp(App[int]):
             )
             vwap_percent = vwap_distance_percent(indicators.vwap, self.current_price)
             if indicators.vwap is not None and vwap_percent is not None:
-                text.append(
+                vwap_segment = (
                     f"VWAP {format_decimal(indicators.vwap, self.current_currency)} · "
-                    f"현재가 {format_percent(vwap_percent)}\n",
-                    style=MUTED_COLOR,
+                    f"현재가 {format_percent(vwap_percent)}"
                 )
             else:
-                text.append("VWAP 데이터 부족\n", style=MUTED_COLOR)
+                vwap_segment = "VWAP 데이터 부족"
+            text.append(vwap_segment + "\n", style=MUTED_COLOR)
             text.append(
-                f"지지 {level_display_ko(indicators.levels.support, self.current_currency)}\n",
-                style=MUTED_COLOR,
-            )
-            text.append(
+                f"지지 {level_display_ko(indicators.levels.support, self.current_currency)} · "
                 f"저항 {level_display_ko(indicators.levels.resistance, self.current_currency)}\n",
                 style=MUTED_COLOR,
             )
@@ -1250,11 +1369,7 @@ class TossMarketApp(App[int]):
     def _render_chrome(self) -> None:
         now = datetime.now(KST).strftime("%H:%M:%S KST")
         live = self.stream_live
-        state_color = (
-            "#f0ad4e"
-            if self.connection_state == "DEGRADED"
-            else (UP_COLOR if live else MUTED_COLOR)
-        )
+        state_color = connection_state_color(self.connection_state, live)
         top = Text()
         top.append("TOSS MARKET", style="bold white")
         top.append("   READ ONLY", style="#526273")
@@ -1262,16 +1377,15 @@ class TossMarketApp(App[int]):
         top.append(f"   {now}", style=MUTED_COLOR)
         self.query_one("#topbar", Static).update(top)
 
-        tick_age = "—"
-        if self.last_tick_monotonic is not None:
-            tick_age = f"{max(0.0, time.monotonic() - self.last_tick_monotonic):.1f}s"
+        # Compact two-line status: connection + freshness on line one, the latest
+        # alert (if any) on line two. TICK/SYNC ages use monotonic time and read
+        # "—" (never a fabricated value) until a tick/sync has actually landed.
         status = Text()
-        status.append(f"WS {self.connection_state}", style=state_color)
+        status.append(f"{'●' if live else '○'} {self.connection_state}", style=state_color)
         if self.connection_detail:
             status.append(f" · {self.connection_detail}", style=MUTED_COLOR)
-        status.append(f"   LAST TICK {tick_age}", style=MUTED_COLOR)
-        if self.current_timestamp:
-            status.append(f"   MARKET TIME {self.current_timestamp}", style="#526273")
+        status.append(f"   TICK {format_age(self.last_tick_monotonic)}", style=MUTED_COLOR)
+        status.append(f"   SYNC {format_age(self.last_sync_monotonic)}", style=MUTED_COLOR)
         if self.latest_alert is not None:
             status.append(
                 f"\nALERT {self.latest_alert.rule.id} · {self.latest_alert.rule.symbol} · "

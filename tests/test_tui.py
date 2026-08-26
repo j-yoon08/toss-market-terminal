@@ -36,14 +36,33 @@ async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> No
         await pilot.pause()
         assert "TOSS MARKET" in app.query_one("#topbar", Static).render().plain
         assert app.query_one("#watchlist-panel .panel-title", Static).render().plain == "WATCHLIST"
-        assert app.query_one("#watchlist", DataTable).row_count == 3
-        assert app.query_one("#watchlist", DataTable).max_scroll_x == 0
+        watchlist = app.query_one("#watchlist", DataTable)
+        assert watchlist.row_count == 3
+        assert watchlist.max_scroll_x == 0
+        symbols = [watchlist.get_cell_at(Coordinate(row, 0)) for row in range(watchlist.row_count)]
+        assert symbols.count(">AAPL") == 1
+        assert sum(symbol.startswith(">") for symbol in symbols) == 1
+        prices = [
+            watchlist.get_cell_at(Coordinate(row, 1)).plain for row in range(watchlist.row_count)
+        ]
+        assert all(price.startswith(" ") for price in prices)
         assert app.query_one("#orderbook-panel .panel-title", Static).render().plain == "ORDER BOOK"
         assert "MARKET CHART" in app.query_one("#chart-panel .panel-title", Static).render().plain
         assert app.query_one("#trades-panel .panel-title", Static).render().plain == "LIVE TRADES"
         assert app.query_one("#trades", DataTable).max_scroll_x == 0
         assert "체결 평균" in app.query_one("#market-stats", Static).render().plain
         assert not app.screen.has_class("compact")
+        widths = {
+            panel: app.query_one(f"#{panel}-panel").size.width
+            for panel in ("watchlist", "orderbook", "chart", "trades")
+        }
+        total_width = sum(widths.values())
+        assert widths["watchlist"] / total_width == pytest.approx(0.15, abs=0.02)
+        assert widths["orderbook"] / total_width == pytest.approx(0.24, abs=0.02)
+        assert widths["chart"] / total_width == pytest.approx(0.42, abs=0.02)
+        assert widths["trades"] / total_width == pytest.approx(0.19, abs=0.02)
+        assert app.query_one("#summary").styles.height.value == 4
+        assert app.query_one("#statusbar").styles.height.value == 2
         await pilot.press("5")
         await pilot.pause()
         assert (
@@ -102,10 +121,12 @@ async def test_snapshot_failure_is_sanitized_and_not_marked_live(tmp_path: Path)
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
         app.client = FailingClient()  # type: ignore[assignment]
+        app.last_sync_monotonic = 123.0
         assert not await app._refresh_snapshot()
         assert app.connection_state == "ERROR"
         assert "secret-value" not in app.connection_detail
         assert app.connection_detail == "RuntimeError: REST snapshot failed"
+        assert app.last_sync_monotonic == 123.0
 
 
 async def test_pong_does_not_replace_live_state(tmp_path: Path) -> None:
@@ -151,6 +172,8 @@ async def test_manual_refresh_restores_live_state(tmp_path: Path) -> None:
         assert app.stream_live
         assert app.connection_state == "LIVE"
         assert app.connection_detail == "topics=2"
+        assert app.last_sync_monotonic is not None
+        assert "SYNC" in app.query_one("#statusbar", Static).render().plain
 
 
 async def test_live_snapshot_failure_becomes_degraded(tmp_path: Path) -> None:
@@ -301,9 +324,52 @@ async def test_watchlist_navigation_uses_cursor_and_selects_row(tmp_path: Path) 
 
 
 def test_app_binding_keys_are_unique_and_include_watchlist_add() -> None:
-    keys = [binding[0] for binding in TossMarketApp.BINDINGS]
+    keys = [binding.key for binding in TossMarketApp.BINDINGS]
     assert len(keys) == len(set(keys))
     assert "a" in keys
+    assert "question_mark" in keys
+    visible = {binding.key for binding in TossMarketApp.BINDINGS if binding.show}
+    assert {"q", "r", "a", "1", "c", "question_mark"} <= visible
+    assert {"up", "down", "j", "k", "enter"}.isdisjoint(visible)
+
+
+async def test_help_modal_opens_and_closes_at_compact_size(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        body = app.screen.query_one("#help-body", Static).render().plain
+        assert "1분/5분/15분/1시간/일봉" in body
+        assert "관심 목록 이동" in body
+        assert app.screen.query_one("#help-dialog").size.height <= 30
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert len(app.screen.query("#help-dialog")) == 0
+
+
+async def test_watchlist_input_captures_app_binding_characters(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings_path=tmp_path / "settings.json",
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        symbol_input = app.screen.query_one("#watchlist-add-input", Input)
+        await pilot.press("a", "q", "question_mark")
+        await pilot.pause()
+        assert app.screen.query_one("#watchlist-add-input", Input) is symbol_input
+        assert symbol_input.value == "aq?"
 
 
 async def test_watchlist_add_binding_persists_and_updates_running_table(tmp_path: Path) -> None:
@@ -644,6 +710,8 @@ async def test_chart_focus_toggle_hides_watchlist_and_widens_chart(tmp_path: Pat
         assert chart_width > trades_width > 0
         ratio = chart_width / total
         assert 0.60 <= ratio <= 0.70
+        assert app.query_one("#orderbook", DataTable).max_scroll_x == 0
+        assert app.query_one("#trades", DataTable).max_scroll_x == 0
 
         await pilot.press("c")
         await pilot.pause()
