@@ -9,7 +9,7 @@
 - 제출 직전에 계좌·보유수량·매수가능금액을 다시 조회하고 risk gate를 재실행합니다. 이어 `GET /api/v1/orders?status=OPEN`으로 같은 종목·방향의 미체결 주문을 확인하며, 활성 상태 또는 알 수 없는 상태가 있으면 fail-closed로 차단합니다.
 - 안전 점검 뒤 기존 OAuth token을 just-in-time으로 재사용해 별도 동기 transport를 `asyncio.to_thread`에서 실행합니다. POST는 계획당 최대 1회이며 timeout·5xx·응답 불일치 등 모호한 결과 뒤에는 절대 자동 재시도하지 않습니다.
 - 결과는 `접수됨(accepted)`·`거절됨(rejected)`·`결과 불명확(ambiguous)`으로 구분합니다. 접수는 체결을 뜻하지 않으며, 제출 뒤 계좌와 미체결 주문을 read-only로 재조회합니다.
-- 감사로그는 `~/.local/state/toss-market-terminal/live-order-audit.jsonl`에 append-only JSONL로 저장됩니다. 디렉터리 `0700`, 파일 `0600`, symlink 차단, 동시 append 잠금·fsync를 적용하며 계좌 식별자·token·승인문구·order ID·원문 응답은 저장하지 않습니다.
+- 감사로그는 `~/.local/state/toss-market-terminal/live-order-audit.jsonl`에 append-only JSONL로 저장됩니다. 디렉터리 `0700`, 파일 `0600`, symlink 차단, `O_APPEND` 단일 write·fsync를 적용하며 계좌 식별자·token·승인문구·order ID·원문 응답은 저장하지 않습니다.
 - 테스트와 개발 검증에서는 MockTransport만 사용했으며 실제 주문을 실행하지 않았습니다.
 
 ## v0.8c 구현 계층 (읽기 전용 미체결 주문 조회)
