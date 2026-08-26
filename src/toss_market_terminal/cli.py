@@ -228,8 +228,15 @@ def build_parser() -> argparse.ArgumentParser:
     account.add_argument("--account-seq", type=int, default=None, dest="account_seq")
     account.add_argument("--json", action="store_true", dest="json_output")
 
-    watch = subparsers.add_parser("watch", help="실시간 Textual TUI 실행")
+    watch = subparsers.add_parser(
+        "watch", help="실시간 Textual TUI 실행 (기본 PAPER, 선택적 수동 LIVE)"
+    )
     watch.add_argument("symbol")
+    watch.add_argument(
+        "--live-orders",
+        action="store_true",
+        help="수동 LIVE 승인 화면 활성화(환경 게이트와 정확한 승인문구도 필요)",
+    )
 
     probe = subparsers.add_parser("probe", help="REST + WebSocket 조회 전용 연결 검증")
     probe.add_argument("symbol")
@@ -282,7 +289,12 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
         if args.command == "watch":
             symbol = normalize_symbol(args.symbol)
-            result = TossMarketApp(symbol, args.credentials, settings_path=settings_file()).run()
+            result = TossMarketApp(
+                symbol,
+                args.credentials,
+                settings_path=settings_file(),
+                manual_live_orders=args.live_orders,
+            ).run()
             return result or 0
         if args.command == "watchlist":
             if args.watchlist_command == "list":

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import ClassVar, Literal
@@ -16,16 +17,50 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Static
 
 from .alerts import AlertEvaluator, AlertEvent
 from .client import TossApiError, TossMarketClient
 from .config import CredentialError, Credentials
+from .live_audit import LiveAuditLog, LiveAuditLogError
 from .live_chart import apply_trade_to_candles
-from .models import AccountContext, Candle, DataShapeError, MarketSnapshot, Orderbook, Trade
-from .order_preview import OrderPreview, OrderSide, PaperPreviewService
+from .live_order import (
+    MANUAL_LIVE_ENV_KEY,
+    MANUAL_LIVE_ENV_VALUE,
+    LiveAuditRecord,
+    LiveExecutionRequest,
+    LiveOrderAccepted,
+    LiveOrderAmbiguous,
+    LiveOrderPlan,
+    LiveOrderRejected,
+    LiveOrderTransport,
+    ManualLiveOrderExecutor,
+    build_live_packet,
+    create_live_plan,
+    live_approval_phrase,
+)
+from .live_ticket import LiveApprovalScreen
+from .models import (
+    AccountContext,
+    Candle,
+    DataShapeError,
+    MarketSnapshot,
+    OpenOrdersPage,
+    Orderbook,
+    Trade,
+    find_open_order_duplicates,
+)
+from .order_preview import (
+    OrderPreview,
+    OrderPreviewError,
+    OrderSide,
+    PaperPreviewService,
+    canonical_decimal_text,
+)
 from .order_ticket import OrderConfirmScreen, OrderTicketScreen, build_ticket_capture
+from .order_transport import TossOrderTransport
 from .render import (
     CHART_MODE_LABELS,
     DOWN_COLOR,
@@ -69,6 +104,7 @@ CANDLE_RESYNC_SECONDS = 30.0
 CHART_RENDER_INTERVAL_SECONDS = 0.25
 COMPACT_WIDTH_THRESHOLD = 117
 LiveCandleStatus = Literal["updated", "late", "unavailable"]
+LiveTransportFactory = Callable[[str, int], LiveOrderTransport]
 
 
 def safe_status_error(exc: Exception) -> str:
@@ -118,6 +154,42 @@ class WatchlistRow:
     price: str
     currency: str
     active_alerts: int
+
+
+def _submit_live_plan_once(
+    plan: LiveOrderPlan,
+    approval_phrase: str,
+    access_token: str,
+    account_seq: int,
+    transport_factory: LiveTransportFactory,
+) -> tuple[
+    LiveOrderAccepted | LiveOrderRejected | LiveOrderAmbiguous,
+    tuple[LiveAuditRecord, ...],
+]:
+    """Run the synchronous one-shot executor off the Textual event loop."""
+
+    transport = transport_factory(access_token, account_seq)
+    executor = ManualLiveOrderExecutor(transport)
+    try:
+        outcome = executor.execute(
+            LiveExecutionRequest(
+                plan=plan,
+                execute=True,
+                acknowledge_final_approval=True,
+                interactive_session=True,
+            ),
+            approval_phrase,
+        )
+    finally:
+        close = getattr(transport, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # Closing happens after the one-shot mutation result is known.
+                # It must never overwrite accepted/rejected/ambiguous evidence.
+                pass
+    return outcome, executor.audit_records()
 
 
 class WatchlistAddScreen(ModalScreen[str | None]):
@@ -348,6 +420,9 @@ class TossMarketApp(App[int]):
         watchlist_refresh_seconds: float = WATCHLIST_REFRESH_SECONDS,
         candle_resync_seconds: float = CANDLE_RESYNC_SECONDS,
         chart_render_interval_seconds: float = CHART_RENDER_INTERVAL_SECONDS,
+        manual_live_orders: bool = False,
+        live_audit_log: LiveAuditLog | None = None,
+        live_transport_factory: LiveTransportFactory | None = None,
     ) -> None:
         super().__init__()
         self.symbol = normalize_symbol(symbol)
@@ -364,6 +439,14 @@ class TossMarketApp(App[int]):
             raise ValueError("차트 렌더 간격은 0 이상이어야 합니다.")
         self.candle_resync_seconds = candle_resync_seconds
         self.chart_render_interval_seconds = chart_render_interval_seconds
+        if not isinstance(manual_live_orders, bool):
+            raise ValueError("manual_live_orders는 bool이어야 합니다.")
+        self.manual_live_orders = manual_live_orders
+        self.sub_title = "MANUAL LIVE" if manual_live_orders else "READ ONLY"
+        self.live_audit_log = live_audit_log or LiveAuditLog()
+        self.live_transport_factory = live_transport_factory or (
+            lambda token, account_seq: TossOrderTransport(token, account_seq)
+        )
         self.refresh_lock = asyncio.Lock()
         self.switch_lock = asyncio.Lock()
         self.watchlist_refresh_lock = asyncio.Lock()
@@ -405,10 +488,17 @@ class TossMarketApp(App[int]):
         self._indicator_base_mode: str | None = None
         # v0.7b PAPER 미리보기 상태(메모리 전용, 디스크 저장 없음).
         self.last_paper_preview: OrderPreview | None = None
+        self.last_live_outcome: (
+            LiveOrderAccepted | LiveOrderRejected | LiveOrderAmbiguous | None
+        ) = None
         self._ticket_open_lock = asyncio.Lock()
+        self._live_submit_lock = asyncio.Lock()
+        self._live_attempted_fingerprints: set[str] = set()
         # 테스트 주입 지점(connect_live=False). 실제 앱은 v0.6 읽기 전용
         # account_context만 이 경로로 호출한다.
         self.account_context_loader: Callable[[str], Awaitable[AccountContext]] | None = None
+        self.open_orders_loader: Callable[[int, str], Awaitable[OpenOrdersPage]] | None = None
+        self.access_token_loader: Callable[[], Awaitable[str]] | None = None
         # 미리보기 생성 서비스 팩토리(순수 도메인 PaperPreviewService). 테스트 대체 가능.
         self.paper_preview_service_factory: Callable[[], PaperPreviewService] | None = None
 
@@ -581,6 +671,220 @@ class TossMarketApp(App[int]):
             title="PAPER PREVIEW",
             severity="information",
         )
+        if not self.manual_live_orders:
+            return
+        if os.environ.get(MANUAL_LIVE_ENV_KEY) != MANUAL_LIVE_ENV_VALUE:
+            self.notify(
+                "환경 게이트가 꺼져 있어 LIVE 승인 화면을 열지 않았습니다.",
+                title="LIVE ORDER BLOCKED",
+                severity="warning",
+            )
+            return
+        try:
+            plan = create_live_plan(preview, datetime.now(UTC))
+        except Exception:
+            self.notify(
+                "라이브 계획을 만들 수 없어 주문을 전송하지 않았습니다.",
+                title="LIVE ORDER BLOCKED",
+                severity="error",
+            )
+            return
+        self.push_screen(
+            LiveApprovalScreen(plan),
+            lambda phrase: self._on_live_approval(plan, phrase),
+        )
+
+    def _on_live_approval(self, plan: LiveOrderPlan, phrase: str | None) -> None:
+        if phrase is None:
+            return
+        self.run_worker(self._submit_live_plan(plan, phrase), exclusive=False)
+
+    async def _load_open_orders(self, account_seq: int, symbol: str) -> OpenOrdersPage:
+        if self.open_orders_loader is not None:
+            return await self.open_orders_loader(account_seq, symbol)
+        if self.client is None:
+            raise RuntimeError("client-unavailable")
+        return await self.client.open_orders(account_seq, symbol)
+
+    async def _load_access_token(self) -> str:
+        if self.access_token_loader is not None:
+            return await self.access_token_loader()
+        if self.client is None:
+            raise RuntimeError("client-unavailable")
+        return await self.client.access_token()
+
+    def _revalidate_live_preview(
+        self, plan: LiveOrderPlan, context: AccountContext
+    ) -> OrderPreview:
+        """Re-run paper risk checks against a fresh account snapshot."""
+
+        intent = plan.intent
+        if (
+            context.scope != "account_read_only"
+            or context.order_endpoints_called is not False
+            or context.account.account_seq != intent.account_seq
+            or context.account.masked_account_no != intent.masked_account_no
+            or context.symbol != intent.symbol
+            or context.buying_power.currency != intent.currency
+        ):
+            raise OrderPreviewError("실행 직전 계좌 컨텍스트가 계획과 일치하지 않습니다.")
+        service = (
+            self.paper_preview_service_factory()
+            if self.paper_preview_service_factory is not None
+            else PaperPreviewService()
+        )
+        fresh = service.create_preview(
+            account_no=context.account.masked_account_no,
+            account_seq=context.account.account_seq,
+            symbol=intent.symbol,
+            side=intent.side,
+            order_type=intent.order_type,
+            quantity=canonical_decimal_text(intent.quantity),
+            reference_last_price=canonical_decimal_text(intent.reference_last_price),
+            holding_quantity=canonical_decimal_text(context.holding_quantity),
+            cash_buying_power=canonical_decimal_text(context.buying_power.cash_buying_power),
+            limit_price=(
+                None if intent.limit_price is None else canonical_decimal_text(intent.limit_price)
+            ),
+            market=intent.market,
+            currency=intent.currency,
+        )
+        if fresh.fingerprint != plan.preview_fingerprint:
+            raise OrderPreviewError("실행 직전 미리보기 지문이 계획과 일치하지 않습니다.")
+        return fresh
+
+    async def _submit_live_plan(self, plan: LiveOrderPlan, approval_phrase: str) -> None:
+        """Fail-closed live path: fresh reads, audit preflight, then one POST in a thread."""
+
+        if self._live_submit_lock.locked():
+            self.notify(
+                "이미 라이브 제출을 처리 중입니다.",
+                title="LIVE ORDER BLOCKED",
+                severity="warning",
+            )
+            return
+        async with self._live_submit_lock:
+            packet = build_live_packet(plan)
+            if approval_phrase != live_approval_phrase(packet):
+                self.notify(
+                    "승인 문구가 정확히 일치하지 않아 주문을 전송하지 않았습니다.",
+                    title="LIVE ORDER BLOCKED",
+                    severity="error",
+                )
+                return
+            if (
+                not self.manual_live_orders
+                or os.environ.get(MANUAL_LIVE_ENV_KEY) != MANUAL_LIVE_ENV_VALUE
+            ):
+                self.notify(
+                    "라이브 주문 실행 옵션과 환경 게이트가 모두 필요합니다.",
+                    title="LIVE ORDER BLOCKED",
+                    severity="error",
+                )
+                return
+            if datetime.now(UTC) > plan.expires_at or self.symbol != plan.intent.symbol:
+                self.notify(
+                    "계획이 만료되었거나 종목이 변경되어 주문을 전송하지 않았습니다.",
+                    title="LIVE ORDER BLOCKED",
+                    severity="error",
+                )
+                return
+            if plan.preview_fingerprint in self._live_attempted_fingerprints:
+                self.notify(
+                    "이 주문 계획은 이미 제출을 시도했습니다. 재시도하지 않습니다.",
+                    title="LIVE ORDER BLOCKED",
+                    severity="error",
+                )
+                return
+
+            try:
+                fresh_context = await self._load_account_context(plan.intent.symbol)
+                self._revalidate_live_preview(plan, fresh_context)
+                open_page = await self._load_open_orders(
+                    plan.intent.account_seq, plan.intent.symbol
+                )
+                duplicates = find_open_order_duplicates(
+                    open_page.orders, plan.intent.symbol, plan.intent.side.value
+                )
+                if duplicates:
+                    self.notify(
+                        "같은 종목·방향의 미체결 주문이 있어 새 주문을 차단했습니다.",
+                        title="LIVE ORDER BLOCKED",
+                        severity="error",
+                    )
+                    return
+                await asyncio.to_thread(self.live_audit_log.prepare)
+                access_token = await self._load_access_token()
+            except Exception:
+                self.notify(
+                    "실행 직전 안전 점검에 실패해 주문을 전송하지 않았습니다.",
+                    title="LIVE ORDER BLOCKED",
+                    severity="error",
+                )
+                return
+
+            # Reserve before crossing the mutation boundary. Any later uncertainty is no-retry.
+            self._live_attempted_fingerprints.add(plan.preview_fingerprint)
+            try:
+                outcome, audit_records = await asyncio.to_thread(
+                    _submit_live_plan_once,
+                    plan,
+                    approval_phrase,
+                    access_token,
+                    plan.intent.account_seq,
+                    self.live_transport_factory,
+                )
+            except Exception:
+                self.notify(
+                    "제출 결과를 확인할 수 없습니다. 재시도하지 말고 주문 내역을 확인하세요.",
+                    title="LIVE ORDER AMBIGUOUS",
+                    severity="error",
+                )
+                return
+
+            audit_failed = False
+            for record in audit_records:
+                try:
+                    await asyncio.to_thread(self.live_audit_log.append, record)
+                except LiveAuditLogError:
+                    audit_failed = True
+            self.last_live_outcome = outcome
+
+            if isinstance(outcome, LiveOrderAccepted):
+                self.notify(
+                    "주문이 브로커에 접수되었습니다. 체결 완료를 의미하지 않습니다.",
+                    title="LIVE ORDER ACCEPTED",
+                    severity="information",
+                )
+            elif isinstance(outcome, LiveOrderAmbiguous):
+                self.notify(
+                    "제출 결과가 불명확합니다. 절대 재시도하지 말고 주문 내역을 확인하세요.",
+                    title="LIVE ORDER AMBIGUOUS",
+                    severity="error",
+                )
+            else:
+                self.notify(
+                    "주문이 차단되거나 거절되었습니다. 자동 재시도하지 않습니다.",
+                    title="LIVE ORDER REJECTED",
+                    severity="error",
+                )
+            if audit_failed:
+                self.notify(
+                    "감사로그 기록에 실패했습니다. 재시도하지 말고 상태를 직접 확인하세요.",
+                    title="AUDIT FAILURE",
+                    severity="error",
+                )
+
+            # Read-only reconciliation only; never reinterpret acceptance as a fill.
+            try:
+                await self._load_account_context(plan.intent.symbol)
+                await self._load_open_orders(plan.intent.account_seq, plan.intent.symbol)
+            except Exception:
+                self.notify(
+                    "접수 후 계좌/주문 재조회에 실패했습니다. 체결 여부를 직접 확인하세요.",
+                    title="RECONCILIATION",
+                    severity="warning",
+                )
 
     async def _add_watchlist_symbol(self, raw_symbol: str | None) -> None:
         if raw_symbol is None:
@@ -1482,10 +1786,19 @@ class TossMarketApp(App[int]):
         state_color = connection_state_color(self.connection_state, live)
         top = Text()
         top.append("TOSS MARKET", style="bold white")
-        top.append("   READ ONLY", style="#526273")
+        if not self.manual_live_orders:
+            top.append("   PAPER DEFAULT", style="#526273")
+        elif os.environ.get(MANUAL_LIVE_ENV_KEY) == MANUAL_LIVE_ENV_VALUE:
+            top.append("   MANUAL LIVE READY", style="#f28b82")
+        else:
+            top.append("   MANUAL LIVE BLOCKED (ENV OFF)", style="#f0ad4e")
         top.append(f"   {'●' if live else '○'} {self.connection_state}", style=state_color)
         top.append(f"   {now}", style=MUTED_COLOR)
-        self.query_one("#topbar", Static).update(top)
+        try:
+            topbar = self.query_one("#topbar", Static)
+        except NoMatches:
+            return  # timer may race with Textual teardown
+        topbar.update(top)
 
         # Compact two-line status: connection + freshness on line one, the latest
         # alert (if any) on line two. TICK/SYNC ages use monotonic time and read
@@ -1502,4 +1815,8 @@ class TossMarketApp(App[int]):
                 f"{self.latest_alert.condition} · {self.latest_alert.observed_value}",
                 style="#f0ad4e",
             )
-        self.query_one("#statusbar", Static).update(status)
+        try:
+            statusbar = self.query_one("#statusbar", Static)
+        except NoMatches:
+            return  # timer may race with Textual teardown
+        statusbar.update(status)

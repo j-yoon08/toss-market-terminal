@@ -1,3 +1,3 @@
-"""Read-only terminal client for Toss Securities market data."""
+"""Paper-default Toss market terminal with guarded manual live orders."""
 
-__version__ = "0.4.1"
+__version__ = "0.8.0"

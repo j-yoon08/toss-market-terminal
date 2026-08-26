@@ -134,6 +134,29 @@ def test_watch_and_snapshot_accept_settings_override() -> None:
     assert str(args.settings_path) == str(DEFAULT_SETTINGS_PATH)
 
 
+def test_watch_live_orders_flag_is_explicit_and_default_off() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["watch", "AAPL"]).live_orders is False
+    assert parser.parse_args(["watch", "AAPL", "--live-orders"]).live_orders is True
+
+
+def test_watch_passes_live_orders_only_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    class FakeApp:
+        def __init__(self, symbol: str, credentials: object, **kwargs: object) -> None:
+            captured.append({"symbol": symbol, "credentials": credentials, **kwargs})
+
+        def run(self) -> int:
+            return 0
+
+    monkeypatch.setattr(cli, "TossMarketApp", FakeApp)
+    assert main(["watch", "aapl"]) == 0
+    assert main(["watch", "AAPL", "--live-orders"]) == 0
+    assert captured[0]["manual_live_orders"] is False
+    assert captured[1]["manual_live_orders"] is True
+
+
 @pytest.mark.parametrize(
     ("argv", "needle"),
     [

@@ -1,15 +1,25 @@
 # Toss Market Terminal
 
-토스증권 **공식 Open API**로 관심 종목·현재가·호가·체결·캔들 차트를 보여주는 조회 전용 실시간 터미널입니다. 넓은 터미널에서는 관심 종목·호가·차트·체결을 함께 표시하고, 좁은 SSH 터미널에서는 호가·체결 중심의 compact 화면으로 전환합니다.
+토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 runtime 옵션·환경 게이트·주문별 전체 승인문구를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다.
 
-## v0.8c 주요 기능 (읽기 전용 미체결 주문 조회 — TUI/CLI 미연결)
+## v0.8.0 주요 기능 (기본 PAPER · 수동 승인 LIVE)
+
+- `toss-market watch SYMBOL`은 항상 PAPER 기본입니다. `--live-orders`와 `TOSS_ENABLE_MANUAL_LIVE_ORDERS=1` 중 하나라도 없으면 주문 POST는 실행되지 않습니다.
+- `b`/`s` 티켓에서 PAPER 미리보기를 먼저 만들고 확인한 뒤, live 옵션에서만 별도 최종 승인 모달이 열립니다. 사용자는 주문별 64자 전체 fingerprint에 묶인 문구를 직접 입력해야 합니다.
+- 제출 직전에 계좌·보유수량·매수가능금액을 다시 조회하고 risk gate를 재실행합니다. 이어 `GET /api/v1/orders?status=OPEN`으로 같은 종목·방향의 미체결 주문을 확인하며, 활성 상태 또는 알 수 없는 상태가 있으면 fail-closed로 차단합니다.
+- 안전 점검 뒤 기존 OAuth token을 just-in-time으로 재사용해 별도 동기 transport를 `asyncio.to_thread`에서 실행합니다. POST는 계획당 최대 1회이며 timeout·5xx·응답 불일치 등 모호한 결과 뒤에는 절대 자동 재시도하지 않습니다.
+- 결과는 `접수됨(accepted)`·`거절됨(rejected)`·`결과 불명확(ambiguous)`으로 구분합니다. 접수는 체결을 뜻하지 않으며, 제출 뒤 계좌와 미체결 주문을 read-only로 재조회합니다.
+- 감사로그는 `~/.local/state/toss-market-terminal/live-order-audit.jsonl`에 append-only JSONL로 저장됩니다. 디렉터리 `0700`, 파일 `0600`, symlink 차단, 동시 append 잠금·fsync를 적용하며 계좌 식별자·token·승인문구·order ID·원문 응답은 저장하지 않습니다.
+- 테스트와 개발 검증에서는 MockTransport만 사용했으며 실제 주문을 실행하지 않았습니다.
+
+## v0.8c 구현 계층 (읽기 전용 미체결 주문 조회)
 
 - `TossMarketClient.open_orders(account_seq, symbol=None)`: 계좌·(선택) 심볼별 `status=OPEN` 미체결 주문을 조회하는 GET 전용 메서드. 고정 경로 `/api/v1/orders` 하나만 허용하는 별도 allowlist(`OPEN_ORDERS_READ_ONLY_PATHS`)로 게이트되며, 계좌·시세 조회 allowlist와는 분리되어 있습니다.
 - 응답은 `nextCursor=null`, `hasNext=false`(완전히 채워진 단일 페이지)일 때만 유효한 `OpenOrdersPage`로 파싱되고, 그렇지 않으면 오류로 실패합니다.
 - `find_open_order_duplicates(orders, symbol, side)`: 같은 심볼·같은 방향의 기존 미체결 주문을 찾는 순수 조회 함수. 공식 `OrderStatus` 중 명확히 종료된 상태(`FILLED`/`CANCELED`/`REJECTED`/`REPLACED`/`CANCEL_REJECTED`/`REPLACE_REJECTED`)만 제외하고, 활성 상태나 이 클라이언트가 모르는 상태 문자열은 모두 잠재적 중복으로 fail-closed 취급합니다.
-- 이번 버전은 조회와 중복 탐지 로직만 추가하며, TUI/CLI에는 아직 연결되지 않았습니다. 실제 주문은 실행되지 않았습니다.
+- 이 계층은 v0.8.0 TUI 실행 직전 중복 주문 차단에 연결됩니다.
 
-## v0.8b 주요 기능 (동기 주문 전송 계층 — TUI/CLI 미연결)
+## v0.8b 구현 계층 (동기 주문 전송)
 
 - `order_transport` 모듈: `LiveOrderPacket`을 고정 경로 `/api/v1/orders`로 **정확히 한 번** POST하는 동기 `TossOrderTransport`. 재시도 루프가 없으며, 리다이렉트를 따르지 않습니다.
 - 자격증명 모듈을 import하지 않고 OAuth 발급을 하지 않습니다. 호출자가 **미리 발급한** 액세스 토큰과 양의 정수 `account_seq`만 생성자로 받으며, httpx 클라이언트는 기본 생성 또는 주입이 가능하고 주입된 클라이언트는 닫지 않습니다.
@@ -17,16 +27,16 @@
 - 400/401/403/404/409/422/429는 브로커 오류 `code`만 정제해 `LiveOrderTransportError`로 변환됩니다. 타임아웃·연결 실패·5xx·리다이렉트·JSON 판독 불가·응답 불일치는 원문 정보 없이 모호 실패 예외로 처리되어 절대 재제출해서는 안 됩니다.
 - 성공 응답은 `orderId`와 일치하는 `clientOrderId`가 있을 때만 `{order_id, client_order_id}`로 정제되며, repr에는 토큰·계좌 값이 노출되지 않습니다.
 
-## v0.8a 주요 기능 (수동 라이브 실행 PLAN/GATE 코어 — 미연결)
+## v0.8a 구현 계층 (수동 라이브 PLAN/GATE 코어)
 
-- `live_order` 모듈: 수동 라이브 주문의 **계획·게이트 코어**입니다. v0.8b에서 별도 transport가 추가됐지만 CLI/TUI와 executor에는 아직 연결되지 않아 앱에서 실제 주문을 시작할 수 없습니다.
+- `live_order` 모듈은 수동 라이브 주문의 **계획·게이트 코어**이며 v0.8.0에서 최종 승인 TUI와 별도 transport에 연결됩니다.
 - `create_live_plan`은 유효한 `PAPER_PREVIEW`(주문 엔드포인트 미호출·자동 재시도 없음·수동 승인 전용 플래그)만 승격하며, canonical intent 페이로드의 SHA-256 지문을 재계산해 위조된 미리보기를 거부합니다.
 - 계획은 만료 시간(기본 300초, 타임존 aware UTC 전용, 테스트용 주입 가능 시계)을 가지며 지문·안전 정책·의도 스냅샷에 묶인 불변 객체입니다.
 - 공식 페이로드는 수량 기반 필드만 허용합니다(`clientOrderId`, `symbol`, `side`, `orderType`, `quantity`, `timeInForce=DAY`, LIMIT 한정 `price`, `confirmHighValueOrder=false`). 금액 기반 필드와 알 수 없는 추가 필드는 구조적으로 존재할 수 없습니다. 클라이언트 주문 ID는 지문에서 결정적으로 파생되는 `tmt-` + 32자 hex(36자 이하)로 멱등성을 제공합니다.
-- 라이브 승인 문구는 반드시 64자 전체 지문(`CONFIRM LIVE <SIDE> <SYMBOL> <수량> <지문>`)과 정확히 일치해야 하며, 8자 접두 문구는 통과하지 않습니다. 자동 복사·자동 승인은 없습니다.
+- 라이브 승인 문구는 반드시 주문별 64자 전체 지문과 정확히 일치해야 하며, 접두 문구나 부분 지문은 통과하지 않습니다. 자동 복사·자동 승인은 없습니다.
 - 실행 게이트는 호출 시점에 전부 평가됩니다: 명시적 동의 3플래그, 정확한 승인 문구, 환경 변수 `TOSS_ENABLE_MANUAL_LIVE_ORDERS=1`(정확히 `1`, 기본값은 차단), 만료되지 않은 계획, 지문 재검증, transport 존재. 하나라도 빠지면 fail-closed로 차단되며 게이트 상태는 저장되지 않습니다.
 - 실행기는 주입된 transport를 **정확히 한 번만** 호출합니다. 재시도 루프·타임아웃 재시도가 없고, 모호한 실패 뒤에는 같은 계획을 다시 제출할 수 없으며(동시 호출도 직렬화되어 already attempted 차단), ACCEPTED는 응답이 비어 있지 않은 `order_id`와 일치하는 `client_order_id`를 담은 엄격한 응답일 때만 반환됩니다(접수 ≠ 체결).
-- 원문 브로커 응답·오류 본문은 예외·결과·감사 레코드 어디에도 보존되지 않고, 감사 레코드는 지문·클라이언트 주문 ID·방향/종목/수량·시각·상태·안전 코드만 담습니다(원문 계좌번호·토큰·승인 문구 필드 자체가 없음). 감사 레코드의 디스크 저장은 아직 없습니다.
+- 원문 브로커 응답·오류 본문은 예외·결과·감사 레코드 어디에도 보존되지 않고, 감사 레코드는 지문·클라이언트 주문 ID·방향/종목/수량·시각·상태·안전 코드만 담습니다(원문 계좌번호·토큰·승인 문구 필드 자체가 없음).
 
 ## v0.7b 주요 기능 (PAPER 주문 미리보기 티켓)
 
@@ -72,8 +82,8 @@
 
 ## 안전 경계
 
-- 기본 `TossMarketClient`에서 호출 가능한 REST 경로는 공개 시장 데이터 5개와 계좌 조회 3개(`/api/v1/accounts`, `/api/v1/holdings`, `/api/v1/buying-power`)로 고정되어 있으며, 모두 GET 전용입니다.
-- 별도 `TossOrderTransport`에는 수동 주문 생성을 위한 `POST /api/v1/orders` 하나만 존재합니다. 현재 CLI/TUI에는 연결되지 않았고 정정·취소·조건주문 경로는 없습니다.
+- 기본 `TossMarketClient`는 공개 시장 데이터 5개, 계좌 조회 3개, 미체결 주문 조회 1개(`/api/v1/orders`, GET)만 고정 allowlist로 호출합니다.
+- 별도 `TossOrderTransport`에는 수동 주문 생성을 위한 `POST /api/v1/orders` 하나만 존재합니다. TUI에서 runtime 옵션·환경 변수·전체 승인문구·fresh risk/duplicate 검사·감사로그 preflight를 모두 통과해야만 정확히 한 번 연결되며, 정정·취소·조건주문 경로는 없습니다.
 - 계좌 조회는 읽기 전용 스코프(`account_read_only`)로만 동작하며 주문 API는 호출하지 않습니다.
 - 자격증명과 액세스 토큰을 로그·설정·화면에 출력하지 않습니다.
 - 자격증명 파일이 일반 파일, 현재 사용자 소유, 정확히 `0600` 권한일 때만 실행됩니다.
@@ -174,6 +184,14 @@ uv run toss-market account 005930 --account-seq 1
 uv run toss-market watch AAPL
 uv run toss-market watch 005930
 ```
+
+위 명령은 PAPER 기본입니다. 수동 LIVE 승인 화면까지 활성화하려면 해당 실행에만 두 개의 명시적 gate를 함께 지정합니다.
+
+```bash
+TOSS_ENABLE_MANUAL_LIVE_ORDERS=1 uv run toss-market watch AAPL --live-orders
+```
+
+이 상태에서도 주문은 자동 전송되지 않습니다. `b`/`s` PAPER 티켓과 확인 단계를 완료한 다음, 별도 LIVE 모달에 표시되는 주문별 전체 승인문구를 직접 입력해야 합니다. `Esc` 취소, 문구 불일치, 계획 만료, 잔고 변화, 미체결 중복, 감사로그 preflight 실패는 모두 POST 0회로 차단됩니다.
 
 연결 검증:
 
