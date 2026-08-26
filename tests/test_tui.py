@@ -44,7 +44,7 @@ async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> No
         assert app.query_one("#trades", DataTable).max_scroll_x == 0
         assert "체결 평균" in app.query_one("#market-stats", Static).render().plain
         assert not app.screen.has_class("compact")
-        await pilot.press("d")
+        await pilot.press("5")
         await pilot.pause()
         assert (
             app.query_one("#chart-panel .panel-title", Static).render().plain
@@ -532,7 +532,7 @@ async def test_chart_mode_bindings_switch_title_and_content_without_fetching(
         await pilot.pause()
         assert app.client is None
         assert app.chart_mode == "1m"
-        for key, mode in (("5", "5m"), ("i", "15m"), ("h", "1h"), ("d", "1d"), ("1", "1m")):
+        for key, mode in (("2", "5m"), ("3", "15m"), ("4", "1h"), ("5", "1d"), ("1", "1m")):
             await pilot.press(key)
             await pilot.pause()
             assert app.chart_mode == mode
@@ -635,7 +635,7 @@ async def test_market_stats_indicator_section_updates_per_timeframe(tmp_path: Pa
     )
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
-        for key, mode in (("5", "5m"), ("i", "15m"), ("h", "1h"), ("d", "1d"), ("1", "1m")):
+        for key, mode in (("2", "5m"), ("3", "15m"), ("4", "1h"), ("5", "1d"), ("1", "1m")):
             await pilot.press(key)
             await pilot.pause()
             stats = app.query_one("#market-stats", Static).render().plain
@@ -649,7 +649,7 @@ async def test_market_stats_indicator_section_updates_per_timeframe(tmp_path: Pa
             for word in _NO_ADVICE_WORDS:
                 assert word not in stats
         # Daily mode never fabricates a session VWAP.
-        await pilot.press("d")
+        await pilot.press("5")
         await pilot.pause()
         assert "VWAP 데이터 부족" in app.query_one("#market-stats", Static).render().plain
 
