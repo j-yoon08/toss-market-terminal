@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from statistics import median
 
-from rich.cells import set_cell_size
+from rich.cells import cell_len, set_cell_size
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
@@ -27,6 +27,9 @@ SPARK_CHARS = "▁▂▃▄▅▆▇█"
 UP_COLOR = "#2dd4bf"
 DOWN_COLOR = "#fb7185"
 MUTED_COLOR = "#7d8998"
+CURRENT_PRICE_COLOR = "#f2c14e"
+CURRENT_PRICE_DASH = "─"
+PREVIOUS_CLOSE_DASH = "·"
 
 CHART_MODE_LABELS = {
     "1m": "1 MINUTE",
@@ -44,8 +47,9 @@ TIMEFRAME_LABELS_KO = {
 }
 _CHART_MAX_ECHO = 32
 _MIN_CHART_DIMENSION = 1
-_CHART_CHROME_LINES = 3  # summary line, blank separator, "VOLUME" header
+_CHART_CHROME_LINES = 3  # blank separator, "VOLUME" header, bottom time axis
 _PRICE_ROW_RATIO = 0.7
+_MIN_WIDTH_FOR_PRICE_AXIS = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,15 +625,42 @@ def _price_row(value: Decimal, low: Decimal, span: Decimal, rows: int) -> int:
     return max(0, min(rows - 1, row_from_top))
 
 
-def _candlestick_grid(buckets: Sequence[Candle], rows: int) -> list[Text]:
-    lines = [Text() for _ in range(rows)]
-    if not buckets or rows <= 0:
-        return lines
-    low = min(candle.low_price for candle in buckets)
-    high = max(candle.high_price for candle in buckets)
+def _price_bounds(candles: Sequence[Candle]) -> tuple[Decimal, Decimal, Decimal]:
+    """Low/high/span across ``candles``, with a span floor to keep row math defined.
+
+    Invariant under :func:`downsample_candles`: a bucket's low/high are the
+    extremes of its members, so this returns the same low/high whether called
+    on the full chronological series or on its downsampled buckets.
+    """
+    low = min(candle.low_price for candle in candles)
+    high = max(candle.high_price for candle in candles)
     span = high - low
     if span <= 0:
         span = Decimal("1")
+    return low, high, span
+
+
+def _candlestick_grid(
+    buckets: Sequence[Candle],
+    rows: int,
+    *,
+    scale: tuple[Decimal, Decimal, Decimal] | None = None,
+    current_price_row: int | None = None,
+    previous_close_row: int | None = None,
+) -> list[Text]:
+    """Candlestick body/wick grid, optionally overlaid with reference-price dashes.
+
+    ``current_price_row``/``previous_close_row`` (row indices from the same
+    price scale used to build ``buckets``' rows) only fill in cells that are
+    otherwise blank -- a candle's body/wick always wins so the reference
+    lines read as a line *behind* the candles, never over them. ``scale`` is
+    the ``(low, high, span)`` triple shared with the caller's row math; when
+    omitted it is derived from ``buckets`` alone.
+    """
+    lines = [Text() for _ in range(rows)]
+    if not buckets or rows <= 0:
+        return lines
+    low, _high, span = scale if scale is not None else _price_bounds(buckets)
     for candle in buckets:
         style = UP_COLOR if candle.close_price >= candle.open_price else DOWN_COLOR
         top_row = _price_row(candle.high_price, low, span, rows)
@@ -638,13 +669,60 @@ def _candlestick_grid(buckets: Sequence[Candle], rows: int) -> list[Text]:
         body_bottom_row = _price_row(min(candle.open_price, candle.close_price), low, span, rows)
         for row in range(rows):
             if body_top_row <= row <= body_bottom_row:
-                char = "█"
+                lines[row].append("█", style=style)
             elif top_row <= row <= bottom_row:
-                char = "│"
+                lines[row].append("│", style=style)
+            elif row == current_price_row:
+                lines[row].append(CURRENT_PRICE_DASH, style=CURRENT_PRICE_COLOR)
+            elif row == previous_close_row:
+                lines[row].append(PREVIOUS_CLOSE_DASH, style=MUTED_COLOR)
             else:
-                char = " "
-            lines[row].append(char, style=style if char != " " else None)
+                lines[row].append(" ")
     return lines
+
+
+def _axis_label_width(labels: Sequence[str]) -> int:
+    """One leading space plus the widest label, in display cells."""
+    widest = max((cell_len(text) for text in labels), default=0)
+    return widest + 1
+
+
+def _axis_suffix(label: str, width: int) -> str:
+    return set_cell_size(f" {label}", width)
+
+
+def _format_axis_time(timestamp: str, mode: str) -> str:
+    """Compact bottom-axis time label: ``MM/DD`` for daily, ``HH:MM`` otherwise."""
+    parsed = _parse_timestamp(timestamp)
+    if parsed is None:
+        return ""
+    return parsed.strftime("%m/%d") if mode == "1d" else parsed.strftime("%H:%M")
+
+
+def _time_axis_line(buckets: Sequence[Candle], mode: str) -> str:
+    """Bottom time axis: up to three non-overlapping labels (left/mid/right column)."""
+    columns = len(buckets)
+    if columns == 0:
+        return ""
+    cells = [" "] * columns
+    placed: list[tuple[int, int]] = []
+    for index in sorted({0, (columns - 1) // 2, columns - 1}):
+        text = _format_axis_time(buckets[index].timestamp, mode)
+        if not text:
+            continue
+        if index == 0:
+            start = 0
+        elif index == columns - 1:
+            start = max(0, columns - len(text))
+        else:
+            start = max(0, min(columns - len(text), index - len(text) // 2))
+        end = min(columns, start + len(text))
+        text = text[: end - start]
+        if any(start < prev_end and end > prev_start for prev_start, prev_end in placed):
+            continue
+        cells[start:end] = list(text)
+        placed.append((start, end))
+    return "".join(cells)
 
 
 def _volume_grid(buckets: Sequence[Candle], rows: int) -> list[Text]:
@@ -678,6 +756,9 @@ def chart_renderable(
     mode: str = "1m",
     width: int = 48,
     height: int = 18,
+    *,
+    current_price: Decimal | None = None,
+    previous_close: Decimal | None = None,
 ) -> Text:
     """Render a candlestick + volume chart for ``mode`` as pure Rich ``Text``.
 
@@ -685,11 +766,25 @@ def chart_renderable(
     ``snapshot.daily_candles`` as-is; ``5m``, ``15m``, and ``1h`` aggregate
     ``snapshot.candles`` via :func:`toss_market_terminal.indicators.aggregate_candles`.
     Candles render chronologically, oldest on the left and newest on the
-    right; when more candles exist than fit in ``width`` columns they are
+    right; when more candles exist than fit in the price columns they are
     downsampled via :func:`downsample_candles` (not close-only sampling).
     Every plain line stays within ``cell_len(line) <= width`` and the line
     count stays within ``height``; ``width``/``height`` below 1 are clamped
     up to 1. Raises ``ValueError`` for an unsupported ``mode``.
+
+    A bounded right-side price axis shows the visible high/low plus, when
+    room allows, a bold ``current_price`` line/label and a subtler
+    ``previous_close`` line/label. Candles, reference lines, and axis labels
+    share one price scale that includes ``current_price`` when it falls
+    outside the candle high/low, so an above-high or below-low current price
+    renders truthfully instead of clamping onto a boundary. A
+    ``previous_close`` outside the represented range is omitted rather than
+    clamped. With no ``current_price`` the latest candle's close is used
+    instead, and with no ``previous_close`` (or one that lands on the same
+    row as the current price) no previous-close line is drawn. A narrow
+    ``width`` disables the price axis entirely rather than starve the candle
+    columns. When enough rows are available, a bottom time axis labels the
+    leftmost/middle/rightmost rendered candles.
     """
     source = select_chart_candles(snapshot, mode)
     chart_width = max(_MIN_CHART_DIMENSION, int(width))
@@ -704,7 +799,29 @@ def chart_renderable(
         lines.append(Text(set_cell_size("데이터 없음", chart_width), style=MUTED_COLOR))
         return _join_lines(lines[:chart_height])
 
-    buckets = downsample_candles(chronological, chart_width)
+    resolved_current_price = (
+        current_price if current_price is not None else chronological[-1].close_price
+    )
+    low, high, span = _price_bounds(chronological)
+    if current_price is not None:
+        if current_price > high:
+            high = current_price
+        elif current_price < low:
+            low = current_price
+        span = max(high - low, Decimal("1"))
+
+    axis_labels = [
+        format_decimal(high, currency),
+        format_decimal(low, currency),
+        format_decimal(resolved_current_price, currency),
+    ]
+    if previous_close is not None:
+        axis_labels.append(format_decimal(previous_close, currency))
+    axis_width = _axis_label_width(axis_labels)
+    show_axis = chart_width >= _MIN_WIDTH_FOR_PRICE_AXIS and axis_width < chart_width - 3
+    candle_width = chart_width - axis_width if show_axis else chart_width
+
+    buckets = downsample_candles(chronological, candle_width)
 
     remaining = max(0, chart_height - 1)
     price_rows = 0
@@ -718,19 +835,56 @@ def chart_renderable(
     elif remaining > 0:
         price_rows = remaining
 
-    lines.extend(_candlestick_grid(buckets, price_rows))
+    current_price_row = (
+        _price_row(resolved_current_price, low, span, price_rows) if price_rows else None
+    )
+    previous_close_row = None
+    if price_rows and previous_close is not None and low <= previous_close <= high:
+        candidate_row = _price_row(previous_close, low, span, price_rows)
+        if candidate_row != current_price_row:
+            previous_close_row = candidate_row
+
+    price_grid = _candlestick_grid(
+        buckets,
+        price_rows,
+        scale=(low, high, span),
+        current_price_row=current_price_row,
+        previous_close_row=previous_close_row,
+    )
+    if show_axis and price_rows:
+        axis_rows: dict[int, tuple[str, str]] = {
+            0: (format_decimal(high, currency), MUTED_COLOR),
+            price_rows - 1: (format_decimal(low, currency), MUTED_COLOR),
+        }
+        if previous_close_row is not None and previous_close is not None:
+            axis_rows[previous_close_row] = (
+                format_decimal(previous_close, currency),
+                MUTED_COLOR,
+            )
+        if current_price_row is not None:
+            axis_rows[current_price_row] = (
+                format_decimal(resolved_current_price, currency),
+                CURRENT_PRICE_COLOR,
+            )
+        for row_index, row_text in enumerate(price_grid):
+            row_label = axis_rows.get(row_index)
+            if row_label is not None:
+                suffix_text, suffix_style = row_label
+                row_text.append(_axis_suffix(suffix_text, axis_width), style=suffix_style)
+            else:
+                row_text.append(" " * axis_width)
+    lines.extend(price_grid)
+
     if include_chrome:
-        low_price = min(candle.low_price for candle in buckets)
-        high_price = max(candle.high_price for candle in buckets)
-        summary = set_cell_size(
-            f"LOW {format_decimal(low_price, currency)}   "
-            f"HIGH {format_decimal(high_price, currency)}",
-            chart_width,
-        )
-        lines.append(Text(summary, style=MUTED_COLOR))
         lines.append(Text())
         lines.append(Text(set_cell_size("VOLUME", chart_width), style="bold #c9d1d9"))
-        lines.extend(_volume_grid(buckets, volume_rows))
+        volume_grid = _volume_grid(buckets, volume_rows)
+        if show_axis:
+            for row_text in volume_grid:
+                row_text.append(" " * axis_width)
+        lines.extend(volume_grid)
+        time_axis = _time_axis_line(buckets, mode)
+        lines.append(Text(set_cell_size(time_axis, chart_width), style=MUTED_COLOR))
     return _join_lines(lines)
 
 

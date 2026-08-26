@@ -19,7 +19,11 @@ from toss_market_terminal.indicators import (
 from toss_market_terminal.models import Candle, Orderbook, OrderbookEntry, Trade
 from toss_market_terminal.render import (
     CHART_MODE_LABELS,
+    CURRENT_PRICE_COLOR,
+    CURRENT_PRICE_DASH,
     DOWN_COLOR,
+    MUTED_COLOR,
+    PREVIOUS_CLOSE_DASH,
     UP_COLOR,
     NearestLevel,
     _candlestick_grid,
@@ -367,6 +371,163 @@ def test_chart_renderable_handles_empty_flat_and_zero_volume_without_crashing() 
     chart = chart_renderable(one_candle, "1m", width=20, height=12)
     for line in chart.plain.splitlines():
         assert cell_len(line) <= 20
+
+
+# --- price axis, current-price line, previous-close line, time axis -------
+
+
+def test_candlestick_grid_overlays_reference_lines_only_on_blank_cells() -> None:
+    # Column 0's wick/body spans the full row range; column 1's is narrow, leaving
+    # rows 0-1 blank there for the reference dashes to show through.
+    wide = _candle("t1", "102", "110", "100", "108", "10")
+    narrow = _candle("t2", "103", "104", "101", "102", "10")
+    grid = _candlestick_grid((wide, narrow), rows=5, current_price_row=0, previous_close_row=1)
+    row0, row1 = grid[0], grid[1]
+
+    assert row0.plain[0] in ("│", "█")
+    assert _style_at(row0, 0) == UP_COLOR  # candle glyph always wins over the overlay
+
+    assert row0.plain[1] == CURRENT_PRICE_DASH
+    assert _style_at(row0, 1) == CURRENT_PRICE_COLOR
+    assert row1.plain[1] == PREVIOUS_CLOSE_DASH
+    assert _style_at(row1, 1) == MUTED_COLOR
+
+
+def test_chart_renderable_price_axis_shows_current_price_label() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    chart = chart_renderable(snapshot, "1m", width=48, height=18, current_price=Decimal("135"))
+    assert "135" in chart.plain
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_narrow_width_disables_price_axis() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    narrow = chart_renderable(snapshot, "1m", width=10, height=18, current_price=Decimal("135"))
+    wide = chart_renderable(snapshot, "1m", width=48, height=18, current_price=Decimal("135"))
+    # Below the axis width threshold the whole 10 columns go to candles (matches the
+    # pre-axis behavior); at 48 columns some width is reserved for axis labels.
+    narrow_price_line = narrow.plain.splitlines()[1]
+    wide_price_line = wide.plain.splitlines()[1]
+    assert cell_len(narrow_price_line) == 10
+    assert cell_len(wide_price_line) < 48
+    for line in narrow.plain.splitlines():
+        assert cell_len(line) <= 10
+
+
+def test_chart_renderable_previous_close_line_only_when_row_distinct() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+
+    far = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("129"),
+        previous_close=Decimal("100"),
+    )
+    far_price_rows = far.plain.splitlines()[1:11]
+    assert any(PREVIOUS_CLOSE_DASH in row for row in far_price_rows)
+
+    same_row = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("129"),
+        previous_close=Decimal("129"),
+    )
+    same_row_price_rows = same_row.plain.splitlines()[1:11]
+    assert not any(PREVIOUS_CLOSE_DASH in row for row in same_row_price_rows)
+
+    unavailable = chart_renderable(
+        snapshot, "1m", width=48, height=18, current_price=Decimal("129")
+    )
+    unavailable_price_rows = unavailable.plain.splitlines()[1:11]
+    assert not any(PREVIOUS_CLOSE_DASH in row for row in unavailable_price_rows)
+
+
+def test_chart_renderable_time_axis_shows_leftmost_and_rightmost_labels() -> None:
+    chronological = tuple(
+        _candle(f"2026-01-05T09:{i:02d}:00Z", "100", "101", "99", "100", "10") for i in range(40)
+    )
+    snapshot = replace(sample_snapshot(), candles=tuple(reversed(chronological)))
+    chart = chart_renderable(snapshot, "1m", width=48, height=18)
+    last_line = chart.plain.splitlines()[-1]
+    assert "09:00" in last_line
+    assert "09:39" in last_line
+    assert cell_len(last_line) <= 48
+
+
+def test_chart_renderable_time_axis_uses_month_day_for_daily_mode() -> None:
+    chronological = tuple(
+        _candle(f"2026-01-{i + 1:02d}T09:30:00-04:00", "100", "101", "99", "100", "10")
+        for i in range(20)
+    )
+    snapshot = replace(sample_snapshot(), daily_candles=tuple(reversed(chronological)))
+    chart = chart_renderable(snapshot, "1d", width=48, height=18)
+    last_line = chart.plain.splitlines()[-1]
+    assert "01/01" in last_line
+    assert "01/20" in last_line
+
+
+def test_chart_renderable_time_axis_absent_when_height_too_short_for_chrome() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    chart = chart_renderable(snapshot, "1m", width=48, height=5)
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_current_price_above_high_shares_truthful_scale() -> None:
+    chronological = tuple(
+        _candle(f"2026-01-05T09:{i:02d}:00Z", "100", "101", "99", "100", "10") for i in range(40)
+    )
+    snapshot = replace(sample_snapshot(), candles=tuple(reversed(chronological)))
+    chart = chart_renderable(snapshot, "1m", width=48, height=18, current_price=Decimal("120"))
+    price_rows = chart.plain.splitlines()[1:11]
+    # The current-price dash renders once, at its true off-chart level, instead
+    # of being clamped onto the candle-extreme rows (where candles win blanks).
+    current_rows = [row for row in price_rows if CURRENT_PRICE_DASH in row]
+    assert len(current_rows) == 1
+    # Candles, the reference line, and the axis labels share one scale whose
+    # maximum is the current price: 120 labels the top row/current line and
+    # the former candle-high label 101 is gone.
+    assert "120" in current_rows[0]
+    assert "120" in price_rows[0]
+    assert "101" not in chart.plain
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_omits_previous_close_outside_represented_range() -> None:
+    chronological = tuple(
+        _candle(f"2026-01-05T09:{i:02d}:00Z", "100", "101", "99", "100", "10") for i in range(40)
+    )
+    snapshot = replace(sample_snapshot(), candles=tuple(reversed(chronological)))
+    outside = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("100"),
+        previous_close=Decimal("50"),
+    )
+    outside_price_rows = outside.plain.splitlines()[1:11]
+    # 50 is below every represented price: no clamped dash or label.
+    assert not any(PREVIOUS_CLOSE_DASH in row for row in outside_price_rows)
+    assert "50" not in outside.plain
+
+    inside = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("100"),
+        previous_close=Decimal("99.5"),
+    )
+    # Every candle wick spans the full price range, so the dotted line is
+    # occluded by candle glyphs; the truthful in-range axis label must remain.
+    assert "99.5" in inside.plain
 
 
 # --- select_chart_candles / chart_indicators -----------------------------
