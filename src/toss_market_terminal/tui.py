@@ -1269,6 +1269,13 @@ class TossMarketApp(App[int]):
         if target != self.symbol:
             await self.switch_symbol(target)
 
+    async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Route the watchlist table's consumed Enter key to symbol selection."""
+        if event.data_table.id != "watchlist":
+            return
+        event.stop()
+        await self.action_watch_select()
+
     async def switch_symbol(self, target: str) -> None:
         """Switch active symbol after fully stopping the previous stream."""
         normalized = normalize_symbol(target)

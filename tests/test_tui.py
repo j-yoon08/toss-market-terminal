@@ -21,7 +21,7 @@ from toss_market_terminal.render import (
 from toss_market_terminal.render import chart_indicator_base as real_chart_indicator_base
 from toss_market_terminal.settings import AlertRule, Settings, SettingsStore
 from toss_market_terminal.stream import OrderbookEvent, StreamStatus, TradeEvent
-from toss_market_terminal.tui import TossMarketApp
+from toss_market_terminal.tui import TossMarketApp, WatchlistAddScreen
 
 
 async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> None:
@@ -359,7 +359,9 @@ async def test_live_picker_starts_without_active_symbol_then_selects_watchlist_r
         assert table.get_cell_at(Coordinate(0, 0)) == ">AAPL"
 
 
-async def test_live_picker_adds_symbol_without_auto_selecting_it(tmp_path: Path) -> None:
+async def test_live_picker_add_modal_enter_then_table_enter_selects_symbol(
+    tmp_path: Path,
+) -> None:
     settings_path = tmp_path / "settings.json"
     store = SettingsStore(settings_path)
     store.save(Settings())
@@ -374,14 +376,19 @@ async def test_live_picker_adds_symbol_without_auto_selecting_it(tmp_path: Path)
 
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
-        await app._add_watchlist_symbol("nvda")
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, WatchlistAddScreen)
+        app.screen.query_one("#watchlist-add-input", Input).value = "nvda"
+
+        await pilot.press("enter")
         await pilot.pause()
         table = app.query_one("#watchlist", DataTable)
         assert store.load().watchlist == ("NVDA",)
         assert app.symbol == ""
         assert table.get_cell_at(Coordinate(0, 0)) == " NVDA"
 
-        await app.action_watch_select()
+        await pilot.press("enter")
         await pilot.pause()
         assert app.symbol == "NVDA"
         assert table.get_cell_at(Coordinate(0, 0)) == ">NVDA"
