@@ -105,6 +105,26 @@ def test_concurrent_appends_keep_one_valid_object_per_line(tmp_path: Path) -> No
     assert len({row["fingerprint"] for row in rows}) == 32
 
 
+def test_concurrent_first_appends_from_distinct_instances_are_safe(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "audit.jsonl"
+
+    def append_one(index: int) -> None:
+        LiveAuditLog(path).append(
+            record(
+                fingerprint=f"{index:064x}",
+                client_order_id="tmt-" + f"{index:032x}",
+                side="BUY" if index % 2 == 0 else "SELL",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(append_one, range(32)))
+
+    rows = read_rows(path)
+    assert len(rows) == 32
+    assert len({row["fingerprint"] for row in rows}) == 32
+
+
 def test_final_symlink_is_rejected_without_touching_target(tmp_path: Path) -> None:
     leaf = tmp_path / "state"
     leaf.mkdir(mode=0o700)
