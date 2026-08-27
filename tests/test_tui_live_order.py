@@ -23,7 +23,7 @@ from toss_market_terminal.live_order import (
     create_live_plan,
     live_approval_phrase,
 )
-from toss_market_terminal.live_ticket import REVIEW_ARM_SECONDS, LiveApprovalScreen
+from toss_market_terminal.live_ticket import LiveApprovalScreen
 from toss_market_terminal.models import BuyingPower, OpenOrder, OpenOrdersPage
 from toss_market_terminal.order_preview import OrderSide, OrderType, build_preview
 from toss_market_terminal.tui import TossMarketApp
@@ -484,17 +484,36 @@ async def test_repeated_early_enter_stays_blocked_until_review_cooldown(
     results: list[str | None] = []
 
     async with app.run_test(size=(90, 30)) as pilot:
+        monkeypatch.setattr("toss_market_terminal.live_ticket.REVIEW_ARM_SECONDS", 60.0)
         screen = LiveApprovalScreen(current_plan)
         app.push_screen(screen, results.append)
-        await pilot.pause(REVIEW_ARM_SECONDS / 2)
+        await pilot.pause()
+        assert screen._arm_timer is not None
+        screen._arm_timer.stop()
+
+        class ResetCounter:
+            resets = 0
+
+            def reset(self) -> None:
+                self.resets += 1
+
+            def stop(self) -> None:
+                pass
+
+        counter = ResetCounter()
+        screen._arm_timer = counter  # type: ignore[assignment]
         await pilot.press("enter")
         await pilot.press("enter")
-        await pilot.pause(REVIEW_ARM_SECONDS / 2 + 0.05)
+        await pilot.pause()
         assert app.screen is screen
         assert results == []
         assert screen._finished is False
         assert screen._armed is False
-        await pilot.pause(REVIEW_ARM_SECONDS + 0.25)
+        assert counter.resets == 2
+
+        # Trigger the same callback the cooldown timer would invoke, then require
+        # a new Enter. This avoids wall-clock flakes under a loaded full suite.
+        screen._arm_after_review()
         assert screen._armed is True
         await pilot.press("enter")
         await pilot.pause()

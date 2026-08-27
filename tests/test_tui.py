@@ -50,7 +50,7 @@ async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> No
         assert "MARKET CHART" in app.query_one("#chart-panel .panel-title", Static).render().plain
         assert app.query_one("#trades-panel .panel-title", Static).render().plain == "LIVE TRADES"
         assert app.query_one("#trades", DataTable).max_scroll_x == 0
-        assert "체결 평균" in app.query_one("#market-stats", Static).render().plain
+        assert "시장 해석" in app.query_one("#market-stats", Static).render().plain
         assert not app.screen.has_class("compact")
         widths = {
             panel: app.query_one(f"#{panel}-panel").size.width
@@ -450,7 +450,7 @@ def test_app_binding_keys_are_unique_and_include_watchlist_add() -> None:
     assert "a" in keys
     assert "question_mark" in keys
     visible = {binding.key for binding in TossMarketApp.BINDINGS if binding.show}
-    assert {"q", "r", "a", "1", "c", "question_mark"} <= visible
+    assert {"q", "r", "a", "1", "c", "i", "question_mark"} <= visible
     assert {"up", "down", "j", "k", "enter"}.isdisjoint(visible)
 
 
@@ -467,6 +467,7 @@ async def test_help_modal_opens_and_closes_at_compact_size(tmp_path: Path) -> No
         await pilot.pause()
         body = app.screen.query_one("#help-body", Static).render().plain
         assert "1분/5분/15분/1시간/일봉" in body
+        assert "시장 신호 해석 보기" in body
         assert "관심 목록 이동" in body
         assert app.screen.query_one("#help-dialog").size.height <= 30
         await pilot.press("question_mark")
@@ -750,14 +751,13 @@ async def test_tui_emits_one_edge_alert_and_renders_market_signals(
         monkeypatch.setattr(app, "notify", capture_notification)
         monkeypatch.setattr(app, "bell", capture_bell)
         stats = app.query_one("#market-stats", Static).render().plain
-        assert "시장 신호 요약" in stats
-        assert "매수·매도 호가 차이" in stats
-        assert "체결 평균" in stats
+        assert "시장 해석" in stats
+        assert "차이" in stats
         assert "호가 매도 우세" in stats
         assert "잔량비" in stats
         assert "체결 상승 우세" in stats
-        assert "1분 거래량" in stats
-        assert "공개 시세 · 조회 전용" in stats
+        assert "1분량" in stats
+        assert "공개 시세 · 관찰 전용" in stats
         assert "BOOK " not in stats
         assert "TICKS " not in stats
 
@@ -901,7 +901,7 @@ async def test_market_stats_indicator_section_updates_per_timeframe(tmp_path: Pa
             await pilot.press(key)
             await pilot.pause()
             stats = app.query_one("#market-stats", Static).render().plain
-            assert f"{TIMEFRAME_LABELS_KO[mode]} 지표" in stats
+            assert f"시장 해석 · {TIMEFRAME_LABELS_KO[mode]}" in stats
             assert "EMA9/21" in stats
             assert "RSI" in stats
             assert "거래량" in stats
@@ -1031,9 +1031,9 @@ async def test_render_stats_survives_malformed_candle_timestamp_at_mount(
         assert "2026-08-25T10:00:00" not in app.connection_detail
         stats = app.query_one("#market-stats", Static).render().plain
         # Base stats (computed from metrics/signals, not chart indicators) still render.
-        assert "시장 신호 요약" in stats
-        assert "매수·매도 호가 차이" in stats
-        assert "지표 계산 불가" in stats
+        assert "시장 해석" in stats
+        assert "호가" in stats
+        assert "지표 계산 실패" in stats
         assert "2026-08-25T10:00:00" not in stats
 
 
@@ -1116,8 +1116,8 @@ async def test_render_stats_survives_candle_currency_mismatch(tmp_path: Path) ->
         assert app.connection_detail == "ValueError: 지표 계산 실패"
         assert "KRW" not in app.connection_detail
         stats = app.query_one("#market-stats", Static).render().plain
-        assert "시장 신호 요약" in stats
-        assert "지표 계산 불가" in stats
+        assert "시장 해석" in stats
+        assert "지표 계산 실패" in stats
 
 
 # --- chart indicator caching (finding 2) ------------------------------------

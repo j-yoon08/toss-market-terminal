@@ -12,6 +12,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from . import __version__
 from .api_session_lock import DEFAULT_LOCK_PATH, ApiSessionLock, ApiSessionLockError
 from .client import TossApiError, TossMarketClient
 from .config import DEFAULT_CREDENTIALS_PATH, CredentialError, Credentials
@@ -205,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="toss-market",
         description="토스증권 공식 Open API 기반 PAPER 기본 실시간 주식 터미널",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--credentials",

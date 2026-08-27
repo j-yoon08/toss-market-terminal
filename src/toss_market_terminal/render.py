@@ -463,6 +463,7 @@ class ChartIndicators:
     ema_short: Decimal | None
     ema_long: Decimal | None
     rsi: Decimal | None
+    rsi_previous: Decimal | None
     relative_volume: Decimal | None
     vwap: Decimal | None
     levels: NearestLevels
@@ -475,7 +476,7 @@ class ChartIndicatorBase:
     Depends only on ``(snapshot, mode)``, never on a live current price, so
     callers that re-render on every trade/orderbook tick (see
     :class:`toss_market_terminal.tui.TossMarketApp`) can cache one instance
-    per ``(snapshot identity, mode)`` pair and cheaply re-derive
+    per ``(snapshot identity, chart_mode)`` pair and cheaply re-derive
     :class:`ChartIndicators` per tick via :func:`chart_indicators_from_base`
     instead of repeating the full EMA/RSI/VWAP/pivot computation each time.
     """
@@ -484,6 +485,7 @@ class ChartIndicatorBase:
     ema_short: Decimal | None
     ema_long: Decimal | None
     rsi: Decimal | None
+    rsi_previous: Decimal | None
     relative_volume: Decimal | None
     vwap: Decimal | None
     levels: SupportResistance
@@ -512,6 +514,7 @@ def chart_indicator_base(snapshot: MarketSnapshot, mode: str) -> ChartIndicatorB
         ema_short=ema_short_series[0] if ema_short_series else None,
         ema_long=ema_long_series[0] if ema_long_series else None,
         rsi=rsi_values[0] if rsi_values else None,
+        rsi_previous=rsi_values[1] if len(rsi_values) > 1 else None,
         relative_volume=relative_volume(candles),
         vwap=vwap,
         levels=levels,
@@ -530,6 +533,7 @@ def chart_indicators_from_base(base: ChartIndicatorBase, current_price: Decimal)
         ema_short=base.ema_short,
         ema_long=base.ema_long,
         rsi=base.rsi,
+        rsi_previous=base.rsi_previous,
         relative_volume=base.relative_volume,
         vwap=base.vwap,
         levels=nearest_support_resistance(base.levels, current_price),

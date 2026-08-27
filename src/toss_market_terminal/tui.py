@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import ClassVar, Literal
 from zoneinfo import ZoneInfo
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Static
@@ -24,6 +25,12 @@ from textual.widgets import DataTable, Footer, Input, Static
 from .alerts import AlertEvaluator, AlertEvent
 from .client import TossApiError, TossMarketClient
 from .config import CredentialError, Credentials
+from .interpretation import (
+    MarketInterpretation,
+    build_market_interpretation,
+    interpret_timeframe,
+    interpretation_explanation,
+)
 from .live_audit import LiveAuditLog, LiveAuditLogError
 from .live_chart import apply_trade_to_candles
 from .live_order import (
@@ -85,7 +92,6 @@ from .render import (
     format_percent,
     format_signed,
     format_trade_time,
-    level_display_ko,
     market_metrics,
     market_signals,
     orderbook_signal_label_ko,
@@ -279,6 +285,7 @@ HELP_LINES = (
     ("s", "PAPER 매도 미리보기(주문 전송 없음)"),
     ("1 2 3 4 5", "1분/5분/15분/1시간/일봉"),
     ("c", "차트 포커스 전환"),
+    ("i", "시장 신호 해석 보기"),
     ("↑ ↓ / j k", "관심 목록 이동"),
     ("Enter", "선택한 종목으로 전환"),
     ("?", "도움말 열기/닫기"),
@@ -333,6 +340,139 @@ class HelpScreen(ModalScreen[None]):
         """모달 격리용 no-op. 어떤 상태도 바꾸지 않는다."""
 
 
+def _bounded_cells(value: str, width: int = 52) -> str:
+    """Truncate by terminal display cells, not Python code-point length."""
+    if cell_len(value) <= width:
+        return value
+    text = value
+    while text and cell_len(text + "…") > width:
+        text = text[:-1]
+    return text + "…"
+
+
+def interpretation_detail_text(analysis: MarketInterpretation) -> str:
+    selected = analysis.selected
+    quality_label = {
+        "fresh": "최신",
+        "stale": "신선도 저하",
+        "insufficient": "부족",
+    }[selected.data_quality]
+    lines = [
+        f"{selected.label} · {selected.headline} · 신뢰도 {selected.confidence}",
+        f"데이터 상태 · {quality_label}",
+        "",
+        "해석",
+        interpretation_explanation(selected),
+        "",
+        "근거",
+    ]
+    lines.extend(f"• {item}" for item in selected.evidence)
+    if not selected.evidence:
+        lines.append("• 방향을 설명할 지표 데이터가 부족함")
+    lines.extend(("", "반대 신호와 주의"))
+    lines.extend(f"• {item}" for item in selected.risks)
+    if not selected.risks:
+        lines.append("• 현재 데이터에서 확인된 주요 반대 신호 없음")
+    lines.extend(("", "조건별 관찰"))
+    lines.append(
+        f"• {selected.upside_scenario}" if selected.upside_scenario else "• 저항 가격대 데이터 부족"
+    )
+    lines.append(
+        f"• {selected.downside_scenario}"
+        if selected.downside_scenario
+        else "• 지지 가격대 데이터 부족"
+    )
+    lines.extend(("", "시간대별 흐름"))
+    lines.extend(
+        f"• {item.label:<3} {item.headline} · 신뢰도 {item.confidence}"
+        for item in analysis.timeframes
+    )
+    lines.extend(
+        ("", analysis.alignment, "", "열기 시점의 공개 시세 기반 · 관찰 전용 · 실행 권고 아님")
+    )
+    return "\n".join(lines)
+
+
+class MarketInterpretationScreen(ModalScreen[None]):
+    BINDINGS: ClassVar = [
+        Binding("escape", "close", "닫기"),
+        Binding("i", "close", "닫기"),
+        Binding("up,k", "scroll_up", "위", show=False),
+        Binding("down,j", "scroll_down", "아래", show=False),
+        Binding(
+            "q,r,p,a,b,s,1,2,3,4,5,c,enter,question_mark",
+            "noop",
+            "",
+            show=False,
+        ),
+    ]
+    CSS = """
+    MarketInterpretationScreen {
+        align: center middle;
+        background: rgba(4, 7, 10, 0.78);
+    }
+    #interpretation-dialog {
+        width: 92%;
+        max-width: 96;
+        height: 94%;
+        max-height: 40;
+        padding: 1 2;
+        border: solid #607080;
+        background: #0d131a;
+    }
+    #interpretation-title {
+        height: 2;
+        color: #d9e1e8;
+        text-style: bold;
+    }
+    #interpretation-scroll {
+        height: 1fr;
+        scrollbar-background: #0d131a;
+        scrollbar-color: #3a4654;
+    }
+    #interpretation-body {
+        color: #aab7c4;
+    }
+    #interpretation-footer {
+        height: 1;
+        color: #526273;
+    }
+    """
+
+    def __init__(self, analysis: MarketInterpretation) -> None:
+        super().__init__()
+        self.analysis = analysis
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="interpretation-dialog"):
+            yield Static("시장 신호 상세 해석", id="interpretation-title", markup=False)
+            with VerticalScroll(id="interpretation-scroll"):
+                yield Static(
+                    interpretation_detail_text(self.analysis),
+                    id="interpretation-body",
+                    markup=False,
+                )
+            yield Static(
+                "↑/↓/j/k 스크롤 · i 또는 Esc 닫기",
+                id="interpretation-footer",
+                markup=False,
+            )
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_noop(self) -> None:
+        """Keep every underlying app action inert while this modal is open."""
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#interpretation-scroll", VerticalScroll).scroll_relative(
+            y=-3, animate=False
+        )
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#interpretation-scroll", VerticalScroll).scroll_relative(y=3, animate=False)
+
+
 class TossMarketApp(App[int]):
     TITLE = "Toss Market Terminal"
     SUB_TITLE = "READ ONLY"
@@ -346,6 +486,7 @@ class TossMarketApp(App[int]):
         Binding("4", "chart_1h", "1시간봉", show=False),
         Binding("5", "daily", "일봉", show=False),
         Binding("c", "toggle_focus", "차트 포커스"),
+        Binding("i", "toggle_interpretation", "시장 해석"),
         Binding("a", "add_watchlist", "관심종목 추가"),
         Binding("b", "paper_buy_preview", "매수 미리보기(PAPER)", show=False),
         Binding("s", "paper_sell_preview", "매도 미리보기(PAPER)", show=False),
@@ -719,6 +860,48 @@ class TossMarketApp(App[int]):
 
     def action_toggle_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def _interpretation_is_stale(self) -> bool:
+        return (
+            self.indicator_degraded
+            or self.candle_sync_degraded
+            or self.connection_state not in {"LIVE", "PREVIEW", "SNAPSHOT"}
+        )
+
+    def action_toggle_interpretation(self) -> None:
+        if self.snapshot is None or self.current_price is None:
+            self.notify(
+                "분석할 종목과 시세를 먼저 선택하세요.",
+                title="시장 해석",
+                severity="warning",
+            )
+            return
+        try:
+            stale = self._interpretation_is_stale()
+            indicators = None if stale else self._chart_indicators()
+            signals = market_signals(
+                self.snapshot,
+                self.current_price,
+                orderbook=self.orderbook,
+                trades=tuple(self.trades),
+            )
+            analysis = build_market_interpretation(
+                self.snapshot,
+                self.current_price,
+                self.current_currency,
+                self.chart_mode,
+                signals,
+                selected_indicators=indicators,
+                stale=stale,
+            )
+        except (ValueError, ArithmeticError) as exc:
+            self.notify(
+                safe_indicator_error(exc),
+                title="시장 해석",
+                severity="warning",
+            )
+            return
+        self.push_screen(MarketInterpretationScreen(analysis))
 
     def action_toggle_portfolio(self) -> None:
         if self._portfolio_screen is not None:
@@ -2098,53 +2281,22 @@ class TossMarketApp(App[int]):
             trades=tuple(self.trades),
         )
         text = Text()
-        # Bounded summary: every raw line stays <= 52 display cells so the
-        # stats panel never wraps. Market-data pairs fill lines 1-4, chart
-        # indicator pairs fill lines 5-8, then the provenance footer. Absent
-        # data renders as "—"/"데이터 부족" placeholders (never fabricated
-        # values) so the panel height stays constant through DEGRADED and
-        # recovery cycles.
-        text.append("시장 신호 요약", style="bold #c9d1d9")
-        if metrics.spread is not None:
-            text.append(
-                f" · 매수·매도 호가 차이 {format_decimal(metrics.spread, self.current_currency)}",
-                style=MUTED_COLOR,
-            )
-            if metrics.spread_percent is not None:
-                text.append(f" · {metrics.spread_percent:.3f}%", style=MUTED_COLOR)
-        text.append("\n")
         imbalance = (
             f"{signals.orderbook_imbalance_percent:.1f}%"
             if signals.orderbook_imbalance_percent is not None
             else "—"
         )
-        ratio = format_multiple(signals.bid_ask_ratio)
         pressure = (
             f"{signals.trade_pressure_percent:.1f}%"
             if signals.trade_pressure_percent is not None
             else "—"
         )
         volume_ratio = format_multiple(signals.volume_spike_ratio)
-        if metrics.recent_vwap is not None:
-            vwap_summary = f"체결 평균 {format_decimal(metrics.recent_vwap, self.current_currency)}"
-            if signals.vwap_distance_percent is not None:
-                vwap_summary += f" · 현재가 {format_percent(signals.vwap_distance_percent)}"
-            text.append(vwap_summary + "\n", style=MUTED_COLOR)
-        text.append(
-            f"호가 {orderbook_signal_label_ko(signals.orderbook_imbalance_percent)} "
-            f"{imbalance} · 잔량비 {ratio}\n",
-            style=MUTED_COLOR,
-        )
-        text.append(
-            f"체결 {trade_pressure_label_ko(signals.trade_pressure_percent)} "
-            f"{pressure} · 1분 거래량 {volume_ratio}\n",
-            style=MUTED_COLOR,
-        )
-
+        book_ratio = format_multiple(signals.bid_ask_ratio)
         timeframe_label = TIMEFRAME_LABELS_KO[self.chart_mode]
         try:
             indicators = self._chart_indicators()
-        except ValueError as exc:
+        except (ValueError, ArithmeticError) as exc:
             # Fail-safe boundary: a bad candle (malformed/naive timestamp, currency
             # mismatch) must never kill the live feed task. Render the base stats
             # above, mark the connection truthfully DEGRADED with a sanitized
@@ -2153,42 +2305,91 @@ class TossMarketApp(App[int]):
             self.indicator_degraded = True
             self.connection_state = "DEGRADED"
             self.connection_detail = safe_indicator_error(exc)
-            text.append(
-                f"{timeframe_label} 지표 계산 불가 · {self.connection_detail}\n",
-                style="#f0ad4e",
+            lines = (
+                f"시장 해석 · {timeframe_label} 데이터 부족 · 신뢰도 분석 불가",
+                f"근거 · {self.connection_detail}",
+                "주의 · 지표 계산이 복구될 때까지 방향 해석 보류",
+                "조건 · 가격대 시나리오 데이터 부족",
+                (
+                    f"호가 {orderbook_signal_label_ko(signals.orderbook_imbalance_percent)} "
+                    f"{imbalance}"
+                ),
+                (
+                    f"체결 {trade_pressure_label_ko(signals.trade_pressure_percent)} "
+                    f"{pressure} · 1분량 {volume_ratio}"
+                ),
+                "EMA9/21 — · RSI —",
+                "VWAP — · 지지 — · 저항 —",
+                f"{self.market.upper()} 공개 시세 · 관찰 전용 · i 상세",
             )
-            text.append(
-                "EMA9/21 — · RSI — · VWAP 데이터 부족\n",
-                style=MUTED_COLOR,
-            )
-            text.append("지지 — · 저항 —\n", style=MUTED_COLOR)
+            for index, line in enumerate(lines):
+                text.append(
+                    _bounded_cells(line) + ("\n" if index < len(lines) - 1 else ""),
+                    style="#f0ad4e" if index < 4 else MUTED_COLOR,
+                )
         else:
+            analysis = interpret_timeframe(
+                indicators,
+                self.current_price,
+                self.current_currency,
+                signals=signals,
+                stale=self._interpretation_is_stale(),
+            )
             rsi_text = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "—"
-            text.append(
-                f"{timeframe_label} 지표 · EMA9/21 "
-                f"{ema_relation_label_ko(indicators.ema_short, indicators.ema_long)}\n",
-                style=MUTED_COLOR,
-            )
-            text.append(
-                f"RSI {rsi_text} {rsi_zone_label_ko(indicators.rsi)} · "
-                f"거래량 {format_multiple(indicators.relative_volume)}\n",
-                style=MUTED_COLOR,
-            )
             vwap_percent = vwap_distance_percent(indicators.vwap, self.current_price)
             if indicators.vwap is not None and vwap_percent is not None:
-                vwap_segment = (
-                    f"VWAP {format_decimal(indicators.vwap, self.current_currency)} · "
-                    f"현재가 {format_percent(vwap_percent)}"
-                )
+                vwap_segment = f"VWAP 현재가 {format_percent(vwap_percent)}"
             else:
                 vwap_segment = "VWAP 데이터 부족"
-            text.append(vwap_segment + "\n", style=MUTED_COLOR)
-            text.append(
-                f"지지 {level_display_ko(indicators.levels.support, self.current_currency)} · "
-                f"저항 {level_display_ko(indicators.levels.resistance, self.current_currency)}\n",
-                style=MUTED_COLOR,
+            reason = " · ".join(analysis.evidence[:2]) or "방향 근거 데이터 부족"
+            risk = analysis.risks[0] if analysis.risks else "확인된 주요 반대 신호 없음"
+            if analysis.headline in ("하락 우세", "조정 진행"):
+                scenario = analysis.downside_scenario or "가격대 시나리오 데이터 부족"
+            else:
+                scenario = analysis.upside_scenario or "가격대 시나리오 데이터 부족"
+            spread = (
+                format_decimal(metrics.spread, self.current_currency)
+                if metrics.spread is not None
+                else "—"
             )
-        text.append(f"{self.market.upper()} 공개 시세 · 조회 전용", style="#526273")
+            support_value = (
+                format_decimal(indicators.levels.support.price, self.current_currency)
+                if indicators.levels.support is not None
+                else "—"
+            )
+            resistance_value = (
+                format_decimal(indicators.levels.resistance.price, self.current_currency)
+                if indicators.levels.resistance is not None
+                else "—"
+            )
+            lines = (
+                f"시장 해석 · {timeframe_label} {analysis.headline} · 신뢰도 {analysis.confidence}",
+                f"근거 · {reason}",
+                f"주의 · {risk}",
+                f"조건 · {scenario}",
+                (
+                    f"호가 {orderbook_signal_label_ko(signals.orderbook_imbalance_percent)} "
+                    f"{imbalance} · 잔량비 {book_ratio} · 차이 {spread}"
+                ),
+                (
+                    f"체결 {trade_pressure_label_ko(signals.trade_pressure_percent)} "
+                    f"{pressure} · 1분량 {volume_ratio}"
+                ),
+                (
+                    f"EMA9/21 {ema_relation_label_ko(indicators.ema_short, indicators.ema_long)} "
+                    f"· RSI {rsi_text} {rsi_zone_label_ko(indicators.rsi)}"
+                ),
+                f"{vwap_segment} · 지지 {support_value} · 저항 {resistance_value}",
+                f"{self.market.upper()} 공개 시세 · 관찰 전용 · i 상세",
+            )
+            for index, line in enumerate(lines):
+                style = "bold #c9d1d9" if index == 0 else MUTED_COLOR
+                if index == len(lines) - 1:
+                    style = "#526273"
+                text.append(
+                    _bounded_cells(line) + ("\n" if index < len(lines) - 1 else ""),
+                    style=style,
+                )
         self.query_one("#market-stats", Static).update(text)
 
     def _render_chrome(self) -> None:

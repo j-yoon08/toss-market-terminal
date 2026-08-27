@@ -43,6 +43,13 @@ def _isolated_api_session_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return lock_path
 
 
+def test_version_flag_is_available_without_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as caught:
+        build_parser().parse_args(["--version"])
+    assert caught.value.code == 0
+    assert capsys.readouterr().out.strip() == "toss-market 0.10.0"
+
+
 def sample_context() -> AccountContext:
     item = HoldingsItem(
         symbol="AAPL",
