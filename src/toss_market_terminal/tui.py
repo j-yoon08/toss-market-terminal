@@ -190,6 +190,7 @@ class WatchlistRow:
     price: str
     currency: str
     active_alerts: int
+    waiting_alerts: int
 
 
 def _submit_live_plan_once(
@@ -1691,16 +1692,31 @@ class TossMarketApp(App[int]):
                 self._render_watchlist()
                 return False
             for symbol, price in prices.items():
-                active_alerts = sum(
-                    1 for rule in self.settings.alerts if rule.symbol == symbol and rule.enabled
+                price_tick = self._tick_monotonic_for_timestamp(price.timestamp)
+                price_fresh = price_tick is not None and (
+                    time.monotonic() - price_tick <= PRICE_STALE_SECONDS
+                )
+                full_state = (
+                    symbol == self.symbol
+                    and price_fresh
+                    and self.snapshot is not None
+                    and not self.indicator_degraded
+                    and not self.candle_sync_degraded
+                    and bool(self.snapshot.candles)
+                )
+                active_alerts, waiting_alerts = self._alert_monitoring_counts(
+                    symbol,
+                    price_available=price_fresh,
+                    full_state=full_state,
                 )
                 self.watchlist_rows[symbol] = WatchlistRow(
                     symbol=symbol,
                     price=format_decimal(price.last_price),
                     currency=price.currency,
                     active_alerts=active_alerts,
+                    waiting_alerts=waiting_alerts,
                 )
-                if symbol != self.symbol:
+                if symbol != self.symbol and price_fresh:
                     self._evaluate_alerts(
                         symbol=symbol,
                         current_price=price.last_price,
@@ -1713,23 +1729,60 @@ class TossMarketApp(App[int]):
     def _refresh_watchlist_rows_from_snapshot(self) -> None:
         if self.snapshot is None or self.current_price is None or not self.symbol:
             return
-        active_alerts = sum(
-            1 for rule in self.settings.alerts if rule.symbol == self.symbol and rule.enabled
+        price_fresh = not self._interpretation_is_stale()
+        full_state = (
+            price_fresh
+            and not self.indicator_degraded
+            and not self.candle_sync_degraded
+            and bool(self.snapshot.candles)
+        )
+        active_alerts, waiting_alerts = self._alert_monitoring_counts(
+            self.symbol,
+            price_available=price_fresh,
+            full_state=full_state,
         )
         self.watchlist_rows[self.symbol] = WatchlistRow(
             symbol=self.symbol,
             price=format_decimal(self.current_price),
             currency=self.current_currency or self.snapshot.price.currency,
             active_alerts=active_alerts,
+            waiting_alerts=waiting_alerts,
         )
+
+    def _alert_monitoring_counts(
+        self,
+        symbol: str,
+        *,
+        price_available: bool,
+        full_state: bool,
+    ) -> tuple[int, int]:
+        """Return alerts truly monitored now vs configured but awaiting required data."""
+
+        active = 0
+        waiting = 0
+        for rule in self.settings.alerts:
+            if not rule.enabled or rule.symbol != symbol:
+                continue
+            supported = price_available if rule.kind in {"above", "below"} else full_state
+            if supported:
+                active += 1
+            else:
+                waiting += 1
+        return active, waiting
 
     def _render_watchlist(self) -> None:
         table = self.query_one("#watchlist", DataTable)
         table.clear()
         for symbol in self.watchlist_symbols:
             row = self.watchlist_rows.get(symbol)
-            alert_marker = "•" if row is not None and row.active_alerts else " "
-            count = str(row.active_alerts) if row is not None else "0"
+            active_count = row.active_alerts if row is not None else 0
+            waiting_count = row.waiting_alerts if row is not None else 0
+            if active_count and waiting_count:
+                alert_status = f"±{min(active_count + waiting_count, 9)}"
+            elif waiting_count:
+                alert_status = f"~{min(waiting_count, 9)}"
+            else:
+                alert_status = f"•{min(active_count, 9)}"
             price_text = f"{row.price} {row.currency}" if row is not None else "—"
             if row is None or self.watchlist_stale:
                 price_text = f"{price_text}*" if self.watchlist_stale else price_text
@@ -1738,7 +1791,7 @@ class TossMarketApp(App[int]):
             table.add_row(
                 f"{active_prefix}{symbol}",
                 Text(f" {price_text}", style=MUTED_COLOR),
-                f"{alert_marker}{count}",
+                alert_status,
             )
 
     def _evaluate_alerts(

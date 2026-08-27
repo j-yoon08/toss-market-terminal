@@ -1100,6 +1100,58 @@ async def test_watchlist_refresh_lock_prevents_overlapping_calls(tmp_path: Path)
         assert maximum == 1
 
 
+async def test_watchlist_alerts_distinguish_monitored_from_waiting_data(tmp_path: Path) -> None:
+    calls = 0
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+        settings=Settings(
+            watchlist=("AAPL", "NVDA"),
+            alerts=(
+                AlertRule("A1", "AAPL", "above", Decimal("100")),
+                AlertRule("A2", "AAPL", "volume-spike", Decimal("2")),
+                AlertRule("N1", "NVDA", "above", Decimal("100")),
+                AlertRule("N2", "NVDA", "volume-spike", Decimal("2")),
+            ),
+        ),
+    )
+
+    class PriceClient:
+        async def prices(self, symbols: list[str]) -> dict[str, Price]:
+            nonlocal calls
+            calls += 1
+            timestamp = app.utc_now().isoformat() if calls == 1 else None
+            return {symbol: Price(symbol, Decimal("110"), "USD", timestamp) for symbol in symbols}
+
+        async def close(self) -> None:
+            return None
+
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.client = PriceClient()  # type: ignore[assignment]
+
+        assert await app._refresh_watchlist_prices()
+        assert app.watchlist_rows["AAPL"].active_alerts == 2
+        assert app.watchlist_rows["AAPL"].waiting_alerts == 0
+        assert app.watchlist_rows["NVDA"].active_alerts == 1
+        assert app.watchlist_rows["NVDA"].waiting_alerts == 1
+        table = app.query_one("#watchlist", DataTable)
+        assert table.get_cell_at(Coordinate(0, 2)) == "•2"
+        assert table.get_cell_at(Coordinate(1, 2)) == "±2"
+
+        assert await app._refresh_watchlist_prices()
+        assert app.watchlist_rows["AAPL"].active_alerts == 0
+        assert app.watchlist_rows["AAPL"].waiting_alerts == 2
+        assert app.watchlist_rows["NVDA"].active_alerts == 0
+        assert app.watchlist_rows["NVDA"].waiting_alerts == 2
+        assert table.get_cell_at(Coordinate(0, 2)) == "~2"
+        assert table.get_cell_at(Coordinate(1, 2)) == "~2"
+
+    assert calls == 2
+
+
 async def test_tui_emits_one_edge_alert_and_renders_market_signals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
