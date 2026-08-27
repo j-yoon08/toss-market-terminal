@@ -31,6 +31,8 @@ MUTED_COLOR = "#7d8998"
 CURRENT_PRICE_COLOR = "#f2c14e"
 CURRENT_PRICE_DASH = "─"
 PREVIOUS_CLOSE_DASH = "·"
+HOLDING_AVERAGE_COLOR = "#6c7a8c"
+HOLDING_AVERAGE_DASH = "╌"
 
 CHART_MODE_LABELS = {
     "1m": "1 MINUTE",
@@ -655,15 +657,20 @@ def _candlestick_grid(
     scale: tuple[Decimal, Decimal, Decimal] | None = None,
     current_price_row: int | None = None,
     previous_close_row: int | None = None,
+    holding_average_row: int | None = None,
 ) -> list[Text]:
     """Candlestick body/wick grid, optionally overlaid with reference-price dashes.
 
-    ``current_price_row``/``previous_close_row`` (row indices from the same
-    price scale used to build ``buckets``' rows) only fill in cells that are
-    otherwise blank -- a candle's body/wick always wins so the reference
-    lines read as a line *behind* the candles, never over them. ``scale`` is
-    the ``(low, high, span)`` triple shared with the caller's row math; when
-    omitted it is derived from ``buckets`` alone.
+    ``current_price_row``/``previous_close_row``/``holding_average_row`` (row
+    indices from the same price scale used to build ``buckets``' rows) only
+    fill in cells that are otherwise blank -- a candle's body/wick always
+    wins so the reference lines read as a line *behind* the candles, never
+    over them. Among the reference lines themselves, ``current_price_row``
+    is checked first so the live price stays visually dominant over the
+    holding-average line on a collision, and ``holding_average_row`` in turn
+    wins over ``previous_close_row``. ``scale`` is the ``(low, high, span)``
+    triple shared with the caller's row math; when omitted it is derived
+    from ``buckets`` alone.
     """
     lines = [Text() for _ in range(rows)]
     if not buckets or rows <= 0:
@@ -682,6 +689,8 @@ def _candlestick_grid(
                 lines[row].append("│", style=style)
             elif row == current_price_row:
                 lines[row].append(CURRENT_PRICE_DASH, style=CURRENT_PRICE_COLOR)
+            elif row == holding_average_row:
+                lines[row].append(HOLDING_AVERAGE_DASH, style=HOLDING_AVERAGE_COLOR)
             elif row == previous_close_row:
                 lines[row].append(PREVIOUS_CLOSE_DASH, style=MUTED_COLOR)
             else:
@@ -750,6 +759,28 @@ def _volume_grid(buckets: Sequence[Candle], rows: int) -> list[Text]:
     return lines
 
 
+@dataclass(frozen=True, slots=True)
+class HoldingAveragePriceOverlay:
+    """Immutable, primitive-only holding-average overlay input for :func:`chart_renderable`.
+
+    ``price`` must already be in the chart's own currency and ``stale`` marks
+    that it comes from the last-good portfolio snapshot after a refresh
+    failure -- symbol/currency/quantity matching is the caller's
+    responsibility (see :mod:`toss_market_terminal.tui`), never this module's.
+    """
+
+    price: Decimal
+    stale: bool = False
+
+
+def _holding_average_label_ko(
+    price: Decimal, currency: str | None, *, stale: bool, direction: str = ""
+) -> str:
+    prefix = f"{direction} " if direction else ""
+    suffix = " STALE" if stale else ""
+    return f"{prefix}보유 평단 {format_decimal(price, currency)}{suffix}"
+
+
 def _join_lines(lines: Sequence[Text]) -> Text:
     result = Text()
     for index, line in enumerate(lines):
@@ -767,6 +798,7 @@ def chart_renderable(
     *,
     current_price: Decimal | None = None,
     previous_close: Decimal | None = None,
+    holding_average: HoldingAveragePriceOverlay | None = None,
 ) -> Text:
     """Render a candlestick + volume chart for ``mode`` as pure Rich ``Text``.
 
@@ -793,6 +825,17 @@ def chart_renderable(
     ``width`` disables the price axis entirely rather than starve the candle
     columns. When enough rows are available, a bottom time axis labels the
     leftmost/middle/rightmost rendered candles.
+
+    ``holding_average``, when given, never expands the price scale (unlike
+    ``current_price``). When its price falls within the represented range it
+    draws a dim, non-directional dashed line behind the candles plus a
+    ``보유 평단 <price>`` axis label; a candle body/wick always wins that
+    cell, and the current-price line/label wins any row collision with it.
+    When its price falls outside the represented range no line is drawn at
+    all (never clamped onto a boundary row) and the axis instead shows a
+    truthful ``↑ 보유 평단 <price>`` / ``↓ 보유 평단 <price>`` indicator at
+    the top/bottom of the axis. A stale (last-good) overlay appends
+    `` STALE`` to whichever label is shown.
     """
     source = select_chart_candles(snapshot, mode)
     chart_width = max(_MIN_CHART_DIMENSION, int(width))
@@ -818,6 +861,19 @@ def chart_renderable(
             low = current_price
         span = max(high - low, Decimal("1"))
 
+    holding_average_in_range = holding_average is not None and low <= holding_average.price <= high
+    holding_average_label: str | None = None
+    if holding_average is not None:
+        if holding_average_in_range:
+            holding_average_label = _holding_average_label_ko(
+                holding_average.price, currency, stale=holding_average.stale
+            )
+        else:
+            direction = "↑" if holding_average.price > high else "↓"
+            holding_average_label = _holding_average_label_ko(
+                holding_average.price, currency, stale=holding_average.stale, direction=direction
+            )
+
     axis_labels = [
         format_decimal(high, currency),
         format_decimal(low, currency),
@@ -825,6 +881,8 @@ def chart_renderable(
     ]
     if previous_close is not None:
         axis_labels.append(format_decimal(previous_close, currency))
+    if holding_average_label is not None:
+        axis_labels.append(holding_average_label)
     axis_width = _axis_label_width(axis_labels)
     show_axis = chart_width >= _MIN_WIDTH_FOR_PRICE_AXIS and axis_width < chart_width - 3
     candle_width = chart_width - axis_width if show_axis else chart_width
@@ -852,12 +910,19 @@ def chart_renderable(
         if candidate_row != current_price_row:
             previous_close_row = candidate_row
 
+    holding_average_row = None
+    if price_rows and holding_average_in_range:
+        candidate_row = _price_row(holding_average.price, low, span, price_rows)
+        if candidate_row != current_price_row:
+            holding_average_row = candidate_row
+
     price_grid = _candlestick_grid(
         buckets,
         price_rows,
         scale=(low, high, span),
         current_price_row=current_price_row,
         previous_close_row=previous_close_row,
+        holding_average_row=holding_average_row,
     )
     if show_axis and price_rows:
         axis_rows: dict[int, tuple[str, str]] = {
@@ -869,6 +934,12 @@ def chart_renderable(
                 format_decimal(previous_close, currency),
                 MUTED_COLOR,
             )
+        if holding_average_label is not None:
+            if holding_average_row is not None:
+                axis_rows[holding_average_row] = (holding_average_label, HOLDING_AVERAGE_COLOR)
+            elif not holding_average_in_range:
+                boundary_row = 0 if holding_average.price > high else price_rows - 1
+                axis_rows[boundary_row] = (holding_average_label, HOLDING_AVERAGE_COLOR)
         if current_price_row is not None:
             axis_rows[current_price_row] = (
                 format_decimal(resolved_current_price, currency),

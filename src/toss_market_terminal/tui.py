@@ -73,6 +73,7 @@ from .render import (
     UP_COLOR,
     ChartIndicatorBase,
     ChartIndicators,
+    HoldingAveragePriceOverlay,
     chart_indicator_base,
     chart_indicators_from_base,
     chart_renderable,
@@ -758,6 +759,9 @@ class TossMarketApp(App[int]):
                 self.portfolio_error = safe_status_error(exc)
                 if self._portfolio_screen is not None:
                     self._portfolio_screen.refresh_view()
+                # Last-good overlay line must switch to its STALE label; this
+                # never touches market/WS connection state.
+                self._render_chart()
                 return False
             previous_account_seq = (
                 self.portfolio_snapshot.account.account_seq
@@ -782,6 +786,9 @@ class TossMarketApp(App[int]):
             self._maybe_start_order_history_polling()
             if self._portfolio_screen is not None:
                 self._portfolio_screen.refresh_view()
+            # Recovery clears STALE and/or reflects a newly (un)held symbol;
+            # this never touches market/WS connection state.
+            self._render_chart()
             return True
 
     async def _run_portfolio_polling(self) -> None:
@@ -1997,10 +2004,35 @@ class TossMarketApp(App[int]):
                 Text(marker, style=style),
             )
 
+    def _holding_average_overlay(self) -> HoldingAveragePriceOverlay | None:
+        """Active held-symbol average-price overlay, re-derived fresh on every call.
+
+        Never cached across renders or symbols: sourced only from
+        ``self.snapshot``'s own symbol/currency and the current
+        ``self.portfolio_snapshot``, so a symbol switch or a stale/failed
+        portfolio refresh is reflected immediately with no extra network call
+        and no independent overlay state to fall out of sync.
+        """
+        if self.snapshot is None or self.portfolio_snapshot is None:
+            return None
+        item = self.portfolio_snapshot.holdings.find_item(self.snapshot.stock.symbol)
+        if item is None:
+            return None
+        if item.quantity <= 0 or item.average_purchase_price <= 0:
+            return None
+        if item.currency != self.snapshot.price.currency:
+            return None
+        return HoldingAveragePriceOverlay(
+            price=item.average_purchase_price, stale=self.portfolio_stale
+        )
+
     def _render_chart(self) -> None:
         if self.snapshot is None:
             return
-        chart_content = self.query_one("#chart-content", Static)
+        try:
+            chart_content = self.query_one("#chart-content", Static)
+        except NoMatches:
+            return  # main chart isn't the active screen (e.g. portfolio modal open)
         if not chart_content.is_mounted:
             return
         width, height = chart_content.content_size
@@ -2019,10 +2051,14 @@ class TossMarketApp(App[int]):
                 height,
                 current_price=self.current_price,
                 previous_close=previous_close,
+                holding_average=self._holding_average_overlay(),
             )
         )
         title = f"MARKET CHART · {CHART_MODE_LABELS[self.chart_mode]}"
-        self.query_one("#chart-panel .panel-title", Static).update(title)
+        try:
+            self.query_one("#chart-panel .panel-title", Static).update(title)
+        except NoMatches:
+            return  # same race as above; the chart body already re-rendered
 
     def _chart_indicators(self) -> ChartIndicators:
         """Cached snapshot+mode indicator base, cheaply re-projected onto the live price.

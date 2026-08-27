@@ -22,9 +22,12 @@ from toss_market_terminal.render import (
     CURRENT_PRICE_COLOR,
     CURRENT_PRICE_DASH,
     DOWN_COLOR,
+    HOLDING_AVERAGE_COLOR,
+    HOLDING_AVERAGE_DASH,
     MUTED_COLOR,
     PREVIOUS_CLOSE_DASH,
     UP_COLOR,
+    HoldingAveragePriceOverlay,
     NearestLevel,
     _candlestick_grid,
     chart_indicators,
@@ -528,6 +531,168 @@ def test_chart_renderable_omits_previous_close_outside_represented_range() -> No
     # Every candle wick spans the full price range, so the dotted line is
     # occluded by candle glyphs; the truthful in-range axis label must remain.
     assert "99.5" in inside.plain
+
+
+# --- holding-average overlay ----------------------------------------------
+
+
+def test_candlestick_grid_holding_average_line_is_dim_behind_candles() -> None:
+    # Same fixture as the current-price/previous-close overlay test: column 0's
+    # wick/body spans every row; column 1's leaves rows 0-1 blank.
+    wide = _candle("t1", "102", "110", "100", "108", "10")
+    narrow = _candle("t2", "103", "104", "101", "102", "10")
+    grid = _candlestick_grid((wide, narrow), rows=5, holding_average_row=0)
+    row0 = grid[0]
+    assert row0.plain[0] in ("│", "█")  # candle glyph always wins over the overlay
+    assert row0.plain[1] == HOLDING_AVERAGE_DASH
+    assert _style_at(row0, 1) == HOLDING_AVERAGE_COLOR
+    assert HOLDING_AVERAGE_COLOR not in (UP_COLOR, DOWN_COLOR)
+
+
+def test_candlestick_grid_current_price_wins_holding_average_collision() -> None:
+    wide = _candle("t1", "102", "110", "100", "108", "10")
+    narrow = _candle("t2", "103", "104", "101", "102", "10")
+    grid = _candlestick_grid((wide, narrow), rows=5, current_price_row=0, holding_average_row=0)
+    row0 = grid[0]
+    assert row0.plain[1] == CURRENT_PRICE_DASH
+    assert _style_at(row0, 1) == CURRENT_PRICE_COLOR
+
+
+def test_candlestick_grid_holding_average_wins_previous_close_collision() -> None:
+    wide = _candle("t1", "102", "110", "100", "108", "10")
+    narrow = _candle("t2", "103", "104", "101", "102", "10")
+    grid = _candlestick_grid((wide, narrow), rows=5, previous_close_row=1, holding_average_row=1)
+    row1 = grid[1]
+    assert row1.plain[1] == HOLDING_AVERAGE_DASH
+    assert _style_at(row1, 1) == HOLDING_AVERAGE_COLOR
+
+
+def test_chart_renderable_without_overlay_is_unaffected_by_the_new_parameter() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    implicit = chart_renderable(snapshot, "1m", width=48, height=18, current_price=Decimal("110"))
+    explicit_none = chart_renderable(
+        snapshot, "1m", width=48, height=18, current_price=Decimal("110"), holding_average=None
+    )
+    assert implicit.plain == explicit_none.plain
+    assert "보유 평단" not in implicit.plain
+    assert HOLDING_AVERAGE_DASH not in implicit.plain
+
+
+def test_chart_renderable_holding_average_in_range_draws_line_without_expanding_scale() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("120"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("110"),
+        holding_average=overlay,
+    )
+    price_rows = chart.plain.splitlines()[1:11]
+    dashed_rows = [row for row in price_rows if HOLDING_AVERAGE_DASH in row]
+    assert len(dashed_rows) == 1
+    assert "보유 평단 120" in chart.plain
+    assert "STALE" not in chart.plain
+    # Neither the candle high (130) nor the axis boundary label moved: the
+    # overlay never expands the scale the way current_price does.
+    assert "130" in price_rows[0]
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_holding_average_above_high_shows_truthful_indicator_not_clamped() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("500"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("110"),
+        holding_average=overlay,
+    )
+    price_rows = chart.plain.splitlines()[1:11]
+    assert HOLDING_AVERAGE_DASH not in chart.plain  # never clamped onto a boundary row
+    assert "↑ 보유 평단 500" in price_rows[0]
+    assert "130" not in chart.plain  # the truthful high boundary label was replaced
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_holding_average_below_low_shows_truthful_indicator_not_clamped() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("10"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("110"),
+        holding_average=overlay,
+    )
+    price_rows = chart.plain.splitlines()[1:11]
+    assert HOLDING_AVERAGE_DASH not in chart.plain
+    assert "↓ 보유 평단 10" in price_rows[-1]
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_holding_average_stale_label_retains_line() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("120"), stale=True)
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("110"),
+        holding_average=overlay,
+    )
+    price_rows = chart.plain.splitlines()[1:11]
+    assert any(HOLDING_AVERAGE_DASH in row for row in price_rows)
+    assert "보유 평단 120 STALE" in chart.plain
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_holding_average_exact_current_price_collision_yields_to_current() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("110"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("110"),
+        holding_average=overlay,
+    )
+    assert HOLDING_AVERAGE_DASH not in chart.plain
+    assert "보유 평단" not in chart.plain
+    assert "110" in chart.plain
+
+
+@pytest.mark.parametrize("width", [20, 33, 48, 90, 140])
+@pytest.mark.parametrize("height", [5, 10, 18, 30, 42])
+@pytest.mark.parametrize("price", ["120", "500", "10"])
+def test_chart_renderable_holding_average_stays_within_bounds_every_mode(
+    width: int, height: int, price: str
+) -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal(price), stale=True)
+    for mode in CHART_MODE_LABELS:
+        chart = chart_renderable(
+            snapshot,
+            mode,
+            width=width,
+            height=height,
+            current_price=Decimal("110"),
+            holding_average=overlay,
+        )
+        lines = chart.plain.splitlines()
+        assert len(lines) <= height
+        for line in lines:
+            assert cell_len(line) <= width
 
 
 # --- select_chart_candles / chart_indicators -----------------------------
