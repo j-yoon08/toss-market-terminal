@@ -704,6 +704,22 @@ def _axis_label_width(labels: Sequence[str]) -> int:
     return widest + 1
 
 
+def _nearest_free_axis_row(
+    start_row: int, price_rows: int, *, step: int, occupied: frozenset[int]
+) -> int | None:
+    """Nearest row from ``start_row`` (moving inward by ``step``) absent from ``occupied``.
+
+    Returns ``None`` when every row from ``start_row`` to the grid's far edge
+    is occupied (e.g. a single-row grid whose only row is ``occupied``).
+    """
+    row = start_row
+    while 0 <= row < price_rows:
+        if row not in occupied:
+            return row
+        row += step
+    return None
+
+
 def _axis_suffix(label: str, width: int) -> str:
     return set_cell_size(f" {label}", width)
 
@@ -938,8 +954,33 @@ def chart_renderable(
             if holding_average_row is not None:
                 axis_rows[holding_average_row] = (holding_average_label, HOLDING_AVERAGE_COLOR)
             elif not holding_average_in_range:
-                boundary_row = 0 if holding_average.price > high else price_rows - 1
-                axis_rows[boundary_row] = (holding_average_label, HOLDING_AVERAGE_COLOR)
+                above_high = holding_average.price > high
+                boundary_row = 0 if above_high else price_rows - 1
+                step = 1 if above_high else -1
+                # The out-of-range arrow indicator is anchored to a boundary
+                # row, not a real price, so it must yield its row rather than
+                # silently vanish when that boundary happens to coincide with
+                # the (visually dominant) current-price row: walk inward to
+                # the nearest free row, preferring one that also avoids the
+                # previous-close line, and only give up when every row from
+                # the boundary inward is the current-price row itself.
+                mandatory_occupied = (
+                    frozenset({current_price_row}) if current_price_row is not None else frozenset()
+                )
+                preferred_occupied = mandatory_occupied | (
+                    frozenset({previous_close_row})
+                    if previous_close_row is not None
+                    else frozenset()
+                )
+                placement_row = _nearest_free_axis_row(
+                    boundary_row, price_rows, step=step, occupied=preferred_occupied
+                )
+                if placement_row is None:
+                    placement_row = _nearest_free_axis_row(
+                        boundary_row, price_rows, step=step, occupied=mandatory_occupied
+                    )
+                if placement_row is not None:
+                    axis_rows[placement_row] = (holding_average_label, HOLDING_AVERAGE_COLOR)
         if current_price_row is not None:
             axis_rows[current_price_row] = (
                 format_decimal(resolved_current_price, currency),

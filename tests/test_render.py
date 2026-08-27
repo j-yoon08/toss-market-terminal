@@ -638,6 +638,76 @@ def test_chart_renderable_holding_average_below_low_shows_truthful_indicator_not
         assert cell_len(line) <= 48
 
 
+def test_chart_renderable_holding_average_above_high_survives_current_price_at_top_boundary() -> (
+    None
+):
+    # P2 regression: current_price sitting exactly at the candle high used to
+    # occupy axis row 0, and the out-of-range arrow label (also anchored to
+    # row 0) was assigned afterwards and silently overwrote it -- dropping
+    # the truthful indicator entirely instead of moving it inward.
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("150"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("130"),  # exactly the candle high (99..130)
+        holding_average=overlay,
+    )
+    price_rows = chart.plain.splitlines()[1:11]
+    assert HOLDING_AVERAGE_DASH not in chart.plain  # still never clamped onto a boundary row
+    current_row = next(row for row in price_rows if "130" in row)
+    assert current_row == price_rows[0]  # current price keeps its own (dominant) row
+    arrow_row = next(row for row in price_rows if "↑ 보유 평단 150" in row)
+    assert arrow_row != current_row  # arrow label survives on a distinct row instead
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_holding_average_below_low_survives_current_price_at_bottom_boundary() -> (
+    None
+):
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("5"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=18,
+        current_price=Decimal("99"),  # exactly the candle low (99..130)
+        holding_average=overlay,
+    )
+    price_rows = chart.plain.splitlines()[1:11]
+    assert HOLDING_AVERAGE_DASH not in chart.plain
+    current_row = next(row for row in price_rows if "99" in row)
+    assert current_row == price_rows[-1]
+    arrow_row = next(row for row in price_rows if "↓ 보유 평단 5" in row)
+    assert arrow_row != current_row
+    for line in chart.plain.splitlines():
+        assert cell_len(line) <= 48
+
+
+def test_chart_renderable_holding_average_out_of_range_label_omitted_on_single_row() -> None:
+    # Only one price row exists and current_price already claims it: the
+    # arrow indicator has nowhere free to move and must be omitted cleanly
+    # rather than raise or overflow the declared width/height.
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("500"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=2,
+        current_price=Decimal("130"),
+        holding_average=overlay,
+    )
+    lines = chart.plain.splitlines()
+    assert len(lines) <= 2
+    for line in lines:
+        assert cell_len(line) <= 48
+
+
 def test_chart_renderable_holding_average_stale_label_retains_line() -> None:
     snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
     overlay = HoldingAveragePriceOverlay(price=Decimal("120"), stale=True)
