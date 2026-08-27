@@ -113,6 +113,7 @@ class TossMarketClient:
             base_url=API_BASE_URL,
             timeout=httpx.Timeout(15.0),
             follow_redirects=False,
+            trust_env=False,
         )
         self._access_token: str | None = None
         self._token_expires_at = 0.0

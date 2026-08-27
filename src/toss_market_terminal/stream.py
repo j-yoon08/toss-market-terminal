@@ -133,10 +133,10 @@ class TossMarketStream:
                     open_timeout=15,
                     close_timeout=5,
                     max_size=1_000_000,
+                    proxy=None,
                 ) as websocket:
                     await websocket.send(json.dumps(declaration, separators=(",", ":")))
                     yield StreamStatus("connected")
-                    attempt = 0
                     keepalive = asyncio.create_task(self._keepalive(websocket))
                     try:
                         while True:
@@ -158,6 +158,11 @@ class TossMarketStream:
                             if event is not None:
                                 yield event
                             if isinstance(event, StreamStatus):
+                                if event.state == "subscribed":
+                                    # A TCP/WebSocket handshake alone isn't evidence of a
+                                    # healthy subscription. Only reset exponential backoff
+                                    # after the server acknowledges the requested topics.
+                                    attempt = 0
                                 if event.state == "error":
                                     raise ConnectionError("stream-error")
                                 if event.state == "rejected":

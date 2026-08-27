@@ -14,6 +14,34 @@ from toss_market_terminal.config import Credentials
 from toss_market_terminal.models import MarketSnapshot
 
 
+def test_default_http_client_disables_environment_proxy_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("toss_market_terminal.client.httpx.AsyncClient", FakeAsyncClient)
+    TossMarketClient(Credentials("tsck_live_test", "tssk_live_test"))
+
+    assert captured["trust_env"] is False
+    assert captured["follow_redirects"] is False
+
+
+async def test_injected_http_client_is_preserved() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+        base_url="https://example.invalid",
+    ) as injected:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=injected
+        )
+        assert client._http is injected
+        assert not client._owns_client
+
+
 @pytest.mark.asyncio
 async def test_snapshot_calls_only_allowlisted_market_data() -> None:
     seen: list[str] = []

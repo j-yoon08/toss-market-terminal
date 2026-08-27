@@ -139,7 +139,7 @@ async def test_idle_timeout_reconnects_with_backoff_and_resubscribes(
     assert trade_event.symbol == "AAPL"
 
     second_reconnect = await anext(events)
-    assert second_reconnect.state == "reconnecting"
+    assert second_reconnect == StreamStatus("reconnecting", "retry_in=1.0s")
 
     await events.aclose()
 
@@ -151,6 +151,37 @@ async def test_idle_timeout_reconnects_with_backoff_and_resubscribes(
     assert len(conn2.websocket.sent) == 1
     assert client.calls == 2
     assert len(fake_connect.calls) == 2
+    assert all(call["proxy"] is None for call in fake_connect.calls)
+
+
+async def test_immediate_closes_increase_backoff_until_subscription_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toss_market_terminal.stream as stream_module
+
+    conn1 = FakeConnection(websocket=FakeWebSocket([ConnectionClosedOK(None, None)]))
+    conn2 = FakeConnection(websocket=FakeWebSocket([ConnectionClosedOK(None, None)]))
+    conn3 = FakeConnection(websocket=FakeWebSocket([SILENCE]))
+    fake_connect, client, sleep_calls = _patch_stream(
+        monkeypatch, stream_module, [conn1, conn2, conn3]
+    )
+
+    events = TossMarketStream(client, silence_timeout_seconds=0.02).events(  # type: ignore[arg-type]
+        "AAPL", "us"
+    )
+    assert await anext(events) == StreamStatus("connecting")
+    assert await anext(events) == StreamStatus("connected")
+    assert await anext(events) == StreamStatus("reconnecting", "retry_in=1.0s")
+    assert await anext(events) == StreamStatus("connecting")
+    assert await anext(events) == StreamStatus("connected")
+    assert await anext(events) == StreamStatus("reconnecting", "retry_in=2.0s")
+    assert await anext(events) == StreamStatus("connecting")
+    assert await anext(events) == StreamStatus("connected")
+    await events.aclose()
+
+    assert sleep_calls == [1.0, 2.0]
+    assert len(fake_connect.calls) == 3
+    assert all(call["proxy"] is None for call in fake_connect.calls)
 
 
 async def test_normal_close_reconnects(monkeypatch: pytest.MonkeyPatch) -> None:
