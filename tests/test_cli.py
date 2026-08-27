@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 from decimal import Decimal
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
 from toss_market_terminal import cli
+from toss_market_terminal.api_session_lock import ApiSessionLock
 from toss_market_terminal.cli import build_parser, main
 from toss_market_terminal.models import (
     Account,
@@ -30,6 +32,15 @@ def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("external network attempted in CLI tests")
 
     monkeypatch.setattr("socket.socket.connect", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_api_session_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keeps every CLI test off the real ~/.local/state lock file."""
+
+    lock_path = tmp_path / "session-state" / "api-session.lock"
+    monkeypatch.setattr(cli, "DEFAULT_LOCK_PATH", lock_path)
+    return lock_path
 
 
 def sample_context() -> AccountContext:
@@ -335,3 +346,106 @@ def test_account_payload_guard_rejects_unmasked_number() -> None:
     )
     with pytest.raises(ValueError):
         cli.account_context_payload(broken)
+
+
+# --- cross-process single API session lock ----------------------------------
+
+
+def _block_credential_and_network_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BlockedCredentials:
+        @staticmethod
+        def load(path: object) -> object:
+            raise AssertionError("credential load attempted despite lock contention")
+
+    class BlockedClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("network client constructed despite lock contention")
+
+    class BlockedApp:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("TUI app constructed despite lock contention")
+
+    monkeypatch.setattr(cli, "Credentials", BlockedCredentials)
+    monkeypatch.setattr(cli, "TossMarketClient", BlockedClient)
+    monkeypatch.setattr(cli, "TossMarketApp", BlockedApp)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["snapshot", "AAPL"],
+        ["account", "AAPL"],
+        ["probe", "AAPL"],
+        ["watch", "AAPL"],
+        ["live"],
+    ],
+)
+def test_lock_contention_fails_fast_before_any_credential_or_network_access(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _isolated_api_session_lock: Path,
+) -> None:
+    _block_credential_and_network_access(monkeypatch)
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()
+    try:
+        assert main(argv) == 2
+    finally:
+        other.release()
+    err = capsys.readouterr().err
+    assert "다른 API" in err
+    assert "session-state" not in err  # never echoes the lock path
+
+
+def test_watchlist_and_alert_commands_are_not_lock_gated(
+    tmp_path: Path, _isolated_api_session_lock: Path
+) -> None:
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()
+    try:
+        settings_path = tmp_path / "settings.json"
+        assert main(["--settings", str(settings_path), "watchlist", "add", "AAPL"]) == 0
+        assert main(["--settings", str(settings_path), "watchlist", "list"]) == 0
+        assert main(["--settings", str(settings_path), "alert", "add", "AAPL", "above", "100"]) == 0
+        assert main(["--settings", str(settings_path), "alert", "list"]) == 0
+    finally:
+        other.release()
+
+
+def test_lock_is_released_after_a_successful_command(
+    monkeypatch: pytest.MonkeyPatch, _isolated_api_session_lock: Path
+) -> None:
+    install_fake_client(monkeypatch)
+    assert main(["account", "aapl", "--json"]) == 0
+
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()  # must not raise: the completed command already released it
+    other.release()
+
+
+def test_lock_is_released_when_the_command_raises(_isolated_api_session_lock: Path) -> None:
+    assert main(["account", "AAPL", "--account-seq", "0"]) == 2
+
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()
+    other.release()
+
+
+def test_lock_is_released_when_the_tui_app_raises(
+    monkeypatch: pytest.MonkeyPatch, _isolated_api_session_lock: Path
+) -> None:
+    class FailingApp:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def run(self) -> int:
+            raise RuntimeError("fixture failure")
+
+    monkeypatch.setattr(cli, "TossMarketApp", FailingApp)
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        main(["watch", "AAPL"])
+
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()
+    other.release()

@@ -2,6 +2,14 @@
 
 토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 `live` 실행·주문정보 최종 확인·검토 잠금 이후의 새 Enter·내부 전체 지문 executor 게이트를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다.
 
+## v0.9 구현 계층 (OAuth 단일 세션 잠금 · 읽기 전용 401 복구)
+
+- 공식 API는 OAuth 클라이언트당 유효한 access token을 정확히 1개만 허용하며, 새 token 발급은 이전 token을 즉시 무효화합니다(refresh token 없음). 이 때문에 `snapshot`/`account`/`probe`/`watch`/`live` 중 자격증명·네트워크를 쓰는 프로세스는 동시에 **하나만** 실행할 수 있습니다. `watchlist`/`alert`는 로컬 설정 파일만 다루므로 이 제약과 무관하게 항상 실행 가능합니다.
+- `api_session_lock` 모듈이 `~/.local/state/toss-market-terminal/api-session.lock`에 대해 `fcntl.flock` 기반 프로세스 간 배타 잠금을 명령 실행 전체 구간 동안 유지합니다. 디렉터리 `0700`, 파일 `0600`·현재 사용자 소유·symlink/hardlink 거부를 적용하며, 파일에는 짧은 PID 마커만 남기고 자격증명·token은 절대 기록하지 않습니다. 잠금 파일 자체는 지워지지 않고 재사용되며, 프로세스가 비정상 종료해도 OS가 flock을 자동 해제합니다.
+- 이미 다른 프로세스가 세션을 쓰고 있으면 자격증명 로드나 네트워크 호출 전에 즉시 실패하며, 짧은 한국어 오류와 함께 종료 코드 `2`를 반환합니다.
+- `TossMarketClient`의 모든 GET 전용 엔드포인트(시세·계좌·환율·미체결/종료 주문 조회)는 첫 응답이 `401`이면, 그 요청에 실제로 쓰인 token이 아직 캐시된 값과 같을 때만 이를 무효화하고 token을 한 번 재발급받아 **동일한 GET을 정확히 한 번만** 재시도합니다. 재시도도 실패하면 그대로 정제된 오류를 전달하며 반복 재시도는 없습니다. 같은 만료 token으로 동시에 실패한 여러 GET은 재발급을 단 한 번만 유발합니다.
+- 이 복구는 읽기 전용 GET에만 적용되며, `POST /api/v1/orders`를 포함한 어떤 주문 mutation에도 적용되지 않습니다. `TossOrderTransport`의 기존 1회 전송·모호 실패 시 재제출 금지 계약은 변경되지 않았습니다.
+
 ## v0.8.0 주요 기능 (기본 PAPER · 수동 승인 LIVE)
 
 - `toss-market watch SYMBOL`은 항상 PAPER 기본입니다. 실제 주문용 기본 명령은 `toss-market live`이며, 저장된 관심 목록에서 종목을 선택합니다. 선택적 호환 형식 `toss-market live SYMBOL`도 유지합니다. live 실행 구간에만 runtime/env gate를 함께 활성화하며, 기존 `watch --live-orders` 경로는 환경 게이트가 별도로 없으면 계속 차단됩니다.

@@ -5,12 +5,14 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import ExitStack
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
 from rich.console import Console
 
+from .api_session_lock import DEFAULT_LOCK_PATH, ApiSessionLock, ApiSessionLockError
 from .client import TossApiError, TossMarketClient
 from .config import DEFAULT_CREDENTIALS_PATH, CredentialError, Credentials
 from .live_order import MANUAL_LIVE_ENV_KEY, MANUAL_LIVE_ENV_VALUE
@@ -289,6 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# snapshot/account/probe/watch/live all mint or reuse the single OAuth access
+# token the Toss Open API issues per client, so they share one cross-process
+# lock. watchlist/alert only touch the local settings file and never lock.
+API_SESSION_LOCKED_COMMANDS = frozenset({"snapshot", "account", "probe", "watch", "live"})
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -296,57 +304,60 @@ def main(argv: list[str] | None = None) -> int:
         return getattr(args, "settings", None) or args.settings_path
 
     try:
-        if args.command in {"snapshot", "account", "probe"}:
-            symbol = normalize_symbol(args.symbol)
-            if args.command == "snapshot":
-                return asyncio.run(run_snapshot(symbol, args.credentials, args.json_output))
-            if args.command == "account":
+        with ExitStack() as stack:
+            if args.command in API_SESSION_LOCKED_COMMANDS:
+                stack.enter_context(ApiSessionLock(DEFAULT_LOCK_PATH))
+            if args.command in {"snapshot", "account", "probe"}:
+                symbol = normalize_symbol(args.symbol)
+                if args.command == "snapshot":
+                    return asyncio.run(run_snapshot(symbol, args.credentials, args.json_output))
+                if args.command == "account":
+                    if args.account_seq is not None and args.account_seq <= 0:
+                        raise ValueError("--account-seq는 양의 정수여야 합니다.")
+                    return asyncio.run(
+                        run_account(symbol, args.credentials, args.account_seq, args.json_output)
+                    )
+                if not 1 <= args.seconds <= 60:
+                    raise ValueError("probe 시간은 1~60초여야 합니다.")
+                return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
+            if args.command in {"watch", "live"}:
+                live_shortcut = args.command == "live"
+                symbol = normalize_symbol(args.symbol) if args.symbol is not None else None
                 if args.account_seq is not None and args.account_seq <= 0:
                     raise ValueError("--account-seq는 양의 정수여야 합니다.")
-                return asyncio.run(
-                    run_account(symbol, args.credentials, args.account_seq, args.json_output)
-                )
-            if not 1 <= args.seconds <= 60:
-                raise ValueError("probe 시간은 1~60초여야 합니다.")
-            return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
-        if args.command in {"watch", "live"}:
-            live_shortcut = args.command == "live"
-            symbol = normalize_symbol(args.symbol) if args.symbol is not None else None
-            if args.account_seq is not None and args.account_seq <= 0:
-                raise ValueError("--account-seq는 양의 정수여야 합니다.")
-            previous_gate = os.environ.get(MANUAL_LIVE_ENV_KEY)
-            if live_shortcut:
-                os.environ[MANUAL_LIVE_ENV_KEY] = MANUAL_LIVE_ENV_VALUE
-            try:
-                result = TossMarketApp(
-                    symbol,
-                    args.credentials,
-                    settings_path=settings_file(),
-                    manual_live_orders=live_shortcut or getattr(args, "live_orders", False),
-                    account_seq=args.account_seq,
-                ).run()
-                return result or 0
-            finally:
+                previous_gate = os.environ.get(MANUAL_LIVE_ENV_KEY)
                 if live_shortcut:
-                    if previous_gate is None:
-                        os.environ.pop(MANUAL_LIVE_ENV_KEY, None)
-                    else:
-                        os.environ[MANUAL_LIVE_ENV_KEY] = previous_gate
-        if args.command == "watchlist":
-            if args.watchlist_command == "list":
-                return run_watchlist_list(settings_file())
-            if args.watchlist_command == "add":
-                return run_watchlist_add(settings_file(), args.symbol)
-            if args.watchlist_command == "remove":
-                return run_watchlist_remove(settings_file(), args.symbol)
-        if args.command == "alert":
-            if args.alert_command == "list":
-                return run_alert_list(settings_file())
-            if args.alert_command == "add":
-                return run_alert_add(settings_file(), args.symbol, args.kind, args.threshold)
-            if args.alert_command == "remove":
-                return run_alert_remove(settings_file(), args.id)
-    except (CredentialError, TossApiError, SettingsError, ValueError) as exc:
+                    os.environ[MANUAL_LIVE_ENV_KEY] = MANUAL_LIVE_ENV_VALUE
+                try:
+                    result = TossMarketApp(
+                        symbol,
+                        args.credentials,
+                        settings_path=settings_file(),
+                        manual_live_orders=live_shortcut or getattr(args, "live_orders", False),
+                        account_seq=args.account_seq,
+                    ).run()
+                    return result or 0
+                finally:
+                    if live_shortcut:
+                        if previous_gate is None:
+                            os.environ.pop(MANUAL_LIVE_ENV_KEY, None)
+                        else:
+                            os.environ[MANUAL_LIVE_ENV_KEY] = previous_gate
+            if args.command == "watchlist":
+                if args.watchlist_command == "list":
+                    return run_watchlist_list(settings_file())
+                if args.watchlist_command == "add":
+                    return run_watchlist_add(settings_file(), args.symbol)
+                if args.watchlist_command == "remove":
+                    return run_watchlist_remove(settings_file(), args.symbol)
+            if args.command == "alert":
+                if args.alert_command == "list":
+                    return run_alert_list(settings_file())
+                if args.alert_command == "add":
+                    return run_alert_add(settings_file(), args.symbol, args.kind, args.threshold)
+                if args.alert_command == "remove":
+                    return run_alert_remove(settings_file(), args.id)
+    except (CredentialError, TossApiError, SettingsError, ValueError, ApiSessionLockError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

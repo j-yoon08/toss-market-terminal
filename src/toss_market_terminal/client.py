@@ -149,17 +149,44 @@ class TossMarketClient:
             self._token_expires_at = time.monotonic() + max(expires_in, 1)
             return token
 
-    async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _invalidate_token_if_stale(self, token: str) -> None:
+        """Drop the cached token only if it is still exactly the one that failed.
+
+        A concurrent caller may have already replaced it (or someone else's
+        invalidation already cleared it), in which case this is a no-op --
+        that is what keeps a burst of 401s from the same stale token to
+        exactly one replacement token issuance.
+        """
+        async with self._token_lock:
+            if self._access_token == token:
+                self._access_token = None
+                self._token_expires_at = 0.0
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
         if method != "GET":
             # Structural guarantee: this client can never issue mutations.
             raise ValueError(f"허용되지 않은 HTTP 메서드: {method}")
         token = await self.access_token()
-        response = await self._http.request(
-            method,
-            path,
-            headers={"Authorization": f"Bearer {token}"},
-            **kwargs,
-        )
+        headers = {"Authorization": f"Bearer {token}"}
+        if extra_headers:
+            headers.update(extra_headers)
+        response = await self._http.request(method, path, params=params, headers=headers)
+        if response.status_code == 401:
+            # Official contract: minting a token invalidates any other token
+            # for the same client, so a stale-token 401 is recovered with
+            # exactly one refresh + one retry here -- never a retry loop, and
+            # never for anything but this read-only GET path.
+            await self._invalidate_token_if_stale(token)
+            token = await self.access_token()
+            headers["Authorization"] = f"Bearer {token}"
+            response = await self._http.request(method, path, params=params, headers=headers)
         return response
 
     async def _get(self, path: str, params: dict[str, Any]) -> Any:
@@ -204,13 +231,11 @@ class TossMarketClient:
         """
         if path not in ACCOUNT_READ_ONLY_PATHS:
             raise ValueError(f"허용되지 않은 API 경로: {path}")
-        headers = {}
-        token = await self.access_token()
-        headers["Authorization"] = f"Bearer {token}"
+        extra_headers = {}
         if path != "/api/v1/accounts":
             seq = as_account_seq(account_seq)
-            headers["X-Tossinvest-Account"] = str(seq)
-        response = await self._http.get(path, params=params, headers=headers)
+            extra_headers["X-Tossinvest-Account"] = str(seq)
+        response = await self._request_json("GET", path, params=params, extra_headers=extra_headers)
         if response.status_code != 200:
             raise self._sanitized_error(response)
         try:
@@ -227,13 +252,17 @@ class TossMarketClient:
 
         Gated by its own single-path allowlist (``OPEN_ORDERS_READ_ONLY_PATHS``),
         separate from both the market-data and the account-context allowlists.
-        This method never issues a POST and never retries.
+        This method never issues a POST. A first 401 gets exactly one stale-
+        token refresh and retry (see ``_request_json``); it never loops.
         """
         if path not in OPEN_ORDERS_READ_ONLY_PATHS:
             raise ValueError(f"허용되지 않은 API 경로: {path}")
-        token = await self.access_token()
-        headers = {"Authorization": f"Bearer {token}", "X-Tossinvest-Account": str(account_seq)}
-        response = await self._http.get(path, params=params, headers=headers)
+        response = await self._request_json(
+            "GET",
+            path,
+            params=params,
+            extra_headers={"X-Tossinvest-Account": str(account_seq)},
+        )
         if response.status_code != 200:
             raise self._sanitized_error(response)
         try:

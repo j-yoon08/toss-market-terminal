@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from decimal import Decimal
 
 import httpx
 import pytest
 
-from toss_market_terminal.client import READ_ONLY_PATHS, TossMarketClient
+from toss_market_terminal.client import READ_ONLY_PATHS, TossApiError, TossMarketClient
 from toss_market_terminal.config import Credentials
 
 
@@ -173,3 +175,278 @@ async def test_batch_prices_rejects_out_of_bounds_and_duplicates() -> None:
         await client.prices([f"S{i}" for i in range(201)])
     with pytest.raises(ValueError):
         await client.prices(["AAPL", "aapl"])
+
+
+# --- GET-only early-401 recovery --------------------------------------------
+
+
+def _seed_stale_token(client: TossMarketClient, token: str = "stale-token") -> None:
+    """Preloads a still-fresh-looking cached token without hitting the network."""
+    client._access_token = token
+    client._token_expires_at = time.monotonic() + 3600
+
+
+@pytest.mark.asyncio
+async def test_market_get_stale_token_401_recovers_with_one_refresh_and_retry() -> None:
+    token_calls = 0
+    price_attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls
+        if request.url.path == "/oauth2/token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={"access_token": "fresh-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        assert request.url.path == "/api/v1/prices"
+        auth = request.headers["authorization"]
+        price_attempts.append(auth)
+        if auth == "Bearer fresh-token":
+            return httpx.Response(
+                200,
+                json={
+                    "result": [
+                        {
+                            "symbol": "AAPL",
+                            "lastPrice": "185.70",
+                            "currency": "USD",
+                            "timestamp": None,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(401, json={"error": "invalid-token"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        _seed_stale_token(client)
+        price = await client.price("AAPL")
+
+    assert price.last_price == Decimal("185.70")
+    assert price_attempts == ["Bearer stale-token", "Bearer fresh-token"]
+    assert token_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_account_get_stale_token_401_recovers_with_one_refresh_and_retry() -> None:
+    token_calls = 0
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls
+        if request.url.path == "/oauth2/token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={"access_token": "fresh-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        assert request.url.path == "/api/v1/buying-power"
+        assert request.headers["x-tossinvest-account"] == "7"
+        auth = request.headers["authorization"]
+        attempts.append(auth)
+        if auth == "Bearer fresh-token":
+            return httpx.Response(
+                200, json={"result": {"currency": "USD", "cashBuyingPower": "500"}}
+            )
+        return httpx.Response(401, json={"error": "invalid-token"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        _seed_stale_token(client)
+        power = await client.buying_power(7, "USD")
+
+    assert power.cash_buying_power == Decimal("500")
+    assert attempts == ["Bearer stale-token", "Bearer fresh-token"]
+    assert token_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_exchange_rate_get_stale_token_401_recovers_with_one_refresh_and_retry() -> None:
+    token_calls = 0
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls
+        if request.url.path == "/oauth2/token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={"access_token": "fresh-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        assert request.url.path == "/api/v1/exchange-rate"
+        auth = request.headers["authorization"]
+        attempts.append(auth)
+        if auth == "Bearer fresh-token":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "baseCurrency": "USD",
+                        "quoteCurrency": "KRW",
+                        "rate": "1350.5",
+                        "midRate": "1350.5",
+                        "basisPoint": "0",
+                        "rateChangeType": "EQUAL",
+                        "validFrom": "2026-01-01T00:00:00Z",
+                        "validUntil": "2026-01-01T00:01:00Z",
+                    }
+                },
+            )
+        return httpx.Response(401, json={"error": "invalid-token"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        _seed_stale_token(client)
+        rate = await client.exchange_rate()
+
+    assert rate.mid_rate == Decimal("1350.5")
+    assert attempts == ["Bearer stale-token", "Bearer fresh-token"]
+    assert token_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_get_stops_after_exactly_two_attempts_when_401_persists() -> None:
+    token_calls = 0
+    candle_attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls
+        if request.url.path == "/oauth2/token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": f"fresh-token-{token_calls}",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                },
+            )
+        assert request.url.path == "/api/v1/candles"
+        candle_attempts.append(request.headers["authorization"])
+        return httpx.Response(401, json={"error": "invalid-token"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        _seed_stale_token(client)
+        with pytest.raises(TossApiError) as caught:
+            await client.candles("AAPL", count=10)
+
+    assert caught.value.status_code == 401
+    assert len(candle_attempts) == 2
+    assert candle_attempts[0] != candle_attempts[1]
+    assert token_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_non_401_error_is_never_retried() -> None:
+    candle_attempts = 0
+    token_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal candle_attempts, token_calls
+        if request.url.path == "/oauth2/token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={"access_token": "fresh-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        assert request.url.path == "/api/v1/candles"
+        candle_attempts += 1
+        return httpx.Response(500, content=b"internal error")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        with pytest.raises(TossApiError) as caught:
+            await client.candles("AAPL", count=10)
+
+    assert caught.value.status_code == 500
+    assert candle_attempts == 1
+    assert token_calls == 1  # only the initial token issuance, no 401 recovery triggered
+
+
+@pytest.mark.asyncio
+async def test_concurrent_candle_401s_trigger_exactly_one_refresh() -> None:
+    token_calls = 0
+    current_valid_token = "fresh-token-0"  # deliberately not the seeded stale token
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls, current_valid_token
+        if request.url.path == "/oauth2/token":
+            token_calls += 1
+            current_valid_token = f"fresh-token-{token_calls}"
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": current_valid_token,
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                },
+            )
+        assert request.url.path == "/api/v1/candles"
+        if request.headers["authorization"] == f"Bearer {current_valid_token}":
+            return httpx.Response(200, json={"result": {"candles": [], "nextBefore": None}})
+        return httpx.Response(401, json={"error": "invalid-token"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        _seed_stale_token(client)
+        results = await asyncio.gather(
+            client.candles("AAPL", interval="1m", count=10),
+            client.candles("AAPL", interval="1d", count=10),
+        )
+
+    assert results == [(), ()]
+    assert token_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_401_recovery_never_leaks_token_or_body_on_final_failure() -> None:
+    secret = "tssk_live_never_print_this"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(
+                200,
+                json={"access_token": "fresh-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        assert request.url.path == "/api/v1/candles"
+        return httpx.Response(
+            401, content=json.dumps({"error": "invalid-token", "debug": secret}).encode()
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(Credentials("tsck_live_test", secret), http_client=http_client)
+        _seed_stale_token(client)
+        with pytest.raises(TossApiError) as caught:
+            await client.candles("AAPL", count=10)
+
+    assert "invalid-token" in str(caught.value)
+    assert secret not in str(caught.value)
+    assert "stale-token" not in str(caught.value)
