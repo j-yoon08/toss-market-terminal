@@ -703,6 +703,10 @@ class TossMarketApp(App[int]):
         self.last_live_outcome: (
             LiveOrderAccepted | LiveOrderRejected | LiveOrderAmbiguous | None
         ) = None
+        self.last_reconciled_account_context: AccountContext | None = None
+        self.last_reconciled_open_orders: OpenOrdersPage | None = None
+        self.live_reconciliation_monotonic: float | None = None
+        self.live_reconciliation_error: str | None = None
         self._ticket_open_lock = asyncio.Lock()
         self._live_submit_lock = asyncio.Lock()
         self._live_attempted_fingerprints: set[str] = set()
@@ -1462,15 +1466,71 @@ class TossMarketApp(App[int]):
                 raise asyncio.CancelledError
 
             # Read-only reconciliation only; never reinterpret acceptance as a fill.
-            try:
-                await self._load_account_context(plan.intent.symbol)
-                await self._load_open_orders(plan.intent.account_seq, plan.intent.symbol)
-            except Exception:
+            reconciliation = await self._reconcile_live_state(plan)
+            if reconciliation == "full":
+                self.notify(
+                    "접수 후 계좌와 미체결 주문 상태를 다시 동기화했습니다.",
+                    title="RECONCILIATION",
+                    severity="information",
+                )
+            elif reconciliation == "partial":
+                self.notify(
+                    "미체결 주문을 부분 재조회했습니다. 전체 포트폴리오 갱신을 기다리세요.",
+                    title="RECONCILIATION",
+                    severity="warning",
+                )
+            else:
                 self.notify(
                     "접수 후 계좌/주문 재조회에 실패했습니다. 체결 여부를 직접 확인하세요.",
                     title="RECONCILIATION",
                     severity="warning",
                 )
+
+    async def _reconcile_live_state(
+        self, plan: LiveOrderPlan
+    ) -> Literal["full", "partial", "failed"]:
+        """Persist post-submit GET results and refresh the portfolio without inferring a fill."""
+
+        try:
+            context = await self._load_account_context(plan.intent.symbol)
+            open_page = await self._load_open_orders(plan.intent.account_seq, plan.intent.symbol)
+        except Exception as exc:
+            self.live_reconciliation_error = safe_status_error(exc)
+            return "failed"
+
+        self.last_reconciled_account_context = context
+        self.last_reconciled_open_orders = open_page
+        self.live_reconciliation_monotonic = time.monotonic()
+        self.live_reconciliation_error = None
+
+        snapshot = self.portfolio_snapshot
+        if snapshot is not None and snapshot.account.account_seq == context.account.account_seq:
+            symbol = context.symbol.strip().upper()
+            other_orders = tuple(
+                order
+                for order in snapshot.open_orders.orders
+                if order.symbol.strip().upper() != symbol
+            )
+            updates: dict[str, object] = {
+                "open_orders": OpenOrdersPage(other_orders + open_page.orders),
+            }
+            if context.buying_power.currency == "KRW":
+                updates["krw_buying_power"] = context.buying_power
+            elif context.buying_power.currency == "USD":
+                updates["usd_buying_power"] = context.buying_power
+            self.portfolio_snapshot = replace(snapshot, **updates)
+            # This is intentionally PARTIAL: account_context only contains one
+            # symbol and cannot prove aggregate holdings totals are current.
+            self.portfolio_stale = True
+            self.portfolio_error = "주문 후 부분 재조회 · 전체 포트폴리오 동기화 대기"
+            if self._portfolio_screen is not None:
+                self._portfolio_screen.refresh_view()
+            self._render_chart()
+
+        if self.client is not None or self.portfolio_loader is not None:
+            if await self._refresh_portfolio():
+                return "full"
+        return "partial"
 
     async def _add_watchlist_symbol(self, raw_symbol: str | None) -> None:
         if raw_symbol is None:

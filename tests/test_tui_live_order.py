@@ -15,6 +15,7 @@ import pytest
 from textual.widgets import Input, Static
 
 from tests.test_order_ticket import make_context, ticket_snapshot
+from tests.test_portfolio import build_snapshot
 from toss_market_terminal.live_audit import LiveAuditLog
 from toss_market_terminal.live_order import (
     LiveOrderAmbiguous,
@@ -158,6 +159,7 @@ def open_order(status: str = "PENDING") -> OpenOrder:
             "status": status,
             "quantity": "1",
             "price": "40",
+            "execution": {"filledQuantity": "0"},
         }
     )
 
@@ -168,6 +170,7 @@ async def test_exact_live_gates_submit_once_audit_and_reconcile(
     monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
     transport = RecordingTransport()
     app = make_live_app(tmp_path, transport)
+    app.portfolio_snapshot = build_snapshot()
     account_calls = 0
     original_loader = app.account_context_loader
 
@@ -190,6 +193,16 @@ async def test_exact_live_gates_submit_once_audit_and_reconcile(
     assert account_calls == 2  # immediate preflight + read-only reconciliation
     assert app.last_live_outcome is not None
     assert app.last_live_outcome.status == "accepted"
+    assert app.last_reconciled_account_context is not None
+    assert app.last_reconciled_account_context.symbol == "AAPL"
+    assert app.last_reconciled_open_orders == OpenOrdersPage(orders=())
+    assert app.live_reconciliation_monotonic is not None
+    assert app.live_reconciliation_error is None
+    assert app.portfolio_snapshot is not None
+    assert app.portfolio_snapshot.open_orders == OpenOrdersPage(orders=())
+    assert app.portfolio_snapshot.usd_buying_power.cash_buying_power == Decimal("500")
+    assert app.portfolio_stale is True
+    assert app.portfolio_error == "주문 후 부분 재조회 · 전체 포트폴리오 동기화 대기"
 
     audit_path = tmp_path / "audit-state" / "audit.jsonl"
     rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
@@ -204,6 +217,46 @@ async def test_exact_live_gates_submit_once_audit_and_reconcile(
         "raw",
     ):
         assert forbidden not in serialized
+
+
+async def test_post_submit_reconciliation_updates_full_portfolio_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
+    app = make_live_app(tmp_path, RecordingTransport())
+    reconciled_orders = OpenOrdersPage((open_order(),))
+    full_snapshot = replace(build_snapshot(), open_orders=reconciled_orders)
+    open_calls = 0
+    portfolio_calls = 0
+
+    async def staged_open_loader(account_seq: int, symbol: str) -> OpenOrdersPage:
+        nonlocal open_calls
+        assert (account_seq, symbol) == (1, "AAPL")
+        open_calls += 1
+        return OpenOrdersPage(()) if open_calls == 1 else reconciled_orders
+
+    async def portfolio_loader():
+        nonlocal portfolio_calls
+        portfolio_calls += 1
+        return full_snapshot
+
+    app.open_orders_loader = staged_open_loader
+    current_plan = plan()
+    async with app.run_test(size=(90, 30)):
+        # Install after mount so no background polling races this one-shot test.
+        app.portfolio_loader = portfolio_loader
+        await app._submit_live_plan(
+            current_plan, live_approval_phrase(build_live_packet(current_plan))
+        )
+
+    assert open_calls == 2
+    assert portfolio_calls == 1
+    assert app.last_reconciled_open_orders == reconciled_orders
+    assert app.portfolio_snapshot == full_snapshot
+    assert app.portfolio_stale is False
+    assert app.portfolio_error is None
+    messages = [notification.message for notification in app._notifications]
+    assert any("계좌와 미체결 주문 상태" in message for message in messages)
 
 
 async def test_close_failure_cannot_override_accepted_result_or_audit(
