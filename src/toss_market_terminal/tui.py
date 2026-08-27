@@ -2494,16 +2494,23 @@ class TossMarketApp(App[int]):
         naive candle timestamps or a currency mismatch; callers must handle
         that to keep rendering resilient to bad data.
         """
+        snapshot = self.snapshot
+        current_price = self.current_price
+        if snapshot is None or current_price is None:
+            raise ValueError("차트 지표 계산에 현재 snapshot과 가격이 필요합니다.")
         if (
             self._indicator_base is None
-            or self._indicator_base_snapshot is not self.snapshot
+            or self._indicator_base_snapshot is not snapshot
             or self._indicator_base_mode != self.chart_mode
         ):
-            base = chart_indicator_base(self.snapshot, self.chart_mode)
+            base = chart_indicator_base(snapshot, self.chart_mode)
             self._indicator_base = base
-            self._indicator_base_snapshot = self.snapshot
+            self._indicator_base_snapshot = snapshot
             self._indicator_base_mode = self.chart_mode
-        return chart_indicators_from_base(self._indicator_base, self.current_price)
+        indicator_base = self._indicator_base
+        if indicator_base is None:
+            raise RuntimeError("차트 지표 base 생성에 실패했습니다.")
+        return chart_indicators_from_base(indicator_base, current_price)
 
     def _render_stats(self) -> None:
         if self.snapshot is None or self.current_price is None:

@@ -120,7 +120,8 @@ def trade_pressure_label_ko(value: Decimal | None) -> str:
 def format_decimal(value: Decimal, currency: str | None = None) -> str:
     if currency == "KRW":
         return f"{value:,.0f}"
-    exponent = -value.as_tuple().exponent
+    raw_exponent = value.as_tuple().exponent
+    exponent = -raw_exponent if isinstance(raw_exponent, int) else 2
     places = min(max(exponent, 2), 6)
     return f"{value:,.{places}f}".rstrip("0").rstrip(".")
 
@@ -221,7 +222,7 @@ def market_metrics(
     change = price - previous_close if previous_close is not None else None
     change_percent = (
         change / previous_close * Decimal("100")
-        if change is not None and previous_close not in {None, Decimal("0")}
+        if change is not None and previous_close is not None and previous_close != Decimal("0")
         else None
     )
 
@@ -931,7 +932,7 @@ def chart_renderable(
             previous_close_row = candidate_row
 
     holding_average_row = None
-    if price_rows and holding_average_in_range:
+    if price_rows and holding_average_in_range and holding_average is not None:
         candidate_row = _price_row(holding_average.price, low, span, price_rows)
         if candidate_row != current_price_row:
             holding_average_row = candidate_row
@@ -957,7 +958,7 @@ def chart_renderable(
         if holding_average_label is not None:
             if holding_average_row is not None:
                 axis_rows[holding_average_row] = (holding_average_label, HOLDING_AVERAGE_COLOR)
-            elif not holding_average_in_range:
+            elif not holding_average_in_range and holding_average is not None:
                 above_high = holding_average.price > high
                 boundary_row = 0 if above_high else price_rows - 1
                 opposite_boundary_row = price_rows - 1 if above_high else 0

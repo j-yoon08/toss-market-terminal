@@ -47,7 +47,7 @@ def test_version_flag_is_available_without_a_subcommand(capsys: pytest.CaptureFi
     with pytest.raises(SystemExit) as caught:
         build_parser().parse_args(["--version"])
     assert caught.value.code == 0
-    assert capsys.readouterr().out.strip() == "toss-market 0.10.0"
+    assert capsys.readouterr().out.strip() == "toss-market 0.10.1"
 
 
 def sample_context() -> AccountContext:

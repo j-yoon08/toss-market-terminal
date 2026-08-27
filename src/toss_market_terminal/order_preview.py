@@ -273,6 +273,8 @@ class RiskGate:
             if intent.order_type is OrderType.LIMIT
             else intent.reference_last_price
         )
+        if unit_price is None:
+            raise OrderPreviewError("주문 가격 기준값이 누락되었습니다.")
         return intent.quantity * unit_price
 
 

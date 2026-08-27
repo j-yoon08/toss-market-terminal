@@ -96,11 +96,19 @@ def apply_trade_to_candles(
     if newest.currency != trade.currency:
         raise ValueError("실시간 체결과 캔들의 통화가 일치하지 않습니다.")
     newest_time = _parse_aware_timestamp(newest.timestamp)
-    trade_key = _bucket_key(trade_time, interval, newest_time)
-    newest_key = _bucket_key(newest_time, interval, newest_time)
-    if trade_key < newest_key:
+    if interval == "1m":
+        trade_key = _minute_key(trade_time)
+        newest_key = _minute_key(newest_time)
+        is_older = trade_key < newest_key
+        is_same_bucket = trade_key == newest_key
+    else:
+        trade_key = _daily_key(trade_time, newest_time)
+        newest_key = _daily_key(newest_time, newest_time)
+        is_older = trade_key < newest_key
+        is_same_bucket = trade_key == newest_key
+    if is_older:
         return items
-    if trade_key == newest_key:
+    if is_same_bucket:
         return (
             replace(
                 newest,

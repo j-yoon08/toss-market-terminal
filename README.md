@@ -2,6 +2,16 @@
 
 토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 `live` 실행·주문정보 최종 확인·검토 잠금 이후의 새 Enter·내부 전체 지문 executor 게이트를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다.
 
+## v0.10.1 시세·주문 runtime 안전성
+
+- REST snapshot과 WebSocket 체결의 provider timestamp를 실제 freshness 기준으로 사용합니다. 오래되거나 timezone이 없거나 허용 범위를 크게 벗어난 시각은 현재 수신했다는 이유만으로 fresh가 되지 않으며, stale 상태에서는 PAPER 미리보기와 LIVE 주문을 모두 fail-closed로 차단합니다. 호가 수신은 TICK freshness를 갱신하지 않습니다.
+- 가격·거래량·OHLC·timestamp·통화·심볼을 strict model에서 검증하고, 요청 심볼과 다른 응답이나 snapshot 하위 응답의 심볼/통화 불일치를 거부합니다.
+- 기본 REST/WebSocket 연결은 환경 프록시를 상속하지 않습니다. WebSocket backoff는 TCP 연결만으로 초기화하지 않고 subscription ACK 이후에만 초기화되어 즉시 종료 반복 시 1·2·4초 순서로 증가합니다.
+- 주문 접수 뒤 계좌와 미체결 주문을 GET으로 재조회해 앱 상태에 반영합니다. 부분 재조회는 전체 포트폴리오 fresh로 표시하지 않으며, 브로커 접수는 계속 체결과 구분합니다.
+- 관심종목 `A` 열은 `•` 실제 감시, `~` 필요 데이터 대기, `±` 혼합 상태를 뜻합니다. 비선택 종목은 batch 가격으로 가능한 목표가 알림만 감시하고 change/volume 지표 알림은 활성 snapshot/candle을 기다립니다.
+- 상태바의 `OPS category:state`는 WebSocket·candle sync·alert·reconciliation의 최신 전환을 보여줍니다. 기록은 메모리 내 최대 200건이며 token·계좌번호·provider 원문을 담는 필드가 없습니다.
+- GitHub Actions가 Python 3.12/3.13에서 Ruff·pytest/coverage를 실행하고, 별도 품질 job이 production source Pyright·Bandit·pip-audit·wheel/sdist build를 검증합니다.
+
 ## v0.10.0 시장 신호 해석
 
 - 차트 아래 고정 패널이 원시 지표 나열 대신 `시장 해석 · <시간대> <상태> · 신뢰도 <수준>`을 먼저 표시합니다. 상태는 `상승 우세`·`하락 우세`·`반등 시도`·`조정 진행`·`박스권`·`신호 충돌`·`데이터 부족`으로 제한됩니다.

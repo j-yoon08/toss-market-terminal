@@ -407,7 +407,8 @@ class OrderConfirmScreen(ModalScreen[bool]):
                 f" {intent.currency}"
             )
         else:
-            assert intent.limit_price is not None  # LIMIT은 도메인 계층에서 항상 보장
+            if intent.limit_price is None:
+                raise RuntimeError("LIMIT 주문의 지정가가 누락되었습니다.")
             price_line = f"지정가 {canonical_decimal_text(intent.limit_price)} {intent.currency}"
         return "\n".join(
             [

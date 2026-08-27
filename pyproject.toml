@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "toss-market-terminal"
-version = "0.10.0"
+version = "0.10.1"
 description = "Paper-default market terminal with guarded manual Toss Open API orders"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,8 +22,12 @@ toss-market = "toss_market_terminal.cli:main"
 
 [dependency-groups]
 dev = [
+  "bandit>=1.8",
+  "pip-audit>=2.9",
+  "pyright>=1.1.400",
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
   "ruff>=0.9",
 ]
 
@@ -41,3 +45,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"

@@ -115,6 +115,9 @@ class ApiSessionLock:
     def acquire(self) -> None:
         if self._fd is not None:
             return
+        if fcntl is None:
+            raise _fail("FCNTL_UNAVAILABLE")
+        fcntl_module = fcntl
         _prepare_leaf_directory(self._path.parent)
         _verify_existing_file(self._path)
 
@@ -143,7 +146,7 @@ class ApiSessionLock:
             ):
                 raise _fail("UNSAFE_LOCK_FILE")
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl_module.flock(fd, fcntl_module.LOCK_EX | fcntl_module.LOCK_NB)
             except BlockingIOError:
                 raise _fail(_CONTENTION_MESSAGE) from None
             marker = f"pid={os.getpid()}\n".encode()[:_MAX_MARKER_BYTES]
@@ -160,7 +163,8 @@ class ApiSessionLock:
         fd = self._fd
         self._fd = None
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
 

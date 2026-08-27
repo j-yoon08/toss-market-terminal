@@ -198,7 +198,8 @@ class TossMarketStream:
 
     @staticmethod
     def _retry_delay(attempt: int) -> float:
-        return min(30.0, 2 ** min(attempt - 1, 5)) + random.uniform(0, 0.5)
+        # Backoff jitter isn't used for secrets, identifiers, or authorization.
+        return min(30.0, 2 ** min(attempt - 1, 5)) + random.uniform(0, 0.5)  # nosec B311
 
     @staticmethod
     async def _keepalive(websocket: Any) -> None:

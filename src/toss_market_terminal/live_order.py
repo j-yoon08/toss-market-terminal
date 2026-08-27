@@ -239,6 +239,8 @@ def create_live_plan(
         if preview.intent.order_type.value == "LIMIT"
         else preview.intent.reference_last_price
     )
+    if unit_price is None:
+        raise LiveOrderError("주문 가격 기준값이 누락되었습니다.")
     expected_notional = preview.intent.quantity * unit_price
     if preview.estimated_notional != expected_notional:
         raise LiveOrderError("미리보기 추정 금액이 의도와 일치하지 않습니다(위조 가능).")
@@ -445,23 +447,26 @@ class ManualLiveOrderExecutor:
             if self._attempted.get(fingerprint, False):
                 return self._blocked("ALREADY_ATTEMPTED")
 
+            transport = self._transport
             missing = _missing_gates(
                 request,
                 approval_phrase,
                 packet,
                 now_utc,
                 plan,
-                self._transport,
+                transport,
             )
             if missing:
                 return self._blocked(missing)
+            if transport is None:  # Kept explicit for type narrowing after the gate.
+                return self._blocked("TRANSPORT_NOT_AVAILABLE")
 
             # 원자적으로 시도를 예약한다. 이후 성공/거절/모호 여부와 무관하게 재제출 없음.
             self._attempted[fingerprint] = True
 
         attempted_at = now_utc
         try:
-            raw = self._transport.submit(packet)
+            raw = transport.submit(packet)
         except LiveOrderTransportError:
             # transport 계약상 이미 정제된 거절이다. 원문 정보는 여기서도 보관하지 않는다.
             self._record(fingerprint, packet, attempted_at, "rejected", "TRANSPORT_SUBMIT_ERROR")
