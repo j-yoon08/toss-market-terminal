@@ -193,6 +193,32 @@ class WatchlistRow:
     waiting_alerts: int
 
 
+@dataclass(frozen=True, slots=True)
+class OperationalTransition:
+    category: str
+    state: str
+    observed_monotonic: float
+
+
+_OPERATION_STATES: dict[str, frozenset[str]] = {
+    "ws": frozenset(
+        {
+            "connecting",
+            "connected",
+            "reconnecting",
+            "subscribed",
+            "auth_error",
+            "error",
+            "rejected",
+            "protocol_error",
+        }
+    ),
+    "candle": frozenset({"degraded", "recovered"}),
+    "alert": frozenset({"fired"}),
+    "reconciliation": frozenset({"full", "partial", "failed"}),
+}
+
+
 def _submit_live_plan_once(
     plan: LiveOrderPlan,
     approval_phrase: str,
@@ -688,6 +714,7 @@ class TossMarketApp(App[int]):
         self.protocol_degraded = False
         self.indicator_degraded = False
         self.candle_sync_degraded = False
+        self.operational_transitions: deque[OperationalTransition] = deque(maxlen=200)
         self.last_tick_monotonic: float | None = None
         self.last_orderbook_monotonic: float | None = None
         self.last_sync_monotonic: float | None = None
@@ -1497,6 +1524,7 @@ class TossMarketApp(App[int]):
             open_page = await self._load_open_orders(plan.intent.account_seq, plan.intent.symbol)
         except Exception as exc:
             self.live_reconciliation_error = safe_status_error(exc)
+            self._record_operation("reconciliation", "failed")
             return "failed"
 
         self.last_reconciled_account_context = context
@@ -1530,8 +1558,22 @@ class TossMarketApp(App[int]):
 
         if self.client is not None or self.portfolio_loader is not None:
             if await self._refresh_portfolio():
+                self._record_operation("reconciliation", "full")
                 return "full"
+        self._record_operation("reconciliation", "partial")
         return "partial"
+
+    def _record_operation(self, category: str, state: str) -> None:
+        """Record one bounded, allowlisted transition without raw provider data."""
+
+        if state not in _OPERATION_STATES.get(category, frozenset()):
+            return
+        latest = self.operational_transitions[-1] if self.operational_transitions else None
+        if latest is not None and latest.category == category and latest.state == state:
+            return
+        self.operational_transitions.append(
+            OperationalTransition(category, state, time.monotonic())
+        )
 
     async def _add_watchlist_symbol(self, raw_symbol: str | None) -> None:
         if raw_symbol is None:
@@ -1847,6 +1889,7 @@ class TossMarketApp(App[int]):
 
     def _emit_alert(self, event: AlertEvent) -> None:
         self.latest_alert = event
+        self._record_operation("alert", "fired")
         if self.is_mounted:
             self.notify(event.message, title="MARKET ALERT", severity="information", timeout=8)
             self.bell()
@@ -2133,7 +2176,10 @@ class TossMarketApp(App[int]):
                 self.chart_render_task = None
 
     def _set_candle_sync_degraded(self, detail: str = "WS live · candle sync failed") -> None:
+        was_degraded = self.candle_sync_degraded
         self.candle_sync_degraded = True
+        if not was_degraded:
+            self._record_operation("candle", "degraded")
         if self.stream_live:
             self.connection_state = "DEGRADED"
             self.connection_detail = detail
@@ -2173,7 +2219,10 @@ class TossMarketApp(App[int]):
                 daily_candles = apply_trade_to_candles(daily_candles, trade, interval="1d")
             self._live_candles = candles
             self._live_daily_candles = daily_candles
+            was_degraded = self.candle_sync_degraded
             self.candle_sync_degraded = False
+            if was_degraded:
+                self._record_operation("candle", "recovered")
             self.last_sync_monotonic = time.monotonic()
             self._publish_live_chart()
             if self.stream_live and not self.protocol_degraded and not self.indicator_degraded:
@@ -2238,6 +2287,7 @@ class TossMarketApp(App[int]):
     async def _handle_stream_status(self, event: StreamStatus) -> None:
         if event.state == "pong":
             return
+        self._record_operation("ws", event.state)
         if event.state in {"connecting", "connected", "reconnecting"}:
             self.stream_live = False
             self.protocol_degraded = False
@@ -2615,6 +2665,12 @@ class TossMarketApp(App[int]):
         status.append(f"   TICK {format_age(self.last_tick_monotonic)}", style=MUTED_COLOR)
         status.append(f"   BOOK {format_age(self.last_orderbook_monotonic)}", style=MUTED_COLOR)
         status.append(f"   SYNC {format_age(self.last_sync_monotonic)}", style=MUTED_COLOR)
+        if self.operational_transitions:
+            latest_operation = self.operational_transitions[-1]
+            status.append(
+                f"   OPS {latest_operation.category}:{latest_operation.state}",
+                style=MUTED_COLOR,
+            )
         if self.latest_alert is not None:
             status.append(
                 f"\nALERT {self.latest_alert.rule.id} · {self.latest_alert.rule.symbol} · "

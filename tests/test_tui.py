@@ -1152,6 +1152,35 @@ async def test_watchlist_alerts_distinguish_monitored_from_waiting_data(tmp_path
     assert calls == 2
 
 
+async def test_operational_transitions_are_allowlisted_bounded_and_visible(tmp_path: Path) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    app._record_operation("ws", "connecting")
+    app._record_operation("ws", "connecting")
+    assert len(app.operational_transitions) == 1
+
+    app._record_operation("ws", "secret-token-in-state")
+    assert len(app.operational_transitions) == 1
+    for index in range(205):
+        app._record_operation("ws", "connected" if index % 2 else "reconnecting")
+    assert len(app.operational_transitions) == 200
+    assert all(
+        set(transition.__slots__) == {"category", "state", "observed_monotonic"}
+        for transition in app.operational_transitions
+    )
+    assert "secret-token-in-state" not in repr(tuple(app.operational_transitions))
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        app._render_chrome()
+        status = app.query_one("#statusbar", Static).render().plain
+        assert "OPS ws:reconnecting" in status
+
+
 async def test_tui_emits_one_edge_alert_and_renders_market_signals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
