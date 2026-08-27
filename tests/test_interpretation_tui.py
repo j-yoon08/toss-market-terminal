@@ -6,9 +6,14 @@ import pytest
 from rich.cells import cell_len
 from textual.widgets import Static
 
-from tests.helpers import sample_snapshot
+from tests.helpers import sample_snapshot as _sample_snapshot
 from toss_market_terminal.settings import Settings
 from toss_market_terminal.tui import TossMarketApp
+
+
+def sample_snapshot():
+    return _sample_snapshot(fresh_price=True)
+
 
 FORBIDDEN = ("매수 추천", "매도 추천", "BUY", "SELL", "무조건", "확실", "매수 적기")
 

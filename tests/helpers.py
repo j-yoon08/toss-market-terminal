@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from toss_market_terminal.models import (
@@ -13,10 +14,11 @@ from toss_market_terminal.models import (
 )
 
 
-def sample_snapshot() -> MarketSnapshot:
+def sample_snapshot(*, fresh_price: bool = False) -> MarketSnapshot:
+    price_timestamp = datetime.now(UTC).isoformat() if fresh_price else "2026-08-26T04:00:00+09:00"
     return MarketSnapshot(
         stock=StockInfo("AAPL", "애플", "APPLE INC", "NASDAQ", "USD"),
-        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-26T04:00:00+09:00"),
+        price=Price("AAPL", Decimal("110.00"), "USD", price_timestamp),
         orderbook=Orderbook(
             "USD",
             asks=(

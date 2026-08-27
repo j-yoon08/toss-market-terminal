@@ -9,7 +9,7 @@ import pytest
 from rich.cells import cell_len
 from textual.widgets import Static
 
-from tests.helpers import sample_snapshot
+from tests.helpers import sample_snapshot as _sample_snapshot
 from tests.test_portfolio import (
     build_snapshot,
     official_item,
@@ -25,6 +25,10 @@ from toss_market_terminal.models import ClosedOrdersPage, ExchangeRate
 from toss_market_terminal.portfolio import PortfolioScreen
 from toss_market_terminal.settings import Settings
 from toss_market_terminal.tui import TossMarketApp
+
+
+def sample_snapshot():
+    return _sample_snapshot(fresh_price=True)
 
 
 def portfolio_app(tmp_path: Path) -> TossMarketApp:

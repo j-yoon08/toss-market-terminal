@@ -118,6 +118,7 @@ PORTFOLIO_REFRESH_SECONDS = 30.0
 EXCHANGE_RATE_REFRESH_SECONDS = 60.0
 ORDER_HISTORY_REFRESH_SECONDS = 300.0
 PRICE_STALE_SECONDS = 120.0
+MAX_FUTURE_PRICE_SKEW_SECONDS = 30.0
 COMPACT_WIDTH_THRESHOLD = 117
 LiveCandleStatus = Literal["updated", "late", "unavailable"]
 LiveTransportFactory = Callable[[str, int], LiveOrderTransport]
@@ -614,8 +615,10 @@ class TossMarketApp(App[int]):
         live_audit_log: LiveAuditLog | None = None,
         live_transport_factory: LiveTransportFactory | None = None,
         account_seq: int | None = None,
+        utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         super().__init__()
+        self.utc_now = utc_now
         if symbol is None and initial_snapshot is not None:
             symbol = initial_snapshot.stock.symbol
         self.symbol = normalize_symbol(symbol) if symbol is not None else ""
@@ -1888,6 +1891,31 @@ class TossMarketApp(App[int]):
         self._render_all()
         return True
 
+    def _tick_monotonic_for_timestamp(self, timestamp: str | None) -> float | None:
+        """Truthful monotonic tick time for a provider timestamp, or ``None`` if untrustworthy.
+
+        The provider timestamp is anchored against injected UTC "now" to compute
+        an age, then that age is subtracted from the local monotonic clock so
+        staleness checks reflect the provider's own clock, not wall-clock receipt
+        time. Missing, naive, invalid, or implausibly-future timestamps must never
+        be trusted as a fresh observation.
+        """
+        if not timestamp:
+            return None
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        now = self.utc_now()
+        if now.tzinfo is None or now.utcoffset() is None:
+            return None
+        age_seconds = (now - parsed).total_seconds()
+        if age_seconds < -MAX_FUTURE_PRICE_SKEW_SECONDS:
+            return None
+        return time.monotonic() - max(age_seconds, 0.0)
+
     def _apply_snapshot(
         self,
         snapshot: MarketSnapshot,
@@ -1913,13 +1941,16 @@ class TossMarketApp(App[int]):
         latest_trade = replay_trades[-1] if replay_trades else None
         self.current_price = latest_trade.price if latest_trade else snapshot.price.last_price
         self.current_currency = latest_trade.currency if latest_trade else snapshot.price.currency
-        self.current_timestamp = (
-            latest_trade.timestamp if latest_trade else snapshot.price.timestamp
+        newest_timestamp = (
+            latest_trade.timestamp if latest_trade is not None else snapshot.price.timestamp
         )
+        self.current_timestamp = newest_timestamp
         # A REST snapshot (initial load or resync) is itself a fresh price
         # observation, so it establishes/renews the TICK clock. Orderbook-only
-        # traffic must never do this (see `last_orderbook_monotonic`).
-        self.last_tick_monotonic = time.monotonic()
+        # traffic must never do this (see `last_orderbook_monotonic`). The clock
+        # is anchored to the provider's own timestamp, not receipt time, so a
+        # stale snapshot cannot masquerade as fresh.
+        self.last_tick_monotonic = self._tick_monotonic_for_timestamp(newest_timestamp)
         self._indicator_base = None
         self._indicator_base_snapshot = None
         self._indicator_base_mode = None
@@ -2055,19 +2086,26 @@ class TossMarketApp(App[int]):
                 if event.symbol != feed_symbol:
                     continue
                 self._recover_protocol_status()
-                try:
-                    candle_status: LiveCandleStatus | None = self._record_live_trade(event.trade)
-                except ValueError:
-                    candle_status = None
-                    self._set_candle_sync_degraded("WS live · candle update failed")
+                event_tick = self._tick_monotonic_for_timestamp(event.trade.timestamp)
+                is_fresh = event_tick is not None and (
+                    self.last_tick_monotonic is None or event_tick >= self.last_tick_monotonic
+                )
+                candle_status: LiveCandleStatus | None = None
+                if is_fresh:
+                    try:
+                        candle_status = self._record_live_trade(event.trade)
+                    except ValueError:
+                        candle_status = None
+                        self._set_candle_sync_degraded("WS live · candle update failed")
                 self.trades.appendleft(event.trade)
-                self.last_tick_monotonic = time.monotonic()
-                if candle_status != "late":
-                    self.current_price = event.trade.price
-                    self.current_currency = event.trade.currency
-                    self.current_timestamp = event.trade.timestamp
-                    self._evaluate_active_alerts()
-                    self._render_summary()
+                if is_fresh:
+                    self.last_tick_monotonic = event_tick
+                    if candle_status != "late":
+                        self.current_price = event.trade.price
+                        self.current_currency = event.trade.currency
+                        self.current_timestamp = event.trade.timestamp
+                        self._evaluate_active_alerts()
+                        self._render_summary()
                 self._render_trades()
                 if candle_status == "updated":
                     self._schedule_live_chart_render()

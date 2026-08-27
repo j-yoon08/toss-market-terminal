@@ -10,7 +10,7 @@ from rich.cells import cell_len
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Input, Static
 
-from tests.helpers import sample_snapshot
+from tests.helpers import sample_snapshot as _sample_snapshot
 from toss_market_terminal import tui as tui_module
 from toss_market_terminal.models import MarketSnapshot, Price, Trade
 from toss_market_terminal.render import (
@@ -22,6 +22,10 @@ from toss_market_terminal.render import chart_indicator_base as real_chart_indic
 from toss_market_terminal.settings import AlertRule, Settings, SettingsStore
 from toss_market_terminal.stream import OrderbookEvent, StreamStatus, TradeEvent
 from toss_market_terminal.tui import TossMarketApp, WatchlistAddScreen
+
+
+def sample_snapshot() -> MarketSnapshot:
+    return _sample_snapshot(fresh_price=True)
 
 
 async def test_wide_tui_renders_three_panel_market_console(tmp_path: Path) -> None:
@@ -329,6 +333,7 @@ async def test_trade_event_renews_tick_clock(
         tmp_path / "unused.json",
         initial_snapshot=sample_snapshot(),
         connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T01:00:30+00:00"),
     )
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
@@ -340,6 +345,141 @@ async def test_trade_event_renews_tick_clock(
 
         assert app.last_tick_monotonic is not None
         assert app.last_tick_monotonic != 1.0
+
+
+async def test_hour_old_trade_event_never_freshens_price(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class OneTradeStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("999"), Decimal("7"), "2026-08-25T10:00:00+00:00", "USD"),
+            )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", OneTradeStream)
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-25T10:59:55+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T11:00:00+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.client = FakeClient()  # type: ignore[assignment]
+        tick_before = app.last_tick_monotonic
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        assert app.current_price != Decimal("999")
+        assert app.current_timestamp != "2026-08-25T10:00:00+00:00"
+        assert app.last_tick_monotonic == tick_before
+
+
+async def test_out_of_order_trade_event_cannot_regress_current_price(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class TwoTradeStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("151"), Decimal("1"), "2026-08-25T10:59:55+00:00", "USD"),
+            )
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("999"), Decimal("1"), "2026-08-25T10:59:00+00:00", "USD"),
+            )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", TwoTradeStream)
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-25T10:59:50+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T11:00:00+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.client = FakeClient()  # type: ignore[assignment]
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        assert app.current_price == Decimal("151")
+        assert app.current_timestamp == "2026-08-25T10:59:55+00:00"
+        tick_after_first = app._tick_monotonic_for_timestamp("2026-08-25T10:59:55+00:00")
+        assert app.last_tick_monotonic == pytest.approx(tick_after_first, abs=1.0)
+
+
+async def test_small_future_skew_trade_event_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class OneTradeStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("151"), Decimal("1"), "2026-08-25T11:00:10+00:00", "USD"),
+            )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", OneTradeStream)
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-25T10:59:55+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T11:00:00+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.client = FakeClient()  # type: ignore[assignment]
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        assert app.current_price == Decimal("151")
+        assert app.current_timestamp == "2026-08-25T11:00:10+00:00"
+        assert app.last_tick_monotonic is not None
 
 
 async def test_hour_old_tick_makes_interpretation_stale_even_when_live(
@@ -354,6 +494,7 @@ async def test_hour_old_tick_makes_interpretation_stale_even_when_live(
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
         app.connection_state = "LIVE"
+        app.last_tick_monotonic = tui_module.time.monotonic()
         assert not app._interpretation_is_stale()
         app.last_tick_monotonic = tui_module.time.monotonic() - 3600.0
         assert app._interpretation_is_stale()
@@ -367,6 +508,138 @@ def test_price_stale_seconds_must_be_positive(tmp_path: Path) -> None:
             connect_live=False,
             price_stale_seconds=0,
         )
+
+
+def _fixed_utc_now(iso: str):
+    from datetime import datetime as _datetime
+
+    fixed = _datetime.fromisoformat(iso)
+
+    def _now() -> _datetime:
+        return fixed
+
+    return _now
+
+
+async def test_old_snapshot_timestamp_is_immediately_stale(tmp_path: Path) -> None:
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-25T10:00:00+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T11:00:00+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.connection_state = "LIVE"
+        assert app._interpretation_is_stale()
+
+
+async def test_fresh_snapshot_timestamp_is_not_stale(tmp_path: Path) -> None:
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-25T10:00:00+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T10:00:05+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.connection_state = "LIVE"
+        assert not app._interpretation_is_stale()
+
+
+async def test_missing_timestamp_and_no_trades_is_stale(tmp_path: Path) -> None:
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", None),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T10:00:05+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.connection_state = "LIVE"
+        assert app.last_tick_monotonic is None
+        assert app._interpretation_is_stale()
+
+
+async def test_price_timestamp_more_than_30s_in_future_is_stale(tmp_path: Path) -> None:
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-25T10:01:00+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T10:00:00+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.connection_state = "LIVE"
+        assert app.last_tick_monotonic is None
+        assert app._interpretation_is_stale()
+
+
+async def test_price_timestamp_small_future_skew_is_fresh(tmp_path: Path) -> None:
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(),
+        price=Price("AAPL", Decimal("110.00"), "USD", "2026-08-25T10:00:10+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T10:00:00+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.connection_state = "LIVE"
+        assert app.last_tick_monotonic is not None
+        assert not app._interpretation_is_stale()
+
+
+async def test_snapshot_trades_never_freshen_price_timestamp(tmp_path: Path) -> None:
+    snapshot = replace(
+        sample_snapshot(),
+        trades=(
+            Trade(Decimal("108"), Decimal("1"), "2026-08-25T09:00:00+00:00", "USD"),
+            Trade(Decimal("110"), Decimal("2"), "2026-08-25T10:00:00+00:00", "USD"),
+        ),
+        price=Price("AAPL", Decimal("100.00"), "USD", "2026-08-25T08:00:00+00:00"),
+    )
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=snapshot,
+        connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T10:00:05+00:00"),
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.connection_state = "LIVE"
+        assert app.current_timestamp == "2026-08-25T08:00:00+00:00"
+        assert app._interpretation_is_stale()
 
 
 async def test_watchlist_refresh_keeps_last_good_rows_and_primary_state(tmp_path: Path) -> None:
@@ -724,6 +997,7 @@ async def test_switch_cancels_old_feed_recomputes_market_and_ignores_stale_event
         initial_snapshot=sample_snapshot(),
         connect_live=False,
         settings=Settings(watchlist=("AAPL", "005930")),
+        utc_now=_fixed_utc_now("2026-08-25T10:00:03+00:00"),
     )
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
@@ -1177,6 +1451,7 @@ async def test_indicator_error_in_live_tick_keeps_feed_running_and_recovers_on_s
         tmp_path / "unused.json",
         initial_snapshot=broken,
         connect_live=False,
+        utc_now=_fixed_utc_now("2026-08-25T10:00:04+00:00"),
     )
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
@@ -1352,6 +1627,7 @@ async def test_trade_event_updates_latest_candle_and_rendered_chart(
         initial_snapshot=sample_snapshot(),
         connect_live=False,
         chart_render_interval_seconds=0,
+        utc_now=_fixed_utc_now("2026-08-25T01:00:32+00:00"),
     )
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
@@ -1403,6 +1679,7 @@ async def test_high_frequency_trades_are_coalesced_with_a_trailing_render(
         initial_snapshot=sample_snapshot(),
         connect_live=False,
         chart_render_interval_seconds=0.05,
+        utc_now=_fixed_utc_now("2026-08-25T01:00:35+00:00"),
     )
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()
@@ -1547,6 +1824,7 @@ async def test_trade_without_snapshot_keeps_tape_quote_and_price_alert(
             watchlist=("AAPL",),
             alerts=(AlertRule("A1", "AAPL", "above", Decimal("115")),),
         ),
+        utc_now=_fixed_utc_now("2026-08-25T01:01:02+00:00"),
     )
     async with app.run_test(size=(140, 42)) as pilot:
         await pilot.pause()

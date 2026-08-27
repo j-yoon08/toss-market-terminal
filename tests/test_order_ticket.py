@@ -126,10 +126,11 @@ class SlowLoader:
 
 def ticket_snapshot():
     """마운트 시 current_price=40 USD가 되는 스냅샷(안전 상한 100 USD 내 통과)."""
+    base = sample_snapshot(fresh_price=True)
     return replace(
-        sample_snapshot(),
-        price=Price("AAPL", Decimal("40"), "USD", "2026-08-25T10:00:00+09:00"),
-        trades=(Trade(Decimal("40"), Decimal("2"), "2026-08-25T10:00:00+09:00", "USD"),),
+        base,
+        price=Price("AAPL", Decimal("40"), "USD", base.price.timestamp),
+        trades=(Trade(Decimal("40"), Decimal("2"), base.price.timestamp, "USD"),),
     )
 
 
