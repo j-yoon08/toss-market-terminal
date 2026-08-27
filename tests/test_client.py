@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from decimal import Decimal
 
 import httpx
@@ -10,6 +11,7 @@ import pytest
 
 from toss_market_terminal.client import READ_ONLY_PATHS, TossApiError, TossMarketClient
 from toss_market_terminal.config import Credentials
+from toss_market_terminal.models import MarketSnapshot
 
 
 @pytest.mark.asyncio
@@ -175,6 +177,291 @@ async def test_batch_prices_rejects_out_of_bounds_and_duplicates() -> None:
         await client.prices([f"S{i}" for i in range(201)])
     with pytest.raises(ValueError):
         await client.prices(["AAPL", "aapl"])
+
+
+# --- Provider response <-> request symbol/currency binding -----------------
+
+
+def _token_or(
+    path_responses: dict[str, dict],
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(
+                200,
+                json={"access_token": "test-token", "token_type": "Bearer", "expires_in": 3600},
+            )
+        return httpx.Response(200, json=path_responses[request.url.path])
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_stock_rejects_response_for_a_different_symbol() -> None:
+    handler = _token_or(
+        {
+            "/api/v1/stocks": {
+                "result": [
+                    {
+                        "symbol": "NVDA",
+                        "name": "엔비디아",
+                        "englishName": "NVIDIA CORP",
+                        "market": "NASDAQ",
+                        "currency": "USD",
+                    }
+                ]
+            }
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        with pytest.raises(TossApiError) as caught:
+            await client.stock("AAPL")
+    assert caught.value.status_code == 200
+    assert caught.value.code == "stock-symbol-mismatch"
+    assert "NVDA" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_price_rejects_response_for_a_different_symbol() -> None:
+    handler = _token_or(
+        {
+            "/api/v1/prices": {
+                "result": [
+                    {"symbol": "NVDA", "lastPrice": "130.10", "currency": "USD", "timestamp": None}
+                ]
+            }
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        with pytest.raises(TossApiError) as caught:
+            await client.price("AAPL")
+    assert caught.value.status_code == 200
+    assert caught.value.code == "price-symbol-mismatch"
+    assert "NVDA" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_batch_prices_rejects_an_unrequested_returned_symbol() -> None:
+    handler = _token_or(
+        {
+            "/api/v1/prices": {
+                "result": [
+                    {"symbol": "AAPL", "lastPrice": "185.70", "currency": "USD", "timestamp": None},
+                    {"symbol": "NVDA", "lastPrice": "130.10", "currency": "USD", "timestamp": None},
+                ]
+            }
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        with pytest.raises(TossApiError) as caught:
+            await client.prices(["AAPL", "MSFT"])
+    assert caught.value.status_code == 200
+    assert caught.value.code == "price-unrequested-symbol"
+    assert "NVDA" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_batch_prices_rejects_a_duplicate_returned_symbol() -> None:
+    handler = _token_or(
+        {
+            "/api/v1/prices": {
+                "result": [
+                    {"symbol": "AAPL", "lastPrice": "185.70", "currency": "USD", "timestamp": None},
+                    {"symbol": "AAPL", "lastPrice": "186.00", "currency": "USD", "timestamp": None},
+                ]
+            }
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        with pytest.raises(TossApiError) as caught:
+            await client.prices(["AAPL", "MSFT"])
+    assert caught.value.status_code == 200
+    assert caught.value.code == "price-duplicate-symbol"
+
+
+@pytest.mark.asyncio
+async def test_batch_prices_accepts_lowercase_returned_symbol_keyed_normalized() -> None:
+    handler = _token_or(
+        {
+            "/api/v1/prices": {
+                "result": [
+                    {"symbol": "aapl", "lastPrice": "185.70", "currency": "USD", "timestamp": None},
+                    {"symbol": "MSFT", "lastPrice": "410.00", "currency": "USD", "timestamp": None},
+                ]
+            }
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        prices = await client.prices(["AAPL", "MSFT"])
+    assert list(prices) == ["AAPL", "MSFT"]
+    assert prices["AAPL"].last_price == Decimal("185.70")
+
+
+@pytest.mark.asyncio
+async def test_batch_prices_rejects_case_variant_duplicate_returned_symbol() -> None:
+    handler = _token_or(
+        {
+            "/api/v1/prices": {
+                "result": [
+                    {"symbol": "AAPL", "lastPrice": "185.70", "currency": "USD", "timestamp": None},
+                    {"symbol": "aapl", "lastPrice": "186.00", "currency": "USD", "timestamp": None},
+                ]
+            }
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.tossinvest.com"
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        with pytest.raises(TossApiError) as caught:
+            await client.prices(["AAPL", "MSFT"])
+    assert caught.value.status_code == 200
+    assert caught.value.code == "price-duplicate-symbol"
+
+
+def _snapshot_responses(**currency_overrides: str) -> dict[str, dict]:
+    """One otherwise-fully-consistent snapshot response set, USD everywhere.
+
+    Pass e.g. ``trade="KRW"`` to break exactly one leg's currency so a test
+    can attribute the resulting rejection to that leg.
+    """
+    currency = {
+        "stock": "USD",
+        "price": "USD",
+        "orderbook": "USD",
+        "trade": "USD",
+        "candle": "USD",
+        **currency_overrides,
+    }
+    return {
+        "/api/v1/stocks": {
+            "result": [
+                {
+                    "symbol": "AAPL",
+                    "name": "애플",
+                    "englishName": "APPLE INC",
+                    "market": "NASDAQ",
+                    "currency": currency["stock"],
+                }
+            ]
+        },
+        "/api/v1/prices": {
+            "result": [
+                {
+                    "symbol": "AAPL",
+                    "lastPrice": "185.70",
+                    "currency": currency["price"],
+                    "timestamp": "2026-01-01T00:00:00Z",
+                }
+            ]
+        },
+        "/api/v1/orderbook": {
+            "result": {
+                "currency": currency["orderbook"],
+                "timestamp": None,
+                "asks": [],
+                "bids": [],
+            }
+        },
+        "/api/v1/trades": {
+            "result": [
+                {
+                    "price": "185.70",
+                    "volume": "2",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "currency": currency["trade"],
+                }
+            ]
+        },
+        # Same fixture answers both the 1m and 1d candle requests (as in
+        # test_snapshot_calls_only_allowlisted_market_data above), so this
+        # exercises both "every 1m candle" and "the daily candle" at once.
+        "/api/v1/candles": {
+            "result": {
+                "candles": [
+                    {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "openPrice": "185",
+                        "highPrice": "186",
+                        "lowPrice": "184",
+                        "closePrice": "185.7",
+                        "volume": "100",
+                        "currency": currency["candle"],
+                    }
+                ],
+                "nextBefore": None,
+            }
+        },
+    }
+
+
+async def _run_snapshot(responses: dict[str, dict]) -> MarketSnapshot:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_token_or(responses)),
+        base_url="https://openapi.tossinvest.com",
+    ) as http_client:
+        client = TossMarketClient(
+            Credentials("tsck_live_test", "tssk_live_test"), http_client=http_client
+        )
+        return await client.snapshot("AAPL")
+
+
+@pytest.mark.asyncio
+async def test_snapshot_succeeds_when_fully_consistent() -> None:
+    snapshot = await _run_snapshot(_snapshot_responses())
+    assert snapshot.stock.symbol == "AAPL"
+    assert snapshot.price.symbol == "AAPL"
+    assert snapshot.stock.currency == "USD"
+    assert snapshot.price.currency == "USD"
+    assert snapshot.orderbook.currency == "USD"
+    assert all(trade.currency == "USD" for trade in snapshot.trades)
+    assert all(candle.currency == "USD" for candle in snapshot.candles)
+    assert all(candle.currency == "USD" for candle in snapshot.daily_candles)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "expected_code"),
+    [
+        ("price", "snapshot-price-currency-mismatch"),
+        ("orderbook", "snapshot-orderbook-currency-mismatch"),
+        ("trade", "snapshot-trade-currency-mismatch"),
+        ("candle", "snapshot-candle-currency-mismatch"),
+    ],
+)
+async def test_snapshot_rejects_currency_mismatch(field: str, expected_code: str) -> None:
+    responses = _snapshot_responses(**{field: "KRW"})
+    with pytest.raises(TossApiError) as caught:
+        await _run_snapshot(responses)
+    assert caught.value.status_code == 200
+    assert caught.value.code == expected_code
 
 
 # --- GET-only early-401 recovery --------------------------------------------

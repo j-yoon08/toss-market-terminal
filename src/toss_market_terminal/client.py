@@ -82,6 +82,22 @@ class TossApiError(RuntimeError):
         return f"Toss Open API 요청 실패 (HTTP {self.status_code}, code={self.code})"
 
 
+def _returned_symbol_matches(returned_symbol: str, requested_normalized: str) -> bool:
+    """True when a provider-returned symbol normalizes to the requested one.
+
+    Used to bind a response to the request it answered: a provider that
+    returns data for a different symbol than requested (wrong routing,
+    cache poisoning, a batch response mixing rows) must never be trusted
+    silently. A returned symbol that fails ``normalize_symbol`` outright is
+    treated as a mismatch rather than raising, so callers only ever see the
+    sanitized ``TossApiError`` this feeds into.
+    """
+    try:
+        return normalize_symbol(returned_symbol) == requested_normalized
+    except ValueError:
+        return False
+
+
 class TossMarketClient:
     """Strictly read-only client for public Toss market-data endpoints."""
 
@@ -292,23 +308,34 @@ class TossMarketClient:
         return TossApiError(response.status_code, safe_code or "http-error")
 
     async def stock(self, symbol: str) -> StockInfo:
-        result = await self._get("/api/v1/stocks", {"symbols": symbol})
+        normalized = normalize_symbol(symbol)
+        result = await self._get("/api/v1/stocks", {"symbols": normalized})
         if not isinstance(result, list) or not result:
             raise TossApiError(404, "stock-not-found")
-        return StockInfo.from_api(result[0])
+        info = StockInfo.from_api(result[0])
+        if not _returned_symbol_matches(info.symbol, normalized):
+            # Fail closed rather than trust data for a symbol we did not ask for.
+            raise TossApiError(200, "stock-symbol-mismatch")
+        return info
 
     async def price(self, symbol: str) -> Price:
-        result = await self._get("/api/v1/prices", {"symbols": symbol})
+        normalized = normalize_symbol(symbol)
+        result = await self._get("/api/v1/prices", {"symbols": normalized})
         if not isinstance(result, list) or not result:
             raise TossApiError(404, "price-not-found")
-        return Price.from_api(result[0])
+        quote = Price.from_api(result[0])
+        if not _returned_symbol_matches(quote.symbol, normalized):
+            raise TossApiError(200, "price-symbol-mismatch")
+        return quote
 
     async def prices(self, symbols: list[str] | tuple[str, ...]) -> dict[str, Price]:
         """Batch current prices for 1-200 normalized unique symbols.
 
         Uses the official ``stocks``-style comma-separated batching on the
         read-only ``/api/v1/prices`` endpoint and maps results by their own
-        symbol so provider response order is irrelevant.
+        symbol so provider response order is irrelevant. Any returned row for
+        a symbol that was not requested, or a symbol repeated across rows, is
+        rejected outright rather than silently dropped/overwritten.
         """
         normalized: list[str] = []
         for raw in symbols:
@@ -318,10 +345,25 @@ class TossMarketClient:
             normalized.append(symbol)
         if not 1 <= len(normalized) <= MAX_BATCH_SYMBOLS:
             raise ValueError("배치 현재가 조회는 1~200개 심볼이어야 합니다.")
+        requested = set(normalized)
         result = await self._get("/api/v1/prices", {"symbols": ",".join(normalized)})
         if not isinstance(result, list):
             raise TossApiError(200, "invalid-prices-response")
-        by_symbol = {price.symbol: price for price in (Price.from_api(item) for item in result)}
+        by_symbol: dict[str, Price] = {}
+        for item in result:
+            quote = Price.from_api(item)
+            try:
+                returned_symbol = normalize_symbol(quote.symbol)
+            except ValueError as exc:
+                raise TossApiError(200, "price-invalid-symbol") from exc
+            if returned_symbol not in requested:
+                raise TossApiError(200, "price-unrequested-symbol")
+            if returned_symbol in by_symbol:
+                # Case/format variants of an already-seen symbol (e.g. "AAPL"
+                # then "aapl") normalize to the same key and must be caught
+                # here too -- not just byte-identical repeats.
+                raise TossApiError(200, "price-duplicate-symbol")
+            by_symbol[returned_symbol] = quote
         missing = [symbol for symbol in normalized if symbol not in by_symbol]
         if missing:
             safe = "".join(ch for ch in ",".join(missing) if ch.isalnum() or ch in "-_")[:80]
@@ -329,15 +371,17 @@ class TossMarketClient:
         return {symbol: by_symbol[symbol] for symbol in normalized}
 
     async def orderbook(self, symbol: str) -> Orderbook:
-        result = await self._get("/api/v1/orderbook", {"symbol": symbol})
+        normalized = normalize_symbol(symbol)
+        result = await self._get("/api/v1/orderbook", {"symbol": normalized})
         if not isinstance(result, dict):
             raise TossApiError(200, "invalid-orderbook-response")
         return Orderbook.from_api(result)
 
     async def trades(self, symbol: str, count: int = 30) -> tuple[Trade, ...]:
+        normalized = normalize_symbol(symbol)
         if not 1 <= count <= 50:
             raise ValueError("체결 조회 건수는 1~50이어야 합니다.")
-        result = await self._get("/api/v1/trades", {"symbol": symbol, "count": count})
+        result = await self._get("/api/v1/trades", {"symbol": normalized, "count": count})
         if not isinstance(result, list):
             raise TossApiError(200, "invalid-trades-response")
         return tuple(Trade.from_api(item) for item in result)
@@ -345,13 +389,14 @@ class TossMarketClient:
     async def candles(
         self, symbol: str, *, interval: str = "1m", count: int = 40
     ) -> tuple[Candle, ...]:
+        normalized = normalize_symbol(symbol)
         if interval not in {"1m", "1d"}:
             raise ValueError("캔들 간격은 1m 또는 1d만 지원합니다.")
         if not 1 <= count <= 200:
             raise ValueError("캔들 조회 건수는 1~200이어야 합니다.")
         result = await self._get(
             "/api/v1/candles",
-            {"symbol": symbol, "interval": interval, "count": count, "adjusted": "true"},
+            {"symbol": normalized, "interval": interval, "count": count, "adjusted": "true"},
         )
         if not isinstance(result, dict) or not isinstance(result.get("candles"), list):
             raise TossApiError(200, "invalid-candles-response")
@@ -365,16 +410,39 @@ class TossMarketClient:
         return ExchangeRate.from_api(result)
 
     async def snapshot(self, symbol: str) -> MarketSnapshot:
+        normalized = normalize_symbol(symbol)
         stock, price, orderbook, trades = await asyncio.gather(
-            self.stock(symbol),
-            self.price(symbol),
-            self.orderbook(symbol),
-            self.trades(symbol),
+            self.stock(normalized),
+            self.price(normalized),
+            self.orderbook(normalized),
+            self.trades(normalized),
         )
         candles, daily_candles = await asyncio.gather(
-            self.candles(symbol, count=200),
-            self.candles(symbol, interval="1d", count=200),
+            self.candles(normalized, count=200),
+            self.candles(normalized, interval="1d", count=200),
         )
+        # ``stock``/``price`` already fail closed on their own symbol mismatch;
+        # this re-check makes the stock/price binding an explicit invariant of
+        # snapshot assembly itself, not just an artifact of how the two
+        # sub-calls happen to be implemented today.
+        if not _returned_symbol_matches(stock.symbol, normalized):
+            raise TossApiError(200, "snapshot-stock-symbol-mismatch")
+        if not _returned_symbol_matches(price.symbol, normalized):
+            raise TossApiError(200, "snapshot-price-symbol-mismatch")
+        # Orderbook/trade/candle payloads are path-bound to ``symbol`` and
+        # carry no symbol field of their own -- currency is the only shared
+        # invariant available to bind them all to one consistent listing.
+        reference_currency = stock.currency
+        if price.currency != reference_currency:
+            raise TossApiError(200, "snapshot-price-currency-mismatch")
+        if orderbook.currency != reference_currency:
+            raise TossApiError(200, "snapshot-orderbook-currency-mismatch")
+        if any(trade.currency != reference_currency for trade in trades):
+            raise TossApiError(200, "snapshot-trade-currency-mismatch")
+        if any(candle.currency != reference_currency for candle in candles):
+            raise TossApiError(200, "snapshot-candle-currency-mismatch")
+        if any(candle.currency != reference_currency for candle in daily_candles):
+            raise TossApiError(200, "snapshot-daily-candle-currency-mismatch")
         return MarketSnapshot(
             stock=stock,
             price=price,
