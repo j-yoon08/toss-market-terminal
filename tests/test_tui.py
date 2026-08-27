@@ -266,6 +266,109 @@ async def test_recover_protocol_status_stays_degraded_while_indicator_degraded(
         assert app.indicator_degraded
 
 
+async def test_orderbook_event_does_not_refresh_tick_but_trade_event_does(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class OrderbookOnlyStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield OrderbookEvent(symbol, sample_snapshot().orderbook)
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", OrderbookOnlyStream)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.client = FakeClient()  # type: ignore[assignment]
+        tick_after_mount = app.last_tick_monotonic
+        assert tick_after_mount is not None
+        assert app.last_orderbook_monotonic is None
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        # Orderbook-only traffic must never renew the TICK (price) clock.
+        assert app.last_tick_monotonic == tick_after_mount
+        assert app.last_orderbook_monotonic is not None
+        status = app.query_one("#statusbar", Static).render().plain
+        assert "BOOK " in status
+
+
+async def test_trade_event_renews_tick_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class OneTradeStream:
+        def __init__(self, client: object) -> None:
+            _ = client
+
+        async def events(self, symbol: str, market: str):
+            _ = market
+            yield TradeEvent(
+                symbol,
+                Trade(Decimal("150"), Decimal("7"), "2026-08-25T10:00:30+09:00", "USD"),
+            )
+
+    monkeypatch.setattr(tui_module, "TossMarketStream", OneTradeStream)
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.client = FakeClient()  # type: ignore[assignment]
+        app.last_tick_monotonic = 1.0  # force a known-stale sentinel
+
+        await app._run_feed(symbol="AAPL", market="us")
+        await pilot.pause()
+
+        assert app.last_tick_monotonic is not None
+        assert app.last_tick_monotonic != 1.0
+
+
+async def test_hour_old_tick_makes_interpretation_stale_even_when_live(
+    tmp_path: Path,
+) -> None:
+    app = TossMarketApp(
+        "AAPL",
+        tmp_path / "unused.json",
+        initial_snapshot=sample_snapshot(),
+        connect_live=False,
+    )
+    async with app.run_test(size=(140, 42)) as pilot:
+        await pilot.pause()
+        app.connection_state = "LIVE"
+        assert not app._interpretation_is_stale()
+        app.last_tick_monotonic = tui_module.time.monotonic() - 3600.0
+        assert app._interpretation_is_stale()
+
+
+def test_price_stale_seconds_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        TossMarketApp(
+            "AAPL",
+            tmp_path / "unused.json",
+            connect_live=False,
+            price_stale_seconds=0,
+        )
+
+
 async def test_watchlist_refresh_keeps_last_good_rows_and_primary_state(tmp_path: Path) -> None:
     class PriceClient:
         def __init__(self) -> None:

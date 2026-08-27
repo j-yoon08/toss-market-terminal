@@ -4,6 +4,7 @@ import asyncio
 import json
 import socket
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -313,6 +314,43 @@ async def test_missing_gate_never_reads_account_or_submits(
         await app._submit_live_plan(current_plan, phrase)
 
     assert reads == 0
+    assert transport.packets == []
+    assert not (tmp_path / "audit-state" / "audit.jsonl").exists()
+
+
+async def test_stale_price_blocks_live_submit_before_account_token_or_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
+    transport = RecordingTransport()
+    app = make_live_app(tmp_path, transport)
+    current_plan = plan()
+
+    reads = 0
+
+    async def unexpected_read(symbol: str):
+        nonlocal reads
+        reads += 1
+        raise AssertionError(symbol)
+
+    token_calls = 0
+
+    async def unexpected_token() -> str:
+        nonlocal token_calls
+        token_calls += 1
+        raise AssertionError("token loader should not be called")
+
+    app.account_context_loader = unexpected_read
+    app.access_token_loader = unexpected_token
+
+    async with app.run_test(size=(90, 30)):
+        app.last_tick_monotonic = time.monotonic() - 3600.0
+        await app._submit_live_plan(
+            current_plan, live_approval_phrase(build_live_packet(current_plan))
+        )
+
+    assert reads == 0
+    assert token_calls == 0
     assert transport.packets == []
     assert not (tmp_path / "audit-state" / "audit.jsonl").exists()
 

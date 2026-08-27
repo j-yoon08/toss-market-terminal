@@ -477,6 +477,22 @@ async def test_missing_current_price_blocks_ticket_open(tmp_path: Path) -> None:
         assert app.last_paper_preview is None
 
 
+async def test_stale_price_blocks_ticket_open_before_account_loader(tmp_path: Path) -> None:
+    context = make_context()
+    fake = FakeAccountClient(context)
+    app = make_app(None, tmp_path, client=fake)
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        app.last_tick_monotonic = tui_module.time.monotonic() - 3600.0
+        await app._open_paper_ticket(OrderSide.BUY)
+        await pilot.pause()
+        assert type(app.screen).__name__ != "OrderTicketScreen"
+        assert app.last_paper_preview is None
+        assert fake.calls == []  # blocked before any account/network loading
+        messages = [n.message for n in app._notifications]
+        assert any("신선도" in message for message in messages)
+
+
 async def test_unsupported_currency_blocks_ticket_open(tmp_path: Path) -> None:
     app = make_app(make_context(currency="EUR"), tmp_path)
     async with app.run_test(size=(90, 30)) as pilot:

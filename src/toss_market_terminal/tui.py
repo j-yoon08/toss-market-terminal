@@ -117,6 +117,7 @@ CHART_RENDER_INTERVAL_SECONDS = 0.25
 PORTFOLIO_REFRESH_SECONDS = 30.0
 EXCHANGE_RATE_REFRESH_SECONDS = 60.0
 ORDER_HISTORY_REFRESH_SECONDS = 300.0
+PRICE_STALE_SECONDS = 120.0
 COMPACT_WIDTH_THRESHOLD = 117
 LiveCandleStatus = Literal["updated", "late", "unavailable"]
 LiveTransportFactory = Callable[[str, int], LiveOrderTransport]
@@ -608,6 +609,7 @@ class TossMarketApp(App[int]):
         portfolio_refresh_seconds: float = PORTFOLIO_REFRESH_SECONDS,
         exchange_rate_refresh_seconds: float = EXCHANGE_RATE_REFRESH_SECONDS,
         order_history_refresh_seconds: float = ORDER_HISTORY_REFRESH_SECONDS,
+        price_stale_seconds: float = PRICE_STALE_SECONDS,
         manual_live_orders: bool = False,
         live_audit_log: LiveAuditLog | None = None,
         live_transport_factory: LiveTransportFactory | None = None,
@@ -634,8 +636,11 @@ class TossMarketApp(App[int]):
             raise ValueError("환율 재동기화 주기는 양수여야 합니다.")
         if order_history_refresh_seconds <= 0:
             raise ValueError("주문내역 재동기화 주기는 양수여야 합니다.")
+        if price_stale_seconds <= 0:
+            raise ValueError("시세 신선도 임계값은 양수여야 합니다.")
         self.exchange_rate_refresh_seconds = exchange_rate_refresh_seconds
         self.order_history_refresh_seconds = order_history_refresh_seconds
+        self.price_stale_seconds = price_stale_seconds
         if candle_resync_seconds <= 0:
             raise ValueError("캔들 재동기화 주기는 양수여야 합니다.")
         if chart_render_interval_seconds < 0:
@@ -680,6 +685,7 @@ class TossMarketApp(App[int]):
         self.indicator_degraded = False
         self.candle_sync_degraded = False
         self.last_tick_monotonic: float | None = None
+        self.last_orderbook_monotonic: float | None = None
         self.last_sync_monotonic: float | None = None
         self._live_candles: tuple[Candle, ...] = ()
         self._live_daily_candles: tuple[Candle, ...] = ()
@@ -862,11 +868,22 @@ class TossMarketApp(App[int]):
         self.push_screen(HelpScreen())
 
     def _interpretation_is_stale(self) -> bool:
-        return (
+        """True when the current price cannot be trusted for interpretation or orders.
+
+        The TICK clock (`last_tick_monotonic`) is only renewed by an actual price
+        observation: an initial/resync REST snapshot or a trade tick. Orderbook
+        traffic (`last_orderbook_monotonic`) never counts as a price observation,
+        so a feed that only delivers orderbook updates goes stale here.
+        """
+        if (
             self.indicator_degraded
             or self.candle_sync_degraded
             or self.connection_state not in {"LIVE", "PREVIEW", "SNAPSHOT"}
-        )
+        ):
+            return True
+        if self.current_price is None or self.last_tick_monotonic is None:
+            return True
+        return time.monotonic() - self.last_tick_monotonic > self.price_stale_seconds
 
     def action_toggle_interpretation(self) -> None:
         if self.snapshot is None or self.current_price is None:
@@ -1153,6 +1170,15 @@ class TossMarketApp(App[int]):
                     severity="warning",
                 )
                 return
+            if self._interpretation_is_stale():
+                # Blocks PAPER and, by extension, any later LIVE promotion —
+                # fail-closed before touching account/network loaders at all.
+                self.notify(
+                    "시세 신선도가 저하되어 미리보기를 열지 않았습니다.",
+                    title="PAPER PREVIEW",
+                    severity="warning",
+                )
+                return
             try:
                 context = await self._load_account_context(capture.symbol)
             except Exception:
@@ -1316,6 +1342,15 @@ class TossMarketApp(App[int]):
             if datetime.now(UTC) > plan.expires_at or self.symbol != plan.intent.symbol:
                 self.notify(
                     "계획이 만료되었거나 종목이 변경되어 주문을 전송하지 않았습니다.",
+                    title="LIVE ORDER BLOCKED",
+                    severity="error",
+                )
+                return
+            if self._interpretation_is_stale():
+                # Fail-closed before any account/token/order call: a stale or
+                # degraded current quote is not a safe basis for a live order.
+                self.notify(
+                    "시세 신선도가 저하되어 주문을 전송하지 않았습니다.",
                     title="LIVE ORDER BLOCKED",
                     severity="error",
                 )
@@ -1776,6 +1811,7 @@ class TossMarketApp(App[int]):
             self.current_timestamp = None
             self.snapshot = None
             self.last_tick_monotonic = None
+            self.last_orderbook_monotonic = None
             self.last_sync_monotonic = None
             self.indicator_degraded = False
             self.candle_sync_degraded = False
@@ -1880,6 +1916,10 @@ class TossMarketApp(App[int]):
         self.current_timestamp = (
             latest_trade.timestamp if latest_trade else snapshot.price.timestamp
         )
+        # A REST snapshot (initial load or resync) is itself a fresh price
+        # observation, so it establishes/renews the TICK clock. Orderbook-only
+        # traffic must never do this (see `last_orderbook_monotonic`).
+        self.last_tick_monotonic = time.monotonic()
         self._indicator_base = None
         self._indicator_base_snapshot = None
         self._indicator_base_mode = None
@@ -2039,7 +2079,7 @@ class TossMarketApp(App[int]):
                     continue
                 self._recover_protocol_status()
                 self.orderbook = event.orderbook
-                self.last_tick_monotonic = time.monotonic()
+                self.last_orderbook_monotonic = time.monotonic()
                 self._render_orderbook()
                 self._render_stats()
                 self._render_chrome()
@@ -2413,13 +2453,16 @@ class TossMarketApp(App[int]):
         topbar.update(top)
 
         # Compact two-line status: connection + freshness on line one, the latest
-        # alert (if any) on line two. TICK/SYNC ages use monotonic time and read
-        # "—" (never a fabricated value) until a tick/sync has actually landed.
+        # alert (if any) on line two. TICK/BOOK/SYNC ages use monotonic time and
+        # read "—" (never a fabricated value) until each has actually landed.
+        # TICK is the price observation clock only (trade tick or REST
+        # snapshot) — BOOK (orderbook) traffic never advances it.
         status = Text()
         status.append(f"{'●' if live else '○'} {self.connection_state}", style=state_color)
         if self.connection_detail:
             status.append(f" · {self.connection_detail}", style=MUTED_COLOR)
         status.append(f"   TICK {format_age(self.last_tick_monotonic)}", style=MUTED_COLOR)
+        status.append(f"   BOOK {format_age(self.last_orderbook_monotonic)}", style=MUTED_COLOR)
         status.append(f"   SYNC {format_age(self.last_sync_monotonic)}", style=MUTED_COLOR)
         if self.latest_alert is not None:
             status.append(
