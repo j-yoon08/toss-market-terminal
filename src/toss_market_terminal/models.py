@@ -62,6 +62,74 @@ def as_decimal(value: Any, field: str) -> Decimal:
     return parsed
 
 
+def as_positive_decimal(value: Any, field: str) -> Decimal:
+    """Strictly finite decimal that must be greater than zero.
+
+    Used for market-data quantities that can never legitimately be zero or
+    negative (prices, quote levels). Signed fields (change/P&L/return) must
+    use :func:`as_decimal` instead -- this positivity constraint is
+    deliberately not applied to them.
+    """
+    parsed = as_decimal(value, field)
+    if parsed <= 0:
+        raise DataShapeError(f"{field} 값은 0보다 커야 합니다.")
+    return parsed
+
+
+def as_nonnegative_decimal(value: Any, field: str) -> Decimal:
+    """Strictly finite decimal that must be zero or greater (volumes/sizes)."""
+    parsed = as_decimal(value, field)
+    if parsed < 0:
+        raise DataShapeError(f"{field} 값은 0 이상이어야 합니다.")
+    return parsed
+
+
+# Market data (public quotes) only ever settles in one of these two
+# currencies in this client. Reused from the account-side domain so the two
+# stay in sync; unlike account/holdings currency (which preserves unknown
+# provider strings verbatim for display), an out-of-domain market currency is
+# treated as an unsupported shape and rejected.
+SUPPORTED_MARKET_CURRENCIES = SUPPORTED_ACCOUNT_CURRENCIES
+
+
+def as_market_currency(value: Any, field: str) -> str:
+    if not isinstance(value, str) or value not in SUPPORTED_MARKET_CURRENCIES:
+        raise DataShapeError(f"{field} 통화가 지원되지 않습니다.")
+    return value
+
+
+# Official market-data timestamps are short ISO-8601 strings. This bound
+# rejects pathological input before regex/parse work, without ever needing
+# the original text for anything other than validation.
+MAX_TIMESTAMP_TEXT_LENGTH = 64
+
+
+def as_market_timestamp(value: Any, field: str) -> str:
+    """Validate a required market-data timestamp, returning it unchanged.
+
+    Only well-formedness is enforced (timezone-aware ISO-8601, trailing
+    ``Z`` or an explicit offset, no naive values) -- the original string is
+    returned as-is so display formatting is never altered.
+    """
+    if not isinstance(value, str) or not value:
+        raise DataShapeError(f"{field} 값은 유효한 ISO 8601 시각이어야 합니다.")
+    if len(value) > MAX_TIMESTAMP_TEXT_LENGTH or value != value.strip():
+        raise DataShapeError(f"{field} 값은 유효한 ISO 8601 시각이어야 합니다.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DataShapeError(f"{field} 값은 유효한 ISO 8601 시각이어야 합니다.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DataShapeError(f"{field} 값에는 시간대가 포함되어야 합니다.")
+    return value
+
+
+def as_market_timestamp_or_none(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return as_market_timestamp(value, field)
+
+
 @dataclass(frozen=True, slots=True)
 class StockInfo:
     symbol: str
@@ -77,7 +145,7 @@ class StockInfo:
             name=str(raw.get("name") or raw["symbol"]),
             english_name=str(raw.get("englishName") or ""),
             market=str(raw.get("market") or "UNKNOWN"),
-            currency=str(raw.get("currency") or "UNKNOWN"),
+            currency=as_market_currency(raw.get("currency"), "stock.currency"),
         )
 
 
@@ -92,9 +160,9 @@ class Price:
     def from_api(cls, raw: dict[str, Any]) -> Price:
         return cls(
             symbol=str(raw["symbol"]),
-            last_price=as_decimal(raw["lastPrice"], "lastPrice"),
-            currency=str(raw.get("currency") or "UNKNOWN"),
-            timestamp=str(raw["timestamp"]) if raw.get("timestamp") is not None else None,
+            last_price=as_positive_decimal(raw["lastPrice"], "lastPrice"),
+            currency=as_market_currency(raw.get("currency"), "price.currency"),
+            timestamp=as_market_timestamp_or_none(raw.get("timestamp"), "price.timestamp"),
         )
 
 
@@ -106,8 +174,8 @@ class OrderbookEntry:
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> OrderbookEntry:
         return cls(
-            price=as_decimal(raw["price"], "orderbook.price"),
-            volume=as_decimal(raw["volume"], "orderbook.volume"),
+            price=as_positive_decimal(raw["price"], "orderbook.price"),
+            volume=as_nonnegative_decimal(raw["volume"], "orderbook.volume"),
         )
 
 
@@ -121,10 +189,10 @@ class Orderbook:
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> Orderbook:
         return cls(
-            currency=str(raw.get("currency") or "UNKNOWN"),
+            currency=as_market_currency(raw.get("currency"), "orderbook.currency"),
             asks=tuple(OrderbookEntry.from_api(item) for item in raw.get("asks", [])),
             bids=tuple(OrderbookEntry.from_api(item) for item in raw.get("bids", [])),
-            timestamp=str(raw["timestamp"]) if raw.get("timestamp") is not None else None,
+            timestamp=as_market_timestamp_or_none(raw.get("timestamp"), "orderbook.timestamp"),
         )
 
 
@@ -138,10 +206,10 @@ class Trade:
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> Trade:
         return cls(
-            price=as_decimal(raw["price"], "trade.price"),
-            volume=as_decimal(raw["volume"], "trade.volume"),
-            timestamp=str(raw["timestamp"]),
-            currency=str(raw.get("currency") or "UNKNOWN"),
+            price=as_positive_decimal(raw["price"], "trade.price"),
+            volume=as_nonnegative_decimal(raw["volume"], "trade.volume"),
+            timestamp=as_market_timestamp(raw["timestamp"], "trade.timestamp"),
+            currency=as_market_currency(raw.get("currency"), "trade.currency"),
         )
 
 
@@ -157,14 +225,24 @@ class Candle:
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> Candle:
+        open_price = as_positive_decimal(raw["openPrice"], "candle.openPrice")
+        high_price = as_positive_decimal(raw["highPrice"], "candle.highPrice")
+        low_price = as_positive_decimal(raw["lowPrice"], "candle.lowPrice")
+        close_price = as_positive_decimal(raw["closePrice"], "candle.closePrice")
+        if high_price < low_price:
+            raise DataShapeError("candle.highPrice 값은 candle.lowPrice 이상이어야 합니다.")
+        if not (low_price <= open_price <= high_price):
+            raise DataShapeError("candle.openPrice 값이 고가/저가 범위를 벗어났습니다.")
+        if not (low_price <= close_price <= high_price):
+            raise DataShapeError("candle.closePrice 값이 고가/저가 범위를 벗어났습니다.")
         return cls(
-            timestamp=str(raw["timestamp"]),
-            open_price=as_decimal(raw["openPrice"], "candle.openPrice"),
-            high_price=as_decimal(raw["highPrice"], "candle.highPrice"),
-            low_price=as_decimal(raw["lowPrice"], "candle.lowPrice"),
-            close_price=as_decimal(raw["closePrice"], "candle.closePrice"),
-            volume=as_decimal(raw["volume"], "candle.volume"),
-            currency=str(raw.get("currency") or "UNKNOWN"),
+            timestamp=as_market_timestamp(raw["timestamp"], "candle.timestamp"),
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=close_price,
+            volume=as_nonnegative_decimal(raw["volume"], "candle.volume"),
+            currency=as_market_currency(raw.get("currency"), "candle.currency"),
         )
 
 
