@@ -708,6 +708,57 @@ def test_chart_renderable_holding_average_out_of_range_label_omitted_on_single_r
         assert cell_len(line) <= 48
 
 
+def test_chart_renderable_holding_average_above_high_never_overwrites_far_low_boundary() -> None:
+    # P2 regression: on a small chart with only two price rows, displacing
+    # the above-high arrow inward from row 0 (blocked by current_price) used
+    # to land it on row 1 -- which is *also* the true low-boundary label
+    # ("99") -- silently replacing a real price with a directionally
+    # misleading arrow instead of omitting it.
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("150"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=7,
+        current_price=Decimal("130"),  # exactly the candle high -> claims row 0
+        holding_average=overlay,
+    )
+    lines = chart.plain.splitlines()
+    price_rows = [line for line in lines if "130" in line or "99" in line]
+    assert len(price_rows) == 2
+    assert any("130" in row for row in price_rows)
+    assert any("99" in row for row in price_rows)  # the true low boundary survives
+    assert "보유 평단" not in chart.plain  # no room left, so the arrow is cleanly omitted
+    assert HOLDING_AVERAGE_DASH not in chart.plain
+    for line in lines:
+        assert cell_len(line) <= 48
+    assert len(lines) <= 7
+
+
+def test_chart_renderable_holding_average_below_low_never_overwrites_far_high_boundary() -> None:
+    snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
+    overlay = HoldingAveragePriceOverlay(price=Decimal("5"))
+    chart = chart_renderable(
+        snapshot,
+        "1m",
+        width=48,
+        height=7,
+        current_price=Decimal("99"),  # exactly the candle low -> claims the bottom row
+        holding_average=overlay,
+    )
+    lines = chart.plain.splitlines()
+    price_rows = [line for line in lines if "130" in line or "99" in line]
+    assert len(price_rows) == 2
+    assert any("130" in row for row in price_rows)  # the true high boundary survives
+    assert any("99" in row for row in price_rows)
+    assert "보유 평단" not in chart.plain  # no room left, so the arrow is cleanly omitted
+    assert HOLDING_AVERAGE_DASH not in chart.plain
+    for line in lines:
+        assert cell_len(line) <= 48
+    assert len(lines) <= 7
+
+
 def test_chart_renderable_holding_average_stale_label_retains_line() -> None:
     snapshot = replace(sample_snapshot(), candles=_rising_candles(30))
     overlay = HoldingAveragePriceOverlay(price=Decimal("120"), stale=True)

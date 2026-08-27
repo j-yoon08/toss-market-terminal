@@ -956,16 +956,20 @@ def chart_renderable(
             elif not holding_average_in_range:
                 above_high = holding_average.price > high
                 boundary_row = 0 if above_high else price_rows - 1
+                opposite_boundary_row = price_rows - 1 if above_high else 0
                 step = 1 if above_high else -1
                 # The out-of-range arrow indicator is anchored to a boundary
                 # row, not a real price, so it must yield its row rather than
                 # silently vanish when that boundary happens to coincide with
                 # the (visually dominant) current-price row: walk inward to
                 # the nearest free row, preferring one that also avoids the
-                # previous-close line, and only give up when every row from
-                # the boundary inward is the current-price row itself.
-                mandatory_occupied = (
-                    frozenset({current_price_row}) if current_price_row is not None else frozenset()
+                # previous-close line. The opposite boundary's true high/low
+                # label is always off-limits too -- overwriting it would show
+                # a directionally misleading arrow in place of a real price.
+                # Give up (omit the arrow) once every row from the boundary
+                # inward is claimed by the current price or that far edge.
+                mandatory_occupied = frozenset(
+                    row for row in (current_price_row, opposite_boundary_row) if row is not None
                 )
                 preferred_occupied = mandatory_occupied | (
                     frozenset({previous_close_row})
