@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.0
+
+### AI direction support
+
+- Add a dependency-free local k-nearest-neighbour direction classifier using only validated in-memory public candles.
+- Show `BUY`, `HOLD`, `SELL`, or `INSUFFICIENT_DATA` as Korean display-only TUI state with model confidence, sample size, walk-forward balanced accuracy, evidence, counterpoints, risks, and invalidation conditions.
+- Use horizon-embargoed chronological walk-forward validation and fail closed on stale/degraded data, malformed numbers, inadequate samples or class diversity, and validation below the required floor.
+- Keep the model isolated from credentials, accounts, networking, PAPER preview, LIVE plans, and order transport; no AI result can create or submit an order.
+- Throttle repeated inference for the same symbol/timeframe/candle while invalidating immediately on a new candle or stale-state transition.
+
 ## 0.10.1
 
 ### Safety

@@ -22,6 +22,12 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Static
 
+from .ai_direction import (
+    AiDirection,
+    AiDirectionSignal,
+    build_ai_direction_signal,
+    direction_label_ko,
+)
 from .alerts import AlertEvaluator, AlertEvent
 from .client import TossApiError, TossMarketClient
 from .config import CredentialError, Credentials
@@ -114,6 +120,7 @@ KST = ZoneInfo("Asia/Seoul")
 WATCHLIST_REFRESH_SECONDS = 15.0
 CANDLE_RESYNC_SECONDS = 30.0
 CHART_RENDER_INTERVAL_SECONDS = 0.25
+AI_DIRECTION_REFRESH_SECONDS = 2.0
 PORTFOLIO_REFRESH_SECONDS = 30.0
 EXCHANGE_RATE_REFRESH_SECONDS = 60.0
 ORDER_HISTORY_REFRESH_SECONDS = 300.0
@@ -379,22 +386,67 @@ def _bounded_cells(value: str, width: int = 52) -> str:
     return text + "…"
 
 
-def interpretation_detail_text(analysis: MarketInterpretation) -> str:
+def ai_direction_summary(signal: AiDirectionSignal) -> str:
+    label = direction_label_ko(signal.direction)
+    if signal.confidence_percent is None:
+        detail = signal.reasons[0] if signal.reasons else "검증 데이터 부족"
+        return f"AI 보조 · {label} · 자동주문 아님 · {detail} · i 상세"
+    return (
+        f"AI 보조 · {label} · 자동주문 아님 · 신뢰 {signal.confidence_percent}% · "
+        f"{signal.horizon_label} · i 상세"
+    )
+
+
+def ai_direction_style(direction: AiDirection) -> str:
+    return {
+        AiDirection.BUY: "bold #2dd4bf",
+        AiDirection.HOLD: "bold #f0ad4e",
+        AiDirection.SELL: "bold #fb7185",
+        AiDirection.INSUFFICIENT: "#7d8998",
+    }[direction]
+
+
+def interpretation_detail_text(analysis: MarketInterpretation, ai_signal: AiDirectionSignal) -> str:
     selected = analysis.selected
     quality_label = {
         "fresh": "최신",
         "stale": "신선도 저하",
         "insufficient": "부족",
     }[selected.data_quality]
+    ai_label = direction_label_ko(ai_signal.direction)
+    confidence = (
+        f"{ai_signal.confidence_percent}%"
+        if ai_signal.confidence_percent is not None
+        else "산출 불가"
+    )
+    validation = (
+        f"{ai_signal.validation_percent}%"
+        if ai_signal.validation_percent is not None
+        else "검증 불가"
+    )
     lines = [
         f"{selected.label} · {selected.headline} · 신뢰도 {selected.confidence}",
         f"데이터 상태 · {quality_label}",
         "",
-        "해석",
-        interpretation_explanation(selected),
-        "",
-        "근거",
+        "AI 보조 판단 · 표시 전용",
+        f"{ai_label} · 신뢰도 {confidence} · 전망 {ai_signal.horizon_label}",
+        (f"모델 {ai_signal.model_id} · 표본 {ai_signal.sample_size}개 · walk-forward {validation}"),
+        "• PAPER/LIVE 주문 생성 또는 실행과 연결되지 않음",
+        "• " + " · ".join(ai_signal.reasons),
     ]
+    if ai_signal.counterpoints:
+        lines.append("• 반대 신호 · " + " · ".join(ai_signal.counterpoints))
+    lines.extend(
+        (
+            "• 무효화 · " + ai_signal.invalidation,
+            "• 한계 · " + " · ".join(ai_signal.risks),
+            "",
+            "시장 해석",
+            interpretation_explanation(selected),
+            "",
+            "근거",
+        )
+    )
     lines.extend(f"• {item}" for item in selected.evidence)
     if not selected.evidence:
         lines.append("• 방향을 설명할 지표 데이터가 부족함")
@@ -417,7 +469,12 @@ def interpretation_detail_text(analysis: MarketInterpretation) -> str:
         for item in analysis.timeframes
     )
     lines.extend(
-        ("", analysis.alignment, "", "열기 시점의 공개 시세 기반 · 관찰 전용 · 실행 권고 아님")
+        (
+            "",
+            analysis.alignment,
+            "",
+            "열기 시점의 공개 시세 기반 · AI 보조 판단 포함 · 투자·실행 권고 아님",
+        )
     )
     return "\n".join(lines)
 
@@ -468,16 +525,17 @@ class MarketInterpretationScreen(ModalScreen[None]):
     }
     """
 
-    def __init__(self, analysis: MarketInterpretation) -> None:
+    def __init__(self, analysis: MarketInterpretation, ai_signal: AiDirectionSignal) -> None:
         super().__init__()
         self.analysis = analysis
+        self.ai_signal = ai_signal
 
     def compose(self) -> ComposeResult:
         with Vertical(id="interpretation-dialog"):
-            yield Static("시장 신호 상세 해석", id="interpretation-title", markup=False)
+            yield Static("시장·AI 신호 상세 해석", id="interpretation-title", markup=False)
             with VerticalScroll(id="interpretation-scroll"):
                 yield Static(
-                    interpretation_detail_text(self.analysis),
+                    interpretation_detail_text(self.analysis, self.ai_signal),
                     id="interpretation-body",
                     markup=False,
                 )
@@ -588,7 +646,7 @@ class TossMarketApp(App[int]):
         padding: 1 2;
     }
     #market-stats {
-        height: 10;
+        height: 11;
         padding: 0 2;
         border-top: solid #2a3440;
         color: #9aa7b4;
@@ -714,6 +772,12 @@ class TossMarketApp(App[int]):
         self.protocol_degraded = False
         self.indicator_degraded = False
         self.candle_sync_degraded = False
+        self.ai_direction_signal: AiDirectionSignal | None = None
+        self._ai_direction_computed_monotonic: float | None = None
+        self._ai_direction_mode: str | None = None
+        self._ai_direction_symbol: str | None = None
+        self._ai_direction_source_timestamp: str | None = None
+        self._ai_direction_stale: bool | None = None
         self.operational_transitions: deque[OperationalTransition] = deque(maxlen=200)
         self.last_tick_monotonic: float | None = None
         self.last_orderbook_monotonic: float | None = None
@@ -937,6 +1001,7 @@ class TossMarketApp(App[int]):
                 orderbook=self.orderbook,
                 trades=tuple(self.trades),
             )
+            ai_signal = self._ai_direction(stale=stale, force=True)
             analysis = build_market_interpretation(
                 self.snapshot,
                 self.current_price,
@@ -953,7 +1018,7 @@ class TossMarketApp(App[int]):
                 severity="warning",
             )
             return
-        self.push_screen(MarketInterpretationScreen(analysis))
+        self.push_screen(MarketInterpretationScreen(analysis, ai_signal))
 
     def action_toggle_portfolio(self) -> None:
         if self._portfolio_screen is not None:
@@ -2484,6 +2549,34 @@ class TossMarketApp(App[int]):
         except NoMatches:
             return  # same race as above; the chart body already re-rendered
 
+    def _ai_direction(self, *, stale: bool, force: bool = False) -> AiDirectionSignal:
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise ValueError("AI 판단에 현재 snapshot이 필요합니다.")
+        source = snapshot.daily_candles if self.chart_mode == "1d" else snapshot.candles
+        source_timestamp = source[0].timestamp if source else None
+        now = time.monotonic()
+        cached_at = self._ai_direction_computed_monotonic
+        if (
+            not force
+            and self.ai_direction_signal is not None
+            and cached_at is not None
+            and now - cached_at < AI_DIRECTION_REFRESH_SECONDS
+            and self._ai_direction_mode == self.chart_mode
+            and self._ai_direction_symbol == snapshot.stock.symbol
+            and self._ai_direction_source_timestamp == source_timestamp
+            and self._ai_direction_stale is stale
+        ):
+            return self.ai_direction_signal
+        signal = build_ai_direction_signal(snapshot, self.chart_mode, stale=stale)
+        self.ai_direction_signal = signal
+        self._ai_direction_computed_monotonic = time.monotonic()
+        self._ai_direction_mode = self.chart_mode
+        self._ai_direction_symbol = snapshot.stock.symbol
+        self._ai_direction_source_timestamp = source_timestamp
+        self._ai_direction_stale = stale
+        return signal
+
     def _chart_indicators(self) -> ChartIndicators:
         """Cached snapshot+mode indicator base, cheaply re-projected onto the live price.
 
@@ -2515,6 +2608,8 @@ class TossMarketApp(App[int]):
     def _render_stats(self) -> None:
         if self.snapshot is None or self.current_price is None:
             return
+        stale = self._interpretation_is_stale()
+        ai_signal = self._ai_direction(stale=stale)
         metrics = market_metrics(
             self.snapshot,
             self.current_price,
@@ -2553,7 +2648,9 @@ class TossMarketApp(App[int]):
             self.indicator_degraded = True
             self.connection_state = "DEGRADED"
             self.connection_detail = safe_indicator_error(exc)
+            ai_signal = self._ai_direction(stale=True, force=True)
             lines = (
+                ai_direction_summary(ai_signal),
                 f"시장 해석 · {timeframe_label} 데이터 부족 · 신뢰도 분석 불가",
                 f"근거 · {self.connection_detail}",
                 "주의 · 지표 계산이 복구될 때까지 방향 해석 보류",
@@ -2571,9 +2668,14 @@ class TossMarketApp(App[int]):
                 f"{self.market.upper()} 공개 시세 · 관찰 전용 · i 상세",
             )
             for index, line in enumerate(lines):
+                style = (
+                    ai_direction_style(ai_signal.direction)
+                    if index == 0
+                    else ("#f0ad4e" if index < 5 else MUTED_COLOR)
+                )
                 text.append(
                     _bounded_cells(line) + ("\n" if index < len(lines) - 1 else ""),
-                    style="#f0ad4e" if index < 4 else MUTED_COLOR,
+                    style=style,
                 )
         else:
             analysis = interpret_timeframe(
@@ -2581,7 +2683,7 @@ class TossMarketApp(App[int]):
                 self.current_price,
                 self.current_currency,
                 signals=signals,
-                stale=self._interpretation_is_stale(),
+                stale=stale,
             )
             rsi_text = f"{indicators.rsi:.1f}" if indicators.rsi is not None else "—"
             vwap_percent = vwap_distance_percent(indicators.vwap, self.current_price)
@@ -2611,6 +2713,7 @@ class TossMarketApp(App[int]):
                 else "—"
             )
             lines = (
+                ai_direction_summary(ai_signal),
                 f"시장 해석 · {timeframe_label} {analysis.headline} · 신뢰도 {analysis.confidence}",
                 f"근거 · {reason}",
                 f"주의 · {risk}",
@@ -2631,7 +2734,11 @@ class TossMarketApp(App[int]):
                 f"{self.market.upper()} 공개 시세 · 관찰 전용 · i 상세",
             )
             for index, line in enumerate(lines):
-                style = "bold #c9d1d9" if index == 0 else MUTED_COLOR
+                style = (
+                    ai_direction_style(ai_signal.direction)
+                    if index == 0
+                    else ("bold #c9d1d9" if index == 1 else MUTED_COLOR)
+                )
                 if index == len(lines) - 1:
                     style = "#526273"
                 text.append(
@@ -2667,6 +2774,11 @@ class TossMarketApp(App[int]):
         # snapshot) — BOOK (orderbook) traffic never advances it.
         status = Text()
         status.append(f"{'●' if live else '○'} {self.connection_state}", style=state_color)
+        if self.ai_direction_signal is not None:
+            status.append(
+                f"   AI {direction_label_ko(self.ai_direction_signal.direction)}",
+                style=ai_direction_style(self.ai_direction_signal.direction),
+            )
         if self.connection_detail:
             status.append(f" · {self.connection_detail}", style=MUTED_COLOR)
         status.append(f"   TICK {format_age(self.last_tick_monotonic)}", style=MUTED_COLOR)

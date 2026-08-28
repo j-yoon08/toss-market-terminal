@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from toss_market_terminal.models import (
@@ -76,3 +76,31 @@ def sample_snapshot(*, fresh_price: bool = False) -> MarketSnapshot:
             ),
         ),
     )
+
+
+def patterned_candles(*, count: int = 220, final_phase: int = 4) -> tuple[Candle, ...]:
+    """Newest-first repeating price regimes with a deterministic next path."""
+    start = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+    pattern = tuple(Decimal(100 + value) for value in range(10)) + tuple(
+        Decimal(110 - value) for value in range(10)
+    )
+    offset = (final_phase - (count - 1)) % len(pattern)
+    chronological: list[Candle] = []
+    previous = pattern[offset]
+    for index in range(count):
+        phase = (offset + index) % len(pattern)
+        close = pattern[phase]
+        opened = previous
+        chronological.append(
+            Candle(
+                timestamp=(start + timedelta(minutes=index)).isoformat(),
+                open_price=opened,
+                high_price=max(opened, close) + Decimal("0.2"),
+                low_price=min(opened, close) - Decimal("0.2"),
+                close_price=close,
+                volume=Decimal(100 + phase * 7),
+                currency="USD",
+            )
+        )
+        previous = close
+    return tuple(reversed(chronological))

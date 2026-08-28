@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "toss-market-terminal"
-version = "0.10.1"
+version = "0.11.0"
 description = "Paper-default market terminal with guarded manual Toss Open API orders"
 readme = "README.md"
 requires-python = ">=3.12"
