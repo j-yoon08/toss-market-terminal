@@ -1,6 +1,12 @@
 # Toss Market Terminal
 
-토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 `live` 실행·주문정보 최종 확인·검토 잠금 이후의 새 Enter·내부 전체 지문 executor 게이트를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다.
+> [!IMPORTANT]
+> 이 프로젝트는 토스증권 공식 Open API를 사용하는 **비공식 개인 오픈소스 프로젝트**이며,
+> 토스증권 또는 비바리퍼블리카가 개발·보증·제휴한 공식 제품이 아닙니다.
+> This is an unofficial open-source project and is not affiliated with or endorsed by Toss
+> Securities or Viva Republica. 관련 상표와 서비스 명칭의 권리는 각 소유자에게 있습니다.
+
+토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 `live` 실행·주문정보 최종 확인·검토 잠금 이후의 새 Enter·내부 전체 지문 executor 게이트를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다. 이 소프트웨어와 화면의 시장 해석은 투자 권유·자문이 아닙니다.
 
 ## v0.12.0 최초 실행 온보딩
 
@@ -376,7 +382,7 @@ PAPER 주문 미리보기 티켓(v0.7b)은 **paper preview 전용**입니다. �
 
 ```bash
 uv run python scripts/capture_preview.py AAPL \
-  --output-dir /home/ubuntu/Documents/outputs/toss-market-terminal \
+  --output-dir ~/Documents/outputs/toss-market-terminal \
   --width 140 --height 42
 ```
 
@@ -387,3 +393,12 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pytest
 ```
+
+## 보안
+
+취약점은 공개 Issue에 자격증명·계좌 식별자·주문 정보와 함께 게시하지 마세요. 안전한
+신고 절차와 지원 범위는 [SECURITY.md](SECURITY.md)를 확인하세요.
+
+## 라이선스
+
+[MIT License](LICENSE)
