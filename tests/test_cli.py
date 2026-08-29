@@ -11,6 +11,7 @@ import pytest
 from toss_market_terminal import cli
 from toss_market_terminal.api_session_lock import ApiSessionLock
 from toss_market_terminal.cli import build_parser, main
+from toss_market_terminal.config import Credentials, CredentialStore
 from toss_market_terminal.models import (
     Account,
     AccountContext,
@@ -21,6 +22,7 @@ from toss_market_terminal.models import (
     MarketValue,
     ProfitLoss,
 )
+from toss_market_terminal.onboarding import SetupResult
 from toss_market_terminal.settings import DEFAULT_SETTINGS_PATH
 
 
@@ -40,6 +42,11 @@ def _isolated_api_session_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     lock_path = tmp_path / "session-state" / "api-session.lock"
     monkeypatch.setattr(cli, "DEFAULT_LOCK_PATH", lock_path)
+    monkeypatch.setattr(
+        cli,
+        "resolve_credentials_path",
+        lambda requested: requested or cli.DEFAULT_CREDENTIALS_PATH,
+    )
     return lock_path
 
 
@@ -47,7 +54,7 @@ def test_version_flag_is_available_without_a_subcommand(capsys: pytest.CaptureFi
     with pytest.raises(SystemExit) as caught:
         build_parser().parse_args(["--version"])
     assert caught.value.code == 0
-    assert capsys.readouterr().out.strip() == "toss-market 0.11.0"
+    assert capsys.readouterr().out.strip() == "toss-market 0.12.0"
 
 
 def sample_context() -> AccountContext:
@@ -456,3 +463,206 @@ def test_lock_is_released_when_the_tui_app_raises(
     other = ApiSessionLock(_isolated_api_session_lock)
     other.acquire()
     other.release()
+
+
+def test_first_run_and_credential_commands_parse_without_secret_argv(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = build_parser()
+    assert parser.parse_args([]).command is None
+    setup = parser.parse_args(["setup", "--replace"])
+    assert (setup.command, setup.replace) == ("setup", True)
+    assert parser.parse_args(["credentials", "status"]).credentials_command == "status"
+    assert parser.parse_args(["credentials", "remove"]).credentials_command == "remove"
+    assert parser.parse_args(["credentials", "migrate"]).credentials_command == "migrate"
+    assert parser.parse_args(["demo"]).command == "demo"
+    with pytest.raises(SystemExit) as caught:
+        parser.parse_args(["setup", "--client-secret", "sentinel-secret-must-not-leak"])
+    assert caught.value.code == 2
+    error = capsys.readouterr().err
+    assert "대화형 입력" in error
+    assert "sentinel-secret-must-not-leak" not in error
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--client-secret=second-sentinel", "setup"])
+    assert "second-sentinel" not in capsys.readouterr().err
+
+
+def test_root_command_with_saved_credentials_launches_paper_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "credentials.json"
+    CredentialStore(path).save(
+        Credentials.from_values("tsck_live_cli_identifier", "tssk_live_cli_secret_value")
+    )
+    captured: list[dict[str, object]] = []
+
+    class FakeApp:
+        def __init__(self, symbol: str | None, credentials_path: Path, **kwargs: object) -> None:
+            captured.append({"symbol": symbol, "credentials_path": credentials_path, **kwargs})
+
+        def run(self) -> int:
+            return 0
+
+    monkeypatch.setattr(cli, "TossMarketApp", FakeApp)
+    assert main(["--credentials", str(path)]) == 0
+    assert captured[0]["symbol"] is None
+    assert captured[0]["credentials_path"] == path
+    assert captured[0]["manual_live_orders"] is False
+    assert captured[0]["account_seq"] is None
+
+
+def test_root_missing_credentials_noninteractive_fails_without_prompt_or_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "missing.json"
+    monkeypatch.setattr(cli, "is_interactive_terminal", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "TossMarketApp",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("app started")),
+    )
+    assert main(["--credentials", str(path)]) == 2
+    error = capsys.readouterr().err
+    assert "toss-market setup" in error
+    assert str(path) not in error
+
+
+def test_root_missing_credentials_runs_setup_then_paper_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "credentials.json"
+    calls: list[tuple[str, object]] = []
+
+    async def fake_setup(candidate: Path, *, replace: bool = False) -> SetupResult:
+        calls.append(("setup", (candidate, replace)))
+        return SetupResult(saved=True, replaced=False, path=candidate)
+
+    class FakeApp:
+        def __init__(self, symbol: str | None, credentials_path: Path, **kwargs: object) -> None:
+            calls.append(("app", (symbol, credentials_path, kwargs)))
+
+        def run(self) -> int:
+            return 0
+
+    monkeypatch.setattr(cli, "is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(cli, "setup_credentials", fake_setup)
+    monkeypatch.setattr(cli, "TossMarketApp", FakeApp)
+    assert main(["--credentials", str(path)]) == 0
+    assert calls[0] == ("setup", (path, False))
+    assert calls[1][0] == "app"
+    app_args = calls[1][1]
+    assert isinstance(app_args, tuple)
+    assert app_args[0] is None
+    assert app_args[1] == path
+    assert app_args[2]["manual_live_orders"] is False
+
+
+def test_setup_command_is_interactive_and_passes_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "credentials.json"
+    calls: list[tuple[Path, bool]] = []
+
+    async def fake_setup(candidate: Path, *, replace: bool = False) -> SetupResult:
+        calls.append((candidate, replace))
+        return SetupResult(saved=True, replaced=replace, path=candidate)
+
+    monkeypatch.setattr(cli, "is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(cli, "setup_credentials", fake_setup)
+    assert main(["--credentials", str(path), "setup", "--replace"]) == 0
+    assert calls == [(path, True)]
+
+
+def test_credential_status_masks_value(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "credentials.json"
+    client_id = "tsck_live_cli_status_identifier"
+    secret = "tssk_live_cli_status_secret_value"
+    CredentialStore(path).save(Credentials.from_values(client_id, secret))
+    assert main(["--credentials", str(path), "credentials", "status"]) == 0
+    output = capsys.readouterr().out
+    assert "자격증명: 설정됨" in output
+    assert client_id not in output
+    assert secret not in output
+    assert client_id[-4:] in output
+
+
+def test_credential_remove_requires_interactive_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "credentials.json"
+    monkeypatch.setattr(cli, "is_interactive_terminal", lambda: False)
+    assert main(["--credentials", str(path), "credentials", "remove"]) == 2
+    assert "대화형" in capsys.readouterr().err
+
+
+def test_credential_remove_is_blocked_by_active_api_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _isolated_api_session_lock: Path,
+) -> None:
+    path = tmp_path / "credentials.json"
+    monkeypatch.setattr(
+        cli,
+        "is_interactive_terminal",
+        lambda: (_ for _ in ()).throw(AssertionError("prompt reached")),
+    )
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()
+    try:
+        assert main(["--credentials", str(path), "credentials", "remove"]) == 2
+    finally:
+        other.release()
+    assert "다른 API" in capsys.readouterr().err
+
+
+def test_demo_never_uses_api_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_api_session_lock: Path,
+) -> None:
+    calls: list[str] = []
+
+    class FakeDemoApp:
+        def run(self) -> int:
+            calls.append("run")
+            return 0
+
+    monkeypatch.setattr(cli, "build_demo_app", lambda: FakeDemoApp())
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()
+    try:
+        assert main(["demo"]) == 0
+    finally:
+        other.release()
+    assert calls == ["run"]
+
+
+@pytest.mark.parametrize("argv", [[], ["setup"]])
+def test_default_and_setup_lock_before_prompt_or_app(
+    argv: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _isolated_api_session_lock: Path,
+) -> None:
+    path = tmp_path / "missing.json"
+    monkeypatch.setattr(
+        cli,
+        "is_interactive_terminal",
+        lambda: (_ for _ in ()).throw(AssertionError("prompt reached")),
+    )
+    other = ApiSessionLock(_isolated_api_session_lock)
+    other.acquire()
+    try:
+        assert main(["--credentials", str(path), *argv]) == 2
+    finally:
+        other.release()
+    assert "다른 API" in capsys.readouterr().err

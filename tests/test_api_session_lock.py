@@ -57,7 +57,9 @@ def test_closing_fd_without_release_frees_the_flock(tmp_path: Path) -> None:
     path = tmp_path / "api-session.lock"
     holder = ApiSessionLock(path)
     holder.acquire()
-    os.close(holder._fd)  # crash simulation: bypass release(), just drop the fd
+    fd = holder._fd
+    assert fd is not None
+    os.close(fd)  # crash simulation: bypass release(), just drop the fd
     holder._fd = None
 
     survivor = ApiSessionLock(path)
@@ -191,6 +193,36 @@ def test_existing_0755_ancestor_is_preserved(tmp_path: Path) -> None:
     assert stat.S_IMODE(ancestor.stat().st_mode) == 0o755
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_nested_missing_state_directories_are_created_private(tmp_path: Path) -> None:
+    trusted = tmp_path / "home"
+    trusted.mkdir(mode=0o700)
+    path = trusted / ".local" / "state" / "toss-market-terminal" / "api-session.lock"
+
+    lock = ApiSessionLock(path)
+    lock.acquire()
+    lock.release()
+
+    for directory in (
+        trusted / ".local",
+        trusted / ".local" / "state",
+        path.parent,
+    ):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_nested_creation_rejects_world_writable_existing_parent(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    os.chmod(unsafe, 0o777)
+    path = unsafe / "state" / "toss-market-terminal" / "api-session.lock"
+
+    with pytest.raises(ApiSessionLockError, match="UNSAFE_LOCK_DIRECTORY"):
+        ApiSessionLock(path).acquire()
+
+    assert not (unsafe / "state").exists()
 
 
 def test_repr_redacts_path(tmp_path: Path) -> None:

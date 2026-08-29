@@ -15,9 +15,23 @@ from rich.console import Console
 from . import __version__
 from .api_session_lock import DEFAULT_LOCK_PATH, ApiSessionLock, ApiSessionLockError
 from .client import TossApiError, TossMarketClient
-from .config import DEFAULT_CREDENTIALS_PATH, CredentialError, Credentials
+from .config import (
+    DEFAULT_CREDENTIALS_PATH,
+    LEGACY_CREDENTIALS_PATH,
+    CredentialError,
+    Credentials,
+    CredentialStore,
+    resolve_credentials_path,
+)
+from .demo import build_demo_app
 from .live_order import MANUAL_LIVE_ENV_KEY, MANUAL_LIVE_ENV_VALUE
 from .models import AccountContext
+from .onboarding import (
+    credential_status,
+    migrate_credentials,
+    remove_credentials,
+    setup_credentials,
+)
 from .render import snapshot_renderable
 from .settings import (
     DEFAULT_SETTINGS_PATH,
@@ -32,10 +46,48 @@ from .stream import StreamStatus, TossMarketStream, infer_market, normalize_symb
 from .tui import TossMarketApp
 
 
+class _RejectCredentialArgument(argparse.Action):
+    """Reject credential argv without reflecting the supplied value."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        del namespace, values
+        label = option_string or "credential option"
+        parser.error(
+            f"{label}는 보안상 명령행 인자로 받지 않습니다. "
+            "`toss-market setup`의 대화형 입력을 사용하세요."
+        )
+
+
+def _add_rejected_credential_arguments(parser: argparse.ArgumentParser) -> None:
+    for option in ("--client-id", "--client-secret"):
+        parser.add_argument(
+            option,
+            action=_RejectCredentialArgument,
+            help=argparse.SUPPRESS,
+        )
+
+
 def json_default(value: object) -> str:
     if isinstance(value, Decimal):
         return str(value)
     raise TypeError(f"지원하지 않는 JSON 값: {type(value).__name__}")
+
+
+def is_interactive_terminal() -> bool:
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def require_interactive_terminal() -> None:
+    if not is_interactive_terminal():
+        raise CredentialError(
+            "대화형 터미널이 필요합니다. 터미널에서 `toss-market setup`을 실행하세요."
+        )
 
 
 async def run_snapshot(symbol: str, credentials_path: Path, json_output: bool) -> int:
@@ -215,8 +267,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--credentials",
         type=Path,
-        default=DEFAULT_CREDENTIALS_PATH,
-        help=f"자격증명 경로 (기본값: {DEFAULT_CREDENTIALS_PATH})",
+        default=None,
+        help=f"자격증명 경로 (기본값: {DEFAULT_CREDENTIALS_PATH}, 기존 경로 자동 호환)",
     )
     parser.add_argument(
         "--settings",
@@ -225,7 +277,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SETTINGS_PATH,
         help=f"설정 파일 경로 (기본값: {DEFAULT_SETTINGS_PATH})",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    _add_rejected_credential_arguments(parser)
+    subparsers = parser.add_subparsers(dest="command", required=False)
+
+    setup = subparsers.add_parser("setup", help="최초 Toss Open API 자격증명 설정")
+    _add_rejected_credential_arguments(setup)
+    setup.add_argument(
+        "--replace",
+        action="store_true",
+        help="기존 자격증명을 명시적 확인 후 교체",
+    )
+
+    credentials = subparsers.add_parser("credentials", help="저장된 자격증명 관리")
+    credentials_sub = credentials.add_subparsers(dest="credentials_command", required=True)
+    credentials_sub.add_parser("status", help="원문을 노출하지 않고 설정 상태 확인")
+    credentials_sub.add_parser("remove", help="최종 확인 후 로컬 자격증명 삭제")
+    credentials_sub.add_parser("migrate", help="기존 경로의 자격증명을 새 경로로 복사")
+
+    subparsers.add_parser("demo", help="credential·network 없는 offline PAPER 데모")
 
     snapshot = subparsers.add_parser("snapshot", help="현재가·호가·체결·1분봉 스냅샷")
     snapshot.add_argument("symbol")
@@ -297,35 +366,84 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# snapshot/account/probe/watch/live all mint or reuse the single OAuth access
+# default/setup/snapshot/account/probe/watch/live all mint or reuse the single OAuth access
 # token the Toss Open API issues per client, so they share one cross-process
-# lock. watchlist/alert only touch the local settings file and never lock.
-API_SESSION_LOCKED_COMMANDS = frozenset({"snapshot", "account", "probe", "watch", "live"})
+# lock. demo/credentials/watchlist/alert stay local and never lock.
+API_SESSION_LOCKED_COMMANDS = frozenset(
+    {"default", "setup", "snapshot", "account", "probe", "watch", "live"}
+)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    effective_command = args.command or "default"
+    credentials_path = resolve_credentials_path(args.credentials)
 
     def settings_file() -> Path:
         return getattr(args, "settings", None) or args.settings_path
 
     try:
         with ExitStack() as stack:
-            if args.command in API_SESSION_LOCKED_COMMANDS:
+            remove_credentials_command = (
+                args.command == "credentials" and args.credentials_command == "remove"
+            )
+            if effective_command in API_SESSION_LOCKED_COMMANDS or remove_credentials_command:
                 stack.enter_context(ApiSessionLock(DEFAULT_LOCK_PATH))
+            if args.command == "demo":
+                result = build_demo_app().run()
+                return result or 0
+            if args.command == "setup":
+                require_interactive_terminal()
+                result = asyncio.run(setup_credentials(credentials_path, replace=args.replace))
+                return 0 if result.saved else 1
+            if args.command == "credentials":
+                if args.credentials_command == "status":
+                    status = credential_status(credentials_path)
+                    if not status.configured:
+                        print("자격증명: 설정되지 않음")
+                        print(f"예정 저장 위치: {status.path}")
+                        return 1
+                    print("자격증명: 설정됨")
+                    print(f"저장 방식: {status.storage}")
+                    print(f"저장 위치: {status.path}")
+                    print(f"Client ID: {status.masked_client_id}")
+                    print("Client Secret: 저장됨 (원문 표시 안 함)")
+                    return 0
+                if args.credentials_command == "remove":
+                    require_interactive_terminal()
+                    return 0 if remove_credentials(credentials_path) else 1
+                if args.credentials_command == "migrate":
+                    destination = args.credentials or DEFAULT_CREDENTIALS_PATH
+                    migrate_credentials(LEGACY_CREDENTIALS_PATH, destination)
+                    return 0
+            if args.command is None:
+                store = CredentialStore(credentials_path)
+                if not store.exists():
+                    require_interactive_terminal()
+                    setup_result = asyncio.run(setup_credentials(credentials_path))
+                    if not setup_result.saved:
+                        return 1
+                result = TossMarketApp(
+                    None,
+                    credentials_path,
+                    settings_path=settings_file(),
+                    manual_live_orders=False,
+                    account_seq=None,
+                ).run()
+                return result or 0
             if args.command in {"snapshot", "account", "probe"}:
                 symbol = normalize_symbol(args.symbol)
                 if args.command == "snapshot":
-                    return asyncio.run(run_snapshot(symbol, args.credentials, args.json_output))
+                    return asyncio.run(run_snapshot(symbol, credentials_path, args.json_output))
                 if args.command == "account":
                     if args.account_seq is not None and args.account_seq <= 0:
                         raise ValueError("--account-seq는 양의 정수여야 합니다.")
                     return asyncio.run(
-                        run_account(symbol, args.credentials, args.account_seq, args.json_output)
+                        run_account(symbol, credentials_path, args.account_seq, args.json_output)
                     )
                 if not 1 <= args.seconds <= 60:
                     raise ValueError("probe 시간은 1~60초여야 합니다.")
-                return asyncio.run(run_probe(symbol, args.credentials, args.seconds))
+                return asyncio.run(run_probe(symbol, credentials_path, args.seconds))
             if args.command in {"watch", "live"}:
                 live_shortcut = args.command == "live"
                 symbol = normalize_symbol(args.symbol) if args.symbol is not None else None
@@ -337,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     result = TossMarketApp(
                         symbol,
-                        args.credentials,
+                        credentials_path,
                         settings_path=settings_file(),
                         manual_live_orders=live_shortcut or getattr(args, "live_orders", False),
                         account_seq=args.account_seq,

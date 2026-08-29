@@ -48,7 +48,7 @@ def _verify_existing_directory(path: Path) -> None:
 
 
 def _prepare_leaf_directory(parent: Path) -> None:
-    """Reject symlink components and create only the final missing directory."""
+    """Reject symlink components and privately create missing user-state directories."""
 
     if not parent.is_absolute():
         raise _fail("LOCK_PATH_NOT_ABSOLUTE")
@@ -57,20 +57,20 @@ def _prepare_leaf_directory(parent: Path) -> None:
     for component in [*ancestors, parent]:
         if component == Path(component.anchor):
             continue
-        if component == parent and not os.path.lexists(component):
+        if not os.path.lexists(component):
             direct_parent = component.parent
             _verify_existing_directory(direct_parent)
             try:
                 os.mkdir(component, 0o700)
             except FileExistsError:
-                # Another cooperating writer may have created the same leaf.
+                # Another cooperating writer may have created the same directory.
                 pass
             except OSError:
                 raise _fail("LOCK_DIRECTORY_CREATE_FAILED") from None
             _verify_existing_directory(component)
             if stat.S_IMODE(os.lstat(component).st_mode) != 0o700:
                 raise _fail("UNSAFE_LOCK_DIRECTORY")
-            return
+            continue
         try:
             info = os.lstat(component)
         except OSError:

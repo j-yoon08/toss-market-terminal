@@ -2,6 +2,16 @@
 
 토스증권 **공식 Open API** 기반 실시간 터미널입니다. 기본 실행은 시세·계좌 조회와 PAPER 주문 미리보기이며, 명시적인 `live` 실행·주문정보 최종 확인·검토 잠금 이후의 새 Enter·내부 전체 지문 executor 게이트를 모두 통과한 경우에만 수동 LIVE 주문 1건을 전송할 수 있습니다. 자동매매·자동 재시도·주문 정정/취소는 지원하지 않습니다.
 
+## v0.12.0 최초 실행 온보딩
+
+- `toss-market`을 처음 실행하면 저장된 자격증명이 없는 대화형 터미널에서 setup 마법사를 시작합니다.
+- Client ID는 일반 입력, Client Secret은 echo가 꺼진 숨김 입력으로 받으며 argv·로그·화면에 원문을 남기지 않습니다.
+- 입력값은 OAuth와 `GET /api/v1/prices` 한 번으로만 검증하고, 주문·계좌 endpoint 없이 성공한 경우에만 로컬에 저장합니다.
+- 신규 기본 경로는 `~/.config/toss-market-terminal/credentials.json`이며 새 디렉터리 `0700`, 파일 `0600`, 원자적 저장, 현재 사용자 소유, symlink/hardlink 거부를 적용합니다.
+- 기존 `~/.config/tossinvest/openapi.json`도 안전 조건을 통과하면 자동으로 계속 사용합니다.
+- `toss-market demo`는 credential·network·계좌·주문 없이 offline PAPER 화면을 실행합니다.
+- 최초 setup도 LIVE를 활성화하지 않습니다. 인자 없는 기본 실행은 항상 PAPER이며 LIVE는 계속 `toss-market live`로만 진입합니다.
+
 ## v0.11.0 로컬 AI 방향 판단 (표시 전용)
 
 - 차트 패널 첫 줄에 `AI 보조 · 매수/관망/매도/판단 불가`를 표시하고, compact 화면에서는 상태바의 `AI` 항목으로 같은 상태를 확인할 수 있습니다. `i` 상세 모달은 신뢰도·학습 표본 수·walk-forward 균형 정확도·근거·반대 신호·무효화 조건·모델 한계를 보여줍니다.
@@ -126,7 +136,7 @@
 - 별도 `TossOrderTransport`에는 수동 주문 생성을 위한 `POST /api/v1/orders` 하나만 존재합니다. TUI에서 명시적 live 실행·주문정보 확인 모달·검토 잠금 이후의 새 Enter·내부 전체 승인문구·fresh risk/duplicate 검사·감사로그 preflight를 모두 통과해야만 정확히 한 번 연결되며, 정정·취소·조건주문 경로는 없습니다.
 - 계좌 조회는 읽기 전용 스코프(`account_read_only`)로만 동작하며 주문 API는 호출하지 않습니다.
 - 자격증명과 액세스 토큰을 로그·설정·화면에 출력하지 않습니다.
-- 자격증명 파일이 일반 파일, 현재 사용자 소유, 정확히 `0600` 권한일 때만 실행됩니다.
+- 자격증명 파일은 원자적으로 저장되며 일반 파일, 현재 사용자 소유, 정확히 `0600`, 단일 link일 때만 실행됩니다. 파일 저장은 OS keyring 암호화가 아닌 사용자 전용 private file 방식입니다.
 - 관심 종목과 알림만 저장하는 설정 파일은 원자적으로 저장되며 파일 `0600`, 디렉터리 `0700` 권한을 사용합니다.
 - 알림은 `watch`가 실행 중일 때만 발생합니다. 백그라운드 서비스나 주문 자동화가 아닙니다.
 - WebSocket 체결·호가에는 sequence가 없어 완전한 틱 복원용이 아닌 모니터링용입니다.
@@ -134,18 +144,58 @@
 
 ## 설치
 
+사용자 설치:
+
 ```bash
-cd /home/ubuntu/apps/toss-market-terminal
-uv sync --dev
+git clone https://github.com/j-yoon08/toss-market-terminal.git
+cd toss-market-terminal
+uv tool install .
 ```
 
-기본 자격증명 경로:
+최초 실행:
+
+```bash
+toss-market
+```
+
+화면 안내에 따라 Toss Open API의 Client ID와 Client Secret을 입력하면 읽기 전용 연결 확인 후 한 번 저장되며, 이후에는 `toss-market`만 실행하면 PAPER TUI가 열립니다. setup을 명시적으로 다시 실행하거나 교체할 수도 있습니다.
+
+```bash
+toss-market setup
+toss-market setup --replace
+toss-market credentials status
+toss-market credentials migrate
+toss-market credentials remove
+```
+
+자격증명 원문은 status에 나오지 않습니다. 삭제는 대화형 최종 확인이 필요하며, 교체는 새 credential 검증과 원자적 저장이 성공해야 기존 파일을 바꿉니다. 비대화형 환경에서 자격증명이 없으면 prompt로 멈추지 않고 종료 코드 `2`와 `toss-market setup` 안내를 반환합니다.
+
+신규 기본 자격증명 경로:
 
 ```text
-/home/ubuntu/.config/tossinvest/openapi.json
+~/.config/toss-market-terminal/credentials.json
 ```
 
-파일 내용은 `client_id`, `client_secret` 키를 가져야 하며 권한은 `0600`이어야 합니다.
+호환되는 기존 경로:
+
+```text
+~/.config/tossinvest/openapi.json
+```
+
+기존 파일을 새 경로로 복사하려면 `toss-market credentials migrate`를 사용합니다. 기존 파일은 자동 삭제하지 않습니다.
+
+credential 없이 체험:
+
+```bash
+toss-market demo
+```
+
+개발 환경:
+
+```bash
+uv sync --frozen --dev
+uv run toss-market demo
+```
 
 관심 종목과 알림의 기본 설정 경로:
 

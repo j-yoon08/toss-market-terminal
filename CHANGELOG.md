@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.0
+
+### First-run onboarding
+
+- Add an interactive `toss-market setup` flow with hidden Client Secret input, OAuth plus one read-only price verification, and no credential values in argv or output.
+- Store new credentials atomically at `~/.config/toss-market-terminal/credentials.json` with private directories, exact `0600` file mode, ownership checks, and symlink/hardlink rejection.
+- Preserve the secure legacy credential path as a compatibility fallback and add explicit status, migration, replacement, and confirmed removal commands.
+- Make bare `toss-market` launch PAPER mode, running setup first only when credentials are missing and the terminal is interactive; non-interactive use fails without blocking for input.
+- Securely initialize missing user-state lock directories as `0700` from a trusted existing parent so a completely fresh HOME reaches onboarding without weakening symlink or ownership checks.
+- Add a credential-free, network-free `toss-market demo` Textual preview with LIVE disabled.
+
 ## 0.11.0
 
 ### AI direction support

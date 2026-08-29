@@ -561,8 +561,8 @@ class MarketInterpretationScreen(ModalScreen[None]):
 
 
 class TossMarketApp(App[int]):
-    TITLE = "Toss Market Terminal"
-    SUB_TITLE = "READ ONLY"
+    TITLE: ClassVar[str] = "Toss Market Terminal"
+    SUB_TITLE: ClassVar[str] = "READ ONLY"
     BINDINGS: ClassVar = [
         Binding("q", "quit", "종료"),
         Binding("r", "refresh", "재동기화"),
@@ -697,6 +697,7 @@ class TossMarketApp(App[int]):
         order_history_refresh_seconds: float = ORDER_HISTORY_REFRESH_SECONDS,
         price_stale_seconds: float = PRICE_STALE_SECONDS,
         manual_live_orders: bool = False,
+        offline_demo: bool = False,
         live_audit_log: LiveAuditLog | None = None,
         live_transport_factory: LiveTransportFactory | None = None,
         account_seq: int | None = None,
@@ -737,6 +738,11 @@ class TossMarketApp(App[int]):
         self.chart_render_interval_seconds = chart_render_interval_seconds
         if not isinstance(manual_live_orders, bool):
             raise ValueError("manual_live_orders는 bool이어야 합니다.")
+        if not isinstance(offline_demo, bool):
+            raise ValueError("offline_demo는 bool이어야 합니다.")
+        if offline_demo and (connect_live or manual_live_orders):
+            raise ValueError("offline demo는 network와 LIVE 주문을 활성화할 수 없습니다.")
+        self.offline_demo = offline_demo
         self.manual_live_orders = manual_live_orders
         self.sub_title = "MANUAL LIVE" if manual_live_orders else "READ ONLY"
         self.live_audit_log = live_audit_log or LiveAuditLog()
@@ -2753,7 +2759,9 @@ class TossMarketApp(App[int]):
         state_color = connection_state_color(self.connection_state, live)
         top = Text()
         top.append("TOSS MARKET", style="bold white")
-        if not self.manual_live_orders:
+        if self.offline_demo:
+            top.append("   DEMO · OFFLINE · PAPER ONLY", style="#33d6c8")
+        elif not self.manual_live_orders:
             top.append("   PAPER DEFAULT", style="#526273")
         elif os.environ.get(MANUAL_LIVE_ENV_KEY) == MANUAL_LIVE_ENV_VALUE:
             top.append("   MANUAL LIVE READY", style="#f28b82")
@@ -2774,6 +2782,8 @@ class TossMarketApp(App[int]):
         # snapshot) — BOOK (orderbook) traffic never advances it.
         status = Text()
         status.append(f"{'●' if live else '○'} {self.connection_state}", style=state_color)
+        if self.offline_demo:
+            status.append("   OFFLINE DEMO", style="#33d6c8")
         if self.ai_direction_signal is not None:
             status.append(
                 f"   AI {direction_label_ko(self.ai_direction_signal.direction)}",
