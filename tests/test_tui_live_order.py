@@ -15,7 +15,11 @@ import pytest
 from textual.widgets import Input, Static
 
 from tests.test_order_ticket import make_context, ticket_snapshot
-from tests.test_portfolio import build_snapshot
+from tests.test_portfolio import (
+    build_snapshot,
+    official_open_orders_page,
+    official_order,
+)
 from toss_market_terminal.live_audit import LiveAuditLog
 from toss_market_terminal.live_order import (
     LiveOrderAmbiguous,
@@ -512,24 +516,106 @@ async def test_same_fingerprint_never_retries_after_first_attempt(
     assert "ambiguous" in text
 
 
-async def test_live_mode_opens_compact_enter_confirm_modal_after_paper_confirm(
+@pytest.mark.parametrize("size", [(90, 30), (140, 44)])
+async def test_live_mode_opens_pretrade_modal_without_horizontal_scroll(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    size: tuple[int, int],
 ) -> None:
     monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
     transport = RecordingTransport()
     app = make_live_app(tmp_path, transport)
 
+    async with app.run_test(size=size) as pilot:
+        app._on_paper_confirmed(preview(), True)
+        await pilot.pause()
+        assert type(app.screen).__name__ == "LiveApprovalScreen"
+        dialog = app.screen.query_one("#live-approval-dialog")
+        region = dialog.region
+        assert 0 < region.width <= size[0] and 0 < region.height <= size[1]
+        assert dialog.max_scroll_x == 0
+        shown = app.screen.query_one("#live-approval-details", Static).render().plain
+        assert app.screen.packet.fingerprint in shown
+        assert len(app.screen.packet.fingerprint) == 64
+        summary = app.screen.query_one("#live-approval-summary", Static).render().plain
+        assert "브로커 접수는 체결을 의미하지 않습니다" in summary
+        facts_title = app.screen.query_one("#live-approval-facts-title", Static).render().plain
+        assert "사전 점검" in facts_title
+        assert "마지막 값" in facts_title
+        assert "Enter 후 계좌·미체결 fresh GET" in facts_title
+        fact_rows = list(app.screen.query(".pretrade-fact"))
+        assert len(fact_rows) == 6
+        assert all(row.region.width <= region.width for row in fact_rows)
+        assert app.screen.facts is not None
+        with pytest.raises(ValueError, match="일치하지 않습니다"):
+            LiveApprovalScreen(
+                app.screen.plan,
+                replace(app.screen.facts, mode="PAPER"),
+            )
+        assert len(app.screen.query(Input)) == 0
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert transport.packets == []
+
+
+async def test_live_market_modal_keeps_estimate_not_cap_and_acceptance_not_fill_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
+    transport = RecordingTransport()
+    app = make_live_app(tmp_path, transport)
+    market_preview = build_preview(
+        account_no="*******8901",
+        account_seq=1,
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity="1",
+        reference_last_price="40",
+        holding_quantity="5",
+        cash_buying_power="500",
+        market="us",
+        currency="USD",
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        app._on_paper_confirmed(market_preview, True)
+        await pilot.pause()
+        assert type(app.screen).__name__ == "LiveApprovalScreen"
+        summary = app.screen.query_one("#live-approval-summary", Static).render().plain
+        facts_text = "\n".join(row.render().plain for row in app.screen.query(".pretrade-fact"))
+        assert "MARKET" in summary
+        assert "브로커 접수는 체결을 의미하지 않습니다" in summary
+        assert "체결 금액 상한도 아님" in facts_text
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert transport.packets == []
+
+
+async def test_live_facts_reuse_fresh_matched_open_orders_without_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOSS_ENABLE_MANUAL_LIVE_ORDERS", "1")
+    transport = RecordingTransport()
+    app = make_live_app(tmp_path, transport)
+    app.portfolio_snapshot = build_snapshot(
+        orders_raw=official_open_orders_page(
+            [official_order(symbol="AAPL", side="BUY", currency="USD")]
+        )
+    )
+    app.portfolio_stale = False
+
     async with app.run_test(size=(90, 30)) as pilot:
         app._on_paper_confirmed(preview(), True)
         await pilot.pause()
         assert type(app.screen).__name__ == "LiveApprovalScreen"
-        region = app.screen.query_one("#live-approval-dialog").region
-        assert 0 < region.width <= 90 and 0 < region.height <= 30
-        shown = app.screen.query_one("#live-approval-details", Static).render().plain
-        assert app.screen.packet.fingerprint in shown
-        assert len(app.screen.packet.fingerprint) == 64
-        assert len(app.screen.query(Input)) == 0
+        assert app.screen.facts is not None
+        duplicate = app.screen.facts.row("duplicate_orders")
+        assert duplicate is not None
+        assert duplicate.status.value == "BLOCK"
+        assert "1건 존재" in duplicate.detail
         await pilot.press("escape")
         await pilot.pause()
 

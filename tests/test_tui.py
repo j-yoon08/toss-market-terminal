@@ -296,8 +296,10 @@ async def test_orderbook_event_does_not_refresh_tick_but_trade_event_does(
         await pilot.pause()
         app.client = FakeClient()  # type: ignore[assignment]
         tick_after_mount = app.last_tick_monotonic
+        book_after_mount = app.last_orderbook_monotonic
         assert tick_after_mount is not None
-        assert app.last_orderbook_monotonic is None
+        # The initial REST snapshot establishes both provider-anchored clocks.
+        assert book_after_mount is not None
 
         await app._run_feed(symbol="AAPL", market="us")
         await pilot.pause()

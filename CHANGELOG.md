@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.0
+
+### Pre-trade facts and order-flow design
+
+- Add a pure, immutable pre-trade facts projection for quote freshness, top-of-book spread, reference execution price, estimated notional, buying-power or conservative sellable context, and duplicate open orders.
+- Redesign PAPER confirmation and final LIVE approval modals as compact, flat, high-contrast surfaces with explicit Korean `정상`/`주의`/`차단`/`정보 없음` states.
+- Keep MARKET values explicitly estimated rather than a fill guarantee or execution cap, and preserve accepted-not-filled wording.
+- Reuse only existing in-memory GET data and canonical risk/preflight decisions; add no endpoint, order mutation, automatic retry, or cumulative budget.
+- Add deterministic Decimal/privacy/adversarial tests and wide/compact Textual layout checks with zero horizontal scroll.
+
 ## 0.12.0
 
 ### First-run onboarding

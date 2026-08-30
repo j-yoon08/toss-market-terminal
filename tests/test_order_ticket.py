@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import time
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -37,6 +38,7 @@ from toss_market_terminal.order_preview import (
     OrderSide,
     build_preview,
 )
+from toss_market_terminal.order_ticket import OrderConfirmScreen
 from toss_market_terminal.tui import TossMarketApp
 
 RAW_ACCOUNT_NO = "50123456701"
@@ -287,6 +289,13 @@ async def test_market_toggle_disables_limit_and_builds_directly(tmp_path: Path) 
         assert "시장가(MARKET)" in body
         assert "참고가 40 USD" in body
         assert "추정 금액: 80 USD" in body
+        facts_text = "\n".join(row.render().plain for row in confirm.query(".pretrade-fact"))
+        assert "MARKET 추정" in facts_text
+        assert "체결 보장" in facts_text
+        assert "체결 금액 상한도 아님" in facts_text
+        assert confirm.facts is not None
+        with pytest.raises(ValueError, match="일치하지 않습니다"):
+            OrderConfirmScreen(confirm.preview, replace(confirm.facts, mode="LIVE"))
 
         # m 토글 복귀: 다시 지정가 모드로 돌아가면 입력이 살아난다
         # (확인 화면이라 여기서는 티켓 화면 동작을 직접 검증하지 않는다)
@@ -338,6 +347,112 @@ async def test_confirm_stores_only_last_paper_preview_and_notifies(tmp_path: Pat
         assert any(
             "PAPER PREVIEW" in message and "전송되지 않았습니다" in message for message in messages
         )
+
+
+async def test_confirm_modal_expires_visible_facts_and_blocks_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = make_app(make_context(), tmp_path)
+    monkeypatch.setattr(app, "_quote_valid_for_seconds", lambda: 0.01)
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("b")
+        await pilot.pause()
+        await pilot.press("1")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+
+        confirm = app.screen
+        assert type(confirm).__name__ == "OrderConfirmScreen"
+        assert "차단" in confirm.query_one("#confirm-facts-title", Static).render().plain
+        quote_row = confirm.query_one("#confirm-fact-quote_freshness", Static)
+        assert quote_row.has_class("fact-block")
+        assert "유효시간 경과" in quote_row.render().plain
+        await pilot.press("enter")
+        await pilot.pause()
+        assert type(app.screen).__name__ == "OrderConfirmScreen"
+        assert app.last_paper_preview is None
+
+
+async def test_paper_confirm_callback_rechecks_current_quote_staleness(tmp_path: Path) -> None:
+    app = make_app(make_context(), tmp_path)
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("b")
+        await pilot.pause()
+        await pilot.press("1")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert type(app.screen).__name__ == "OrderConfirmScreen"
+
+        app.last_tick_monotonic = time.monotonic() - app.price_stale_seconds - 1
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.last_paper_preview is None
+        messages = [notification.message for notification in app._notifications]
+        assert any("확인 중 시세 유효시간" in message for message in messages)
+
+
+async def test_paper_confirm_deadline_stays_expired_after_new_tick(tmp_path: Path) -> None:
+    app = make_app(make_context(), tmp_path)
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("b")
+        await pilot.pause()
+        await pilot.press("1")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        confirm = app.screen
+        assert type(confirm).__name__ == "OrderConfirmScreen"
+
+        # A newer tick must not resurrect facts whose immutable modal deadline passed.
+        app.last_tick_monotonic = time.monotonic()
+        app._on_paper_confirmed(
+            confirm.preview,
+            True,
+            facts_deadline_monotonic=time.monotonic() - 1,
+        )
+        await pilot.pause()
+
+        assert app.last_paper_preview is None
+        messages = [notification.message for notification in app._notifications]
+        assert any("확인 중 시세 유효시간" in message for message in messages)
+
+
+async def test_confirm_expiry_timer_blocks_even_when_facts_projection_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = make_app(make_context(), tmp_path)
+    monkeypatch.setattr(app, "_build_pretrade_facts", lambda preview, mode: None)
+    monkeypatch.setattr(app, "_quote_valid_for_seconds", lambda: 0.01)
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("b")
+        await pilot.pause()
+        await pilot.press("1")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+
+        assert type(app.screen).__name__ == "OrderConfirmScreen"
+        title = app.screen.query_one("#confirm-facts-title", Static).render().plain
+        assert "차단" in title
+        await pilot.press("enter")
+        await pilot.pause()
+        assert type(app.screen).__name__ == "OrderConfirmScreen"
+        assert app.last_paper_preview is None
 
 
 async def test_cancel_at_confirm_stores_nothing(tmp_path: Path) -> None:
@@ -559,14 +674,17 @@ async def test_duplicate_open_is_serialized_by_lock(tmp_path: Path) -> None:
         assert len(loader.calls) == 1
 
 
-async def test_compact_90x30_ticket_and_confirm_are_visible(tmp_path: Path) -> None:
+@pytest.mark.parametrize("size", [(90, 30), (140, 44)])
+async def test_ticket_and_pretrade_confirm_are_visible_without_horizontal_scroll(
+    tmp_path: Path, size: tuple[int, int]
+) -> None:
     app = make_app(make_context(), tmp_path)
-    async with app.run_test(size=(90, 30)) as pilot:
+    async with app.run_test(size=size) as pilot:
         await pilot.pause()
         await pilot.press("b")
         await pilot.pause()
         region = app.screen.query_one("#ticket-dialog").region
-        assert 0 < region.width <= 90 and 0 < region.height <= 30
+        assert 0 < region.width <= size[0] and 0 < region.height <= size[1]
         assert region.width >= 40 and region.height >= 10
 
         await pilot.press("1")
@@ -576,8 +694,17 @@ async def test_compact_90x30_ticket_and_confirm_are_visible(tmp_path: Path) -> N
         assert app.screen.query_one("#ticket-price", Input).has_focus
         await pilot.press("enter")  # 지정가 제출 → 확인 모달
         await pilot.pause()
-        cregion = app.screen.query_one("#order-confirm-dialog").region
-        assert 0 < cregion.width <= 90 and 0 < cregion.height <= 30
+        dialog = app.screen.query_one("#order-confirm-dialog")
+        cregion = dialog.region
+        assert 0 < cregion.width <= size[0] and 0 < cregion.height <= size[1]
+        assert dialog.max_scroll_x == 0
+        assert (
+            "사전 점검 · 종합"
+            in app.screen.query_one("#confirm-facts-title", Static).render().plain
+        )
+        fact_rows = list(app.screen.query(".pretrade-fact"))
+        assert len(fact_rows) == 6
+        assert all(row.region.width <= cregion.width for row in fact_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +730,7 @@ async def test_fake_client_records_only_account_context_calls(tmp_path: Path) ->
         await pilot.press("enter")  # 확인 모달에서 로컬 확정
         await pilot.pause()
 
-    assert set(fake.calls) == {"AAPL"}
+    assert fake.calls == ["AAPL"]
     assert app.last_paper_preview is not None
     assert app.last_paper_preview.order_endpoint_called is False
 

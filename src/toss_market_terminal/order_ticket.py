@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -21,6 +22,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Input, Static
 
 from .client import TossApiError
@@ -36,6 +38,7 @@ from .order_preview import (
     canonical_decimal_text,
     parse_decimal_input,
 )
+from .pretrade import PretradeFacts
 
 PAPER_PREVIEW_BANNER = "PAPER_PREVIEW · 실제 주문 전송 없음"
 
@@ -362,12 +365,12 @@ class OrderConfirmScreen(ModalScreen[bool]):
         background: rgba(4, 7, 10, 0.82);
     }
     #order-confirm-dialog {
-        width: 92%;
-        max-width: 58;
+        width: 96%;
+        max-width: 84;
         height: auto;
-        max-height: 90%;
+        max-height: 94%;
         padding: 1 2;
-        border: solid #f0ad4e;
+        border: solid #34404d;
         background: #0d131a;
     }
     #confirm-banner {
@@ -379,25 +382,87 @@ class OrderConfirmScreen(ModalScreen[bool]):
         height: auto;
         color: #d9e1e8;
     }
-    #confirm-help {
+    #confirm-facts-title {
         height: 1;
-        color: #526273;
+        margin-top: 1;
+        color: #f2f5f7;
+        text-style: bold;
+    }
+    #confirm-facts {
+        height: auto;
+    }
+    .pretrade-fact {
+        height: auto;
+        color: #d9e1e8;
+    }
+    .fact-pass { color: #70d7a5; }
+    .fact-warn { color: #f0c36a; }
+    .fact-block { color: #ff8f87; text-style: bold; }
+    .fact-unavailable { color: #8996a5; }
+    #confirm-help {
+        height: auto;
+        margin-top: 1;
+        color: #8996a5;
     }
     """
 
-    def __init__(self, preview: OrderPreview) -> None:
+    def __init__(
+        self,
+        preview: OrderPreview,
+        facts: PretradeFacts | None = None,
+        *,
+        facts_valid_for_seconds: float | None = None,
+    ) -> None:
         super().__init__()
+        if facts is not None and (
+            facts.mode != "PAPER"
+            or facts.symbol != preview.intent.symbol
+            or facts.side is not preview.intent.side
+            or facts.order_type is not preview.intent.order_type
+        ):
+            raise ValueError("PAPER preview와 pre-trade facts가 일치하지 않습니다.")
+        if facts_valid_for_seconds is not None and (
+            isinstance(facts_valid_for_seconds, bool)
+            or not math.isfinite(facts_valid_for_seconds)
+            or facts_valid_for_seconds < 0
+        ):
+            raise ValueError("facts_valid_for_seconds는 0 이상의 유한한 수여야 합니다.")
         self.preview = preview
+        self.facts = facts
+        self.facts_valid_for_seconds = facts_valid_for_seconds
+        self._facts_expired = False
+        self._facts_expiry_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="order-confirm-dialog"):
             yield Static(PAPER_PREVIEW_BANNER, id="confirm-banner", markup=False)
             yield Static(self._body_text(), id="confirm-body", markup=False)
+            yield Static(self._facts_title(), id="confirm-facts-title", markup=False)
+            with Vertical(id="confirm-facts"):
+                if self.facts is None:
+                    yield Static(
+                        "[정보 없음] 사전 점검 · 현재 화면에 전달된 사실 정보 없음",
+                        classes="pretrade-fact fact-unavailable",
+                        markup=False,
+                    )
+                else:
+                    for row in self.facts.rows:
+                        yield Static(
+                            f"[{row.status_label}] {row.label} · {row.detail}",
+                            id=f"confirm-fact-{row.key}",
+                            classes=f"pretrade-fact fact-{row.status.value.lower()}",
+                            markup=False,
+                        )
             yield Static(
                 "Enter PAPER 미리보기 확정 · Esc 취소 · 실제 주문 전송 없음",
                 id="confirm-help",
                 markup=False,
             )
+
+    def _facts_title(self) -> str:
+        if self.facts is None:
+            return "사전 점검 · 정보 없음"
+        return f"사전 점검 · 종합 {self.facts.overall_label} · 표시 전용"
 
     def _body_text(self) -> str:
         intent = self.preview.intent
@@ -426,15 +491,56 @@ class OrderConfirmScreen(ModalScreen[bool]):
             ]
         )
 
+    def on_mount(self) -> None:
+        if self.facts_valid_for_seconds is not None:
+            self._facts_expiry_timer = self.set_timer(
+                self.facts_valid_for_seconds,
+                self._mark_facts_expired,
+            )
+
+    def _mark_facts_expired(self) -> None:
+        if self._facts_expired:
+            return
+        self._facts_expired = True
+        self.query_one("#confirm-facts-title", Static).update(
+            "사전 점검 · 차단 · 확인 중 시세 유효시간 경과"
+        )
+        if self.facts is not None:
+            widget = self.query_one("#confirm-fact-quote_freshness", Static)
+            for class_name in (
+                "fact-pass",
+                "fact-warn",
+                "fact-unavailable",
+            ):
+                widget.remove_class(class_name)
+            widget.add_class("fact-block")
+            widget.update("[차단] 시세 신선도 · 확인 화면 체류 중 유효시간 경과 · 다시 열어야 함")
+        self.query_one("#confirm-help", Static).update(
+            "시세 재확인 필요 · Esc 취소 후 주문 티켓을 다시 여세요"
+        )
+
+    def _stop_expiry_timer(self) -> None:
+        if self._facts_expiry_timer is not None:
+            self._facts_expiry_timer.stop()
+
     # ------------------------------------------------------------ actions
 
     def action_noop(self) -> None:
         """모달 격리용 no-op. 어떤 상태도 바꾸지 않는다."""
 
     def action_confirm(self) -> None:
+        if self._facts_expired:
+            self.notify(
+                "시세 유효시간이 지났습니다. 취소 후 주문 티켓을 다시 여세요.",
+                title="PAPER PREVIEW BLOCKED",
+                severity="warning",
+            )
+            return
+        self._stop_expiry_timer()
         self.dismiss(True)
 
     def action_cancel(self) -> None:
+        self._stop_expiry_timer()
         self.dismiss(False)
 
 

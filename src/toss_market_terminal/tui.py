@@ -62,6 +62,7 @@ from .models import (
     DataShapeError,
     ExchangeRate,
     MarketSnapshot,
+    OpenOrder,
     OpenOrdersPage,
     Orderbook,
     PortfolioSnapshot,
@@ -78,6 +79,7 @@ from .order_preview import (
 from .order_ticket import OrderConfirmScreen, OrderTicketScreen, build_ticket_capture
 from .order_transport import TossOrderTransport
 from .portfolio import PortfolioScreen
+from .pretrade import PretradeFacts, QuoteFactsContext, build_pretrade_facts
 from .render import (
     CHART_MODE_LABELS,
     DOWN_COLOR,
@@ -1315,18 +1317,96 @@ class TossMarketApp(App[int]):
                 lambda preview: self._on_paper_preview_built(side, preview),
             )
 
+    def _orderbook_is_stale(self) -> bool:
+        if (
+            self.orderbook is None
+            or self.last_orderbook_monotonic is None
+            or self.connection_state not in {"LIVE", "PREVIEW", "SNAPSHOT"}
+        ):
+            return True
+        return time.monotonic() - self.last_orderbook_monotonic > self.price_stale_seconds
+
+    def _quote_valid_for_seconds(self) -> float | None:
+        if self.last_tick_monotonic is None:
+            return None
+        elapsed = time.monotonic() - self.last_tick_monotonic
+        return max(0.0, self.price_stale_seconds - elapsed)
+
+    def _trusted_open_orders_for_facts(self, preview: OrderPreview) -> tuple[OpenOrder, ...] | None:
+        """Return only an account-matched, non-stale in-memory open-order snapshot."""
+
+        snapshot = self.portfolio_snapshot
+        if (
+            snapshot is None
+            or self.portfolio_stale
+            or snapshot.account.account_seq != preview.intent.account_seq
+        ):
+            return None
+        return snapshot.open_orders.orders
+
+    def _build_pretrade_facts(
+        self, preview: OrderPreview, mode: Literal["PAPER", "LIVE"]
+    ) -> PretradeFacts | None:
+        """Project current in-memory state without triggering any loader or endpoint."""
+
+        try:
+            return build_pretrade_facts(
+                preview.intent,
+                QuoteFactsContext(
+                    orderbook=self.orderbook,
+                    last_trade_price=self.current_price,
+                    quote_timestamp=self.current_timestamp,
+                    quote_fresh=not self._interpretation_is_stale(),
+                    orderbook_fresh=not self._orderbook_is_stale(),
+                ),
+                now=self.utc_now(),
+                open_orders=self._trusted_open_orders_for_facts(preview),
+                mode=mode,
+            )
+        except (ValueError, ArithmeticError):
+            return None
+
     def _on_paper_preview_built(self, side: OrderSide, preview: OrderPreview | None) -> None:
         """티켓 모달 결과 콜백: 미리보기가 나오면 확인 모달로 이어간다."""
         if preview is None:
             return  # Esc 취소: 아무 것도 저장하지 않는다.
+        facts = self._build_pretrade_facts(preview, "PAPER")
+        facts_valid_for_seconds = self._quote_valid_for_seconds()
+        facts_deadline_monotonic = (
+            None if facts_valid_for_seconds is None else time.monotonic() + facts_valid_for_seconds
+        )
         self.push_screen(
-            OrderConfirmScreen(preview),
-            lambda ok: self._on_paper_confirmed(preview, bool(ok)),
+            OrderConfirmScreen(
+                preview,
+                facts,
+                facts_valid_for_seconds=facts_valid_for_seconds,
+            ),
+            lambda ok: self._on_paper_confirmed(
+                preview,
+                bool(ok),
+                facts_deadline_monotonic=facts_deadline_monotonic,
+            ),
         )
 
-    def _on_paper_confirmed(self, preview: OrderPreview, confirmed: bool) -> None:
+    def _on_paper_confirmed(
+        self,
+        preview: OrderPreview,
+        confirmed: bool,
+        *,
+        facts_deadline_monotonic: float | None = None,
+    ) -> None:
         if not confirmed:
             return  # 취소: 아무 것도 저장하지 않는다.
+        facts_expired = (
+            facts_deadline_monotonic is not None and time.monotonic() >= facts_deadline_monotonic
+        )
+        if facts_expired or self._interpretation_is_stale():
+            self.notify(
+                "확인 중 시세 유효시간이 지나 PAPER 미리보기를 확정하지 않았습니다. 다시 여세요.",
+                title="PAPER PREVIEW BLOCKED",
+                severity="warning",
+            )
+            return
         # 확정은 메모리 보관 + 알림일 뿐이다. 어떤 엔드포인트 호출도 없다.
         self.last_paper_preview = preview
         self.notify(
@@ -1344,7 +1424,7 @@ class TossMarketApp(App[int]):
             )
             return
         try:
-            plan = create_live_plan(preview, datetime.now(UTC))
+            plan = create_live_plan(preview, self.utc_now())
         except Exception:
             self.notify(
                 "라이브 계획을 만들 수 없어 주문을 전송하지 않았습니다.",
@@ -1352,8 +1432,9 @@ class TossMarketApp(App[int]):
                 severity="error",
             )
             return
+        live_facts = self._build_pretrade_facts(preview, "LIVE")
         self.push_screen(
-            LiveApprovalScreen(plan),
+            LiveApprovalScreen(plan, live_facts),
             lambda phrase: self._on_live_approval(plan, phrase),
         )
 
@@ -2162,6 +2243,9 @@ class TossMarketApp(App[int]):
             daily_candles=live_daily_candles,
         )
         self.orderbook = snapshot.orderbook
+        self.last_orderbook_monotonic = self._tick_monotonic_for_timestamp(
+            snapshot.orderbook.timestamp
+        )
         self.trades = deque(snapshot.trades, maxlen=50)
         for trade in replay_trades:
             self.trades.appendleft(trade)
@@ -2350,7 +2434,9 @@ class TossMarketApp(App[int]):
                     continue
                 self._recover_protocol_status()
                 self.orderbook = event.orderbook
-                self.last_orderbook_monotonic = time.monotonic()
+                self.last_orderbook_monotonic = self._tick_monotonic_for_timestamp(
+                    event.orderbook.timestamp
+                )
                 self._render_orderbook()
                 self._render_stats()
                 self._render_chrome()
